@@ -617,12 +617,30 @@ pub fn replay_class(module: &str, func: &str) -> ReplayClass {
             "run" | "resume" => Recorded(Plain),
             _ => Harmless,
         },
+        // archive (BATT B1) is PER-FUNC (Task 9 audit, §8): the DISK funcs
+        // (`tarExtractTo`/`zipExtractTo` WRITE extracted files; `tarCreateFromDir` READS
+        // a directory tree) are fs-shaped — their result is plain data, so they Record
+        // like `fs` and replay WITHOUT touching the disk. The in-memory builders
+        // (`tarWriter`/`tarEntries`/`tarAppend`/gzip/zip-in-memory) are pure → Harmless.
+        #[cfg(feature = "archive")]
+        "archive" => match func {
+            "tarExtractTo" | "zipExtractTo" | "tarCreateFromDir" => Recorded(Plain),
+            _ => Harmless,
+        },
 
         // ---- Seamed: routed through the determinism context already ---- //
         // `time.sleep` consumes a recorded `TimerSet` + skips the delay (§0.5);
         // `time.now`/`monotonic` route through the virtual clock. `date.now` is the
-        // clock seam. Coarse module-level Seamed (the seam events flow without the hook).
-        "time" => Seamed,
+        // clock seam. But the TIMER funcs `interval`/`debounce`/`throttle` mint a LIVE
+        // `tokio::time::Interval`/sleep-backed handle that BYPASSES the clock seam — under
+        // replay they would real-sleep and the live handle can't be reproduced (Task 9
+        // audit, §8). No virtual-tick seam ships in v1 → Refused (the fs/socket precedent:
+        // a successfully-recorded trace is replayable by construction; a timer-using
+        // program discovers non-replayability AT RECORD, not at replay).
+        "time" => match func {
+            "interval" | "debounce" | "throttle" => Refused,
+            _ => Seamed,
+        },
         #[cfg(feature = "datetime")]
         "date" => Seamed,
         #[cfg(feature = "ffi")]

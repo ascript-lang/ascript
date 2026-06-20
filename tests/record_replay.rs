@@ -41,9 +41,86 @@ fn dispatch_key(full: &str) -> String {
 }
 
 // ===========================================================================
-// 1. classification_is_complete — every STD_MODULES entry yields a class; a
-//    fabricated module name still yields SOME class (the table is total via `_`).
+// 1. classification_is_complete — every STD_MODULES entry has an EXPLICIT,
+//    DOCUMENTED default classification (REPLAY §8, Task 9). The table is total
+//    via `_ => Harmless`, so a probe ALWAYS resolves — that is NOT enough: a NEW
+//    OS-touching module added with no `replay_class` arm would fall to Harmless
+//    SILENTLY (the T3 carry-forward gap). This test closes the loop the way
+//    `every_std_module_is_classified_gated_or_explicitly_ungated` closes the cap
+//    loop: every module's *default* (`__probe__`) class must match a DOCUMENTED
+//    expected class, and any module whose default is Harmless must be listed in
+//    `KNOWN_HARMLESS` (pure / in-memory / seam-routed). A module in NEITHER the
+//    explicit-class map NOR `KNOWN_HARMLESS` trips this — forcing a deliberate
+//    classification decision for anything new. The table IS the test fixture
+//    (spec §8); the per-func splits are pinned by the per-func assertions below.
 // ===========================================================================
+
+/// The DOCUMENTED *default*-func (`__probe__`) replay class for every module whose
+/// default is NOT `Harmless` (the load-bearing rows of the §8 table). Keyed by the
+/// dispatch-site module string (`std/net/http` → `net_http`). A module here is
+/// classified by a deliberate `replay_class` arm; a module that is *intended*
+/// Harmless lives in `KNOWN_HARMLESS` instead. Every `STD_MODULES` entry must be in
+/// exactly one of the two sets — that is the completeness guard.
+fn expected_default_class(key: &str) -> Option<ReplayClass> {
+    use HandleShape::{HttpResponse, Plain};
+    use ReplayClass::{Recorded, Refused, Seamed};
+    Some(match key {
+        // Recorded (effectful, plain-data results recorded at the boundary).
+        "fs" | "env" | "io" | "os" | "net" => Recorded(Plain),
+        // net_http BUFFERED verbs → Recorded with the HttpResponse virtualization shape
+        // (Task 4); `sse`/`cancelToken` are Refused (per-func, asserted below).
+        "net_http" => Recorded(HttpResponse),
+        // archive: the DEFAULT func is an in-memory builder (Harmless); the disk
+        // funcs (tarExtractTo/zipExtractTo/tarCreateFromDir) are Recorded — see the
+        // per-func split assertions below. So `archive` is in KNOWN_HARMLESS by
+        // default, NOT here.
+        "process" => Recorded(Plain), // process.run; process.spawn is Refused (per-func).
+        // Seamed (routed through the determinism context already).
+        "time" => Seamed, // time.now/monotonic/sleep; interval/debounce/throttle Refused (per-func).
+        "date" => Seamed,
+        "ffi" => Seamed,
+        // Refused (no determinism seam — live handles / streams / sockets / servers).
+        "net_tcp" | "net_udp" | "net_ws" | "http_server" | "net_unix" => Refused,
+        "sqlite" | "postgres" | "redis" | "tui" | "ai" | "telemetry" | "docker" | "blob"
+        | "oauth" => Refused,
+        // Everything else has a Harmless default — must be in KNOWN_HARMLESS.
+        _ => return None,
+    })
+}
+
+/// Modules whose DEFAULT-func class is `Harmless` — pure given inputs, in-memory
+/// coordination, or nondeterminism that flows through the det SEAMS (RNG/clock)
+/// rather than the trace hook. Audited from source (Task 9 §8 sweep):
+/// - `math`/`string`/`json`/`regex`/`schema`/`array`/`object`/`map`/`set`/`decimal`/
+///   `bytes`/`convert`/`color`/`template`/`cli`/`url`/`csv`/`toml`/`yaml`/`msgpack`/
+///   `cbor`/`xml`/`html`/`markdown`/`diff`/`semver`/`assert`/`bench`/`test`/`shared`/
+///   `lru`/`events` — pure transforms over their arguments.
+/// - `intl` — locale is ALWAYS an explicit string arg over BUNDLED ICU data; the
+///   instant comes from an explicit `epochMs` field. No system-locale read, no clock.
+/// - `stream` — every source is pure (`from` array/generator, `range` numeric); no
+///   fs/net-backed source. The live handle is never a recorded boundary.
+/// - `sync` — in-memory channels/semaphores/rate-limiter (`tokio::sync::Notify` +
+///   `RefCell`); no recorded value is clock-dependent.
+/// - `log` — the stderr/capture sink: output is OBSERVATION, not an effect event.
+/// - `crypto`/`uuid` — random/salts route through `fill_seeded_bytes` (the RNG seam);
+///   v7's time prefix is the virtual clock. The seam events flow without the hook,
+///   so the MODULE is Harmless (the per-func RNG-vs-pure split is hook-invisible).
+/// - `compress`/`encoding` — pure (de)compression / (de)coding; no random, no clock.
+/// - `caps` — reads are Harmless (`drop`/`dropAll` are Refused per-func).
+/// - `task` — combinators over `future<T>`; the determinism is in the awaited work.
+/// - `cron`/`resilience`/`jwt`/`email`/`archive` — Harmless DEFAULT; their effectful
+///   funcs are Refused/Recorded per-func (asserted below).
+const KNOWN_HARMLESS: &[&str] = &[
+    "assert", "test", "bench", "cli", "color", "decimal", "math", "string", "array",
+    "object", "map", "schema", "shared", "set", "lru", "events", "template", "bytes",
+    "caps", "convert", "task", "sync", "stream", "intl", "json", "log", "encoding",
+    "crypto", "compress", "regex", "url", "uuid", "csv", "toml", "yaml", "msgpack",
+    "cbor", "resilience",
+    // workflow: DEFAULT func is Harmless; `run`/`resume` are Recorded (per-func,
+    // asserted in the Recorded set). Its own internal events go to the workflow log.
+    "workflow",
+    "cron", "semver", "jwt", "archive", "xml", "html", "markdown", "diff", "email",
+];
 
 #[test]
 #[cfg(all(
@@ -58,17 +135,52 @@ fn dispatch_key(full: &str) -> String {
     feature = "datetime",
 ))]
 fn classification_is_complete() {
-    // Every real module classifies. We probe with a representative func name; the table
-    // is total (`_ => Harmless`), so the assertion is that the entry RESOLVES (it always
-    // does) AND that the resource modules resolve to the RIGHT non-Harmless class — a
-    // sabotage that drops sqlite to Harmless is caught by the refusal test below.
+    // COMPLETENESS (T3 carry-forward fix): every STD_MODULES entry must be classified
+    // EXPLICITLY — either by a documented non-Harmless `expected_default_class` arm OR
+    // by membership in `KNOWN_HARMLESS`. A module in NEITHER trips here (it would
+    // silently fall to `_ => Harmless` in `replay_class` — exactly the gap this guards).
     for full in STD_MODULES {
         let key = dispatch_key(full);
-        let class = replay_class(&key, "__probe__");
-        // The probe must yield a class (it always does — total table). The meaningful
-        // assertions are the per-class ones below; this loop guarantees coverage.
-        let _ = class;
+        match expected_default_class(&key) {
+            Some(expected) => {
+                assert_eq!(
+                    replay_class(&key, "__probe__"),
+                    expected,
+                    "std module '{key}' default class drifted from the documented §8 table"
+                );
+                assert!(
+                    !KNOWN_HARMLESS.contains(&key.as_str()),
+                    "std module '{key}' is in BOTH expected_default_class and KNOWN_HARMLESS — pick one."
+                );
+            }
+            None => {
+                // A Harmless default — it MUST be explicitly listed, and `replay_class`
+                // must actually return Harmless for the default func.
+                assert!(
+                    KNOWN_HARMLESS.contains(&key.as_str()),
+                    "std module '{key}' is UNCLASSIFIED for record/replay: add a `replay_class` \
+                     arm + an `expected_default_class` row if it touches an effect/seam, or to \
+                     `KNOWN_HARMLESS` if it is pure / in-memory / seam-routed. (A silently-Harmless \
+                     effectful module is a record/replay correctness bug — REPLAY §8.)"
+                );
+                assert_eq!(
+                    replay_class(&key, "__probe__"),
+                    ReplayClass::Harmless,
+                    "std module '{key}' is in KNOWN_HARMLESS but its default class is not Harmless"
+                );
+            }
+        }
     }
+
+    // SABOTAGE TRIPWIRE: a fabricated module name is in NEITHER set, so it must have no
+    // documented class — proving a NEW unclassified module trips the loop above (it would
+    // hit the `None` arm and the `KNOWN_HARMLESS.contains` assert would fail). We assert
+    // the precondition here so the guard's teeth are self-evident.
+    let fake = "totally_fabricated_module_xyz";
+    assert!(
+        expected_default_class(fake).is_none() && !KNOWN_HARMLESS.contains(&fake),
+        "a fabricated module must be in neither set (else the completeness loop is toothless)"
+    );
 
     // Refused set — the load-bearing classifications.
     for (m, f) in [
@@ -100,6 +212,12 @@ fn classification_is_complete() {
         ("net", "lookup"),
         ("process", "run"),
         ("workflow", "run"),
+        // archive DISK funcs are fs-shaped (read a dir / write extracted files); their
+        // result is plain data → Recorded(Plain) like fs, replayed without disk access
+        // (Task 9 reclassification — the in-memory builders stay Harmless, asserted below).
+        ("archive", "tarExtractTo"),
+        ("archive", "zipExtractTo"),
+        ("archive", "tarCreateFromDir"),
     ] {
         assert!(
             matches!(replay_class(m, f), ReplayClass::Recorded(_)),
@@ -134,6 +252,10 @@ fn classification_is_complete() {
             "{m}.{f} must be Harmless"
         );
     }
+    // archive in-memory builders stay Harmless (the disk funcs above are Recorded).
+    assert_eq!(replay_class("archive", "tarWriter"), ReplayClass::Harmless);
+    assert_eq!(replay_class("archive", "tarEntries"), ReplayClass::Harmless);
+    assert_eq!(replay_class("archive", "tarAppend"), ReplayClass::Harmless);
     // caps.drop / dropAll are Refused (replay can't see the dropped state).
     assert_eq!(replay_class("caps", "drop"), ReplayClass::Refused);
     assert_eq!(replay_class("caps", "dropAll"), ReplayClass::Refused);
@@ -141,6 +263,40 @@ fn classification_is_complete() {
     assert_eq!(replay_class("jwt", "jwks"), ReplayClass::Refused);
     assert_eq!(replay_class("email", "send"), ReplayClass::Refused);
     assert_eq!(replay_class("email", "connect"), ReplayClass::Refused);
+    // time.now/monotonic/sleep are Seamed (above); but the TIMER funcs interval/debounce/
+    // throttle mint a LIVE tokio timer that BYPASSES the clock seam (real-sleeps under
+    // replay) → Refused v1 (Task 9 reclassification; no virtual-tick seam ships in v1).
+    assert_eq!(replay_class("time", "interval"), ReplayClass::Refused);
+    assert_eq!(replay_class("time", "debounce"), ReplayClass::Refused);
+    assert_eq!(replay_class("time", "throttle"), ReplayClass::Refused);
+}
+
+// ===========================================================================
+// 1b. Task 9 reclassification — `time.interval` is REFUSED under a trace (it mints a
+//     live tokio timer that bypasses the clock seam). The refusal fires in the hook
+//     BEFORE the live timer is created, so the test needs no real timer.
+// ===========================================================================
+
+#[test]
+fn time_interval_refused_under_trace() {
+    with_interp(|interp| async move {
+        interp.__install_record_trace(99);
+        for f in ["interval", "debounce", "throttle"] {
+            let r = interp
+                .__call_stdlib("time", f, &[Value::float(10.0)])
+                .await;
+            let err = match r {
+                Err(Control::Panic(e)) => e,
+                other => panic!("time.{f} under a trace must be a LOUD Tier-2 refusal, got {other:?}"),
+            };
+            let msg = &err.message;
+            assert!(
+                msg.contains(&format!("time.{f}")) && msg.contains("not supported under --record/--replay"),
+                "time.{f} refusal must name the func + the §8 message, got: {msg}"
+            );
+        }
+        interp.__clear_determinism();
+    });
 }
 
 // ===========================================================================
