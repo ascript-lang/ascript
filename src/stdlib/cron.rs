@@ -394,8 +394,17 @@ fn schedule_value(expr: &str, sched: &CronSchedule) -> Value {
     Value::object(o)
 }
 
-/// Reconstruct a [`CronSchedule`] from a tagged-Object schedule value.
-fn schedule_from_object(o: &IndexMap<String, Value>) -> Option<CronSchedule> {
+/// Is `v` exactly `Some(true)`? (An owned-`Value` boolean test, since the slab-safe
+/// `ObjectCell::get` returns an owned `Value` — we cannot borrow a `kind()` view out
+/// of the temporary.)
+fn is_true(v: Option<Value>) -> bool {
+    matches!(v.as_ref().map(|x| x.kind()), Some(ValueKind::Bool(true)))
+}
+
+/// Reconstruct a [`CronSchedule`] from a tagged-Object schedule value. Reads via
+/// the slab-safe [`ObjectCell::get`] accessor (NEVER `borrow()`, which panics on a
+/// slab-mode object — the VM builds source-literal objects in slab storage).
+fn schedule_from_object(o: &crate::value::ObjectCell) -> Option<CronSchedule> {
     if o.get("__cron").and_then(|v| match v.kind() {
         ValueKind::Str(s) => Some(s.to_string()),
         _ => None,
@@ -410,8 +419,8 @@ fn schedule_from_object(o: &IndexMap<String, Value>) -> Option<CronSchedule> {
         dom: f("dom")? as u32,
         months: f("months")? as u16,
         dow: f("dow")? as u8,
-        dom_restricted: matches!(o.get("domRestricted").map(|v| v.kind()), Some(ValueKind::Bool(true))),
-        dow_restricted: matches!(o.get("dowRestricted").map(|v| v.kind()), Some(ValueKind::Bool(true))),
+        dom_restricted: is_true(o.get("domRestricted")),
+        dow_restricted: is_true(o.get("dowRestricted")),
     })
 }
 
@@ -423,8 +432,9 @@ fn resolve_schedule(v: &Value, span: Span, ctx: &str) -> Result<Result<CronSched
     match v.kind() {
         ValueKind::Str(s) => Ok(parse_expr(s.as_ref())),
         ValueKind::Object(o) => {
-            let map = o.borrow();
-            match schedule_from_object(&map) {
+            // Slab-safe: read through `ObjectCell::get`, never `borrow()` (a
+            // VM-built source-literal object is in slab storage).
+            match schedule_from_object(o) {
                 Some(sched) => Ok(Ok(sched)),
                 None => Err(AsError::at(
                     format!("{ctx}: object is not a cron schedule (missing __cron tag)"),
@@ -460,15 +470,19 @@ fn read_opts(v: &Value, span: Span, ctx: &str) -> Result<(Option<i64>, i64), Con
     match v.kind() {
         ValueKind::Nil => Ok((None, 0)),
         ValueKind::Object(o) => {
-            let map = o.borrow();
-            let after = match map.get("after") {
+            // Slab-safe: read each opt through `ObjectCell::get` (returns an owned
+            // `Value`, Rc-bump), NEVER `borrow()` — a VM source-literal opts object
+            // is in slab storage and `borrow()` would panic (SHAPE shim contract).
+            let after = match o.get("after") {
                 Some(a) if !matches!(a.kind(), ValueKind::Nil) => {
-                    Some(want_number(a, span, ctx)? as i64)
+                    Some(want_number(&a, span, ctx)? as i64)
                 }
                 _ => None,
             };
-            let tz = match map.get("tzOffset") {
-                Some(t) if !matches!(t.kind(), ValueKind::Nil) => want_number(t, span, ctx)? as i64,
+            let tz = match o.get("tzOffset") {
+                Some(t) if !matches!(t.kind(), ValueKind::Nil) => {
+                    want_number(&t, span, ctx)? as i64
+                }
                 _ => 0,
             };
             Ok((after, tz))
