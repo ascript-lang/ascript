@@ -98,3 +98,61 @@ async fn pin_host_specifier_classifies_as_host() {
         err.message
     );
 }
+
+/// EMBED Unit E (§12, Gate 9): the embedding examples live under `examples/embed/**`,
+/// which the `vm_differential` corpus discovery — `examples/*.as` +
+/// `examples/advanced/*.as`, NON-RECURSIVE (verified `tests/vm_differential.rs`
+/// `all_corpus_examples`) — does NOT auto-claim. These scripts import `host:` modules
+/// and are only runnable inside their host (main.rs / main.c), so they must NOT be
+/// corpus members (there is no byte-identical CLI reference output). This pin mirrors
+/// the exact discovery enumeration and asserts no `embed/` path is ever produced.
+#[test]
+fn examples_embed_is_excluded_from_corpus_discovery() {
+    let root = env!("CARGO_MANIFEST_DIR");
+
+    // Mirror vm_differential's `all_corpus_examples`: read ONLY the two flat dirs,
+    // non-recursively, collecting `*.as` file names.
+    let mut corpus: Vec<String> = Vec::new();
+    for dir in ["examples", "examples/advanced"] {
+        let p = std::path::Path::new(root).join(dir);
+        let rd = std::fs::read_dir(&p).unwrap_or_else(|e| panic!("read_dir {dir}: {e}"));
+        for entry in rd {
+            let path = entry.expect("dir entry").path();
+            if path.extension().and_then(|x| x.to_str()) == Some("as") {
+                corpus.push(format!(
+                    "{dir}/{}",
+                    path.file_name().unwrap().to_string_lossy()
+                ));
+            }
+        }
+    }
+
+    // No corpus entry may reference the embed subtree (it is a SUBDIR of `examples/`,
+    // and the discovery is non-recursive, so this is structurally impossible — the pin
+    // catches any future switch to a recursive walk that would silently absorb them).
+    for entry in &corpus {
+        assert!(
+            !entry.contains("embed/"),
+            "vm_differential corpus discovery picked up an embed example ({entry}); \
+             examples/embed/** must stay OUT of the corpus (host:-only, host-driven). \
+             If discovery became recursive, add these to EXAMPLE_SKIPS with a reason."
+        );
+    }
+
+    // The embed example scripts DO exist on disk (so the pin is meaningful, not vacuous)
+    // — they are simply not in the corpus enumeration.
+    for rel in [
+        "examples/embed/rust-host/game.as",
+        "examples/embed/c-host/plugin.as",
+    ] {
+        let path = std::path::Path::new(root).join(rel);
+        assert!(path.exists(), "embed example script missing: {rel}");
+        // And they are NOT in the corpus list (the file name alone is also absent under
+        // the flat-dir keys).
+        let fname = path.file_name().unwrap().to_string_lossy();
+        assert!(
+            !corpus.iter().any(|c| c.ends_with(&*fname)),
+            "embed script {fname} leaked into the flat-dir corpus enumeration"
+        );
+    }
+}

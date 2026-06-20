@@ -5936,3 +5936,35 @@ fn prop_and_plain_test_coexist() {
     );
     assert!(s.contains("2 passed"), "both the plain test and the prop must run; got:\n{s}");
 }
+
+/// EMBED Unit E (§12): the embedding-example scripts import `host:` modules, which a
+/// plain `ascript run` (no host registered) classifies as `SpecifierKind::Host` and
+/// fails at the registry MISS with the recoverable panic
+///   `host module 'host:<name>' is not registered in this isolate`.
+/// This is the EXPECTED, documented behavior — the scripts are driven by their host
+/// (main.rs / main.c), never by the CLI. Asserting it here also documents WHY these
+/// files are excluded from the vm_differential corpus (pinned in
+/// `tests/embed_negative_space.rs`).
+#[test]
+fn embed_example_scripts_reject_plain_cli_run_at_host_miss() {
+    let bin = env!("CARGO_BIN_EXE_ascript");
+    let root = env!("CARGO_MANIFEST_DIR");
+    for (rel, host) in [
+        ("examples/embed/rust-host/game.as", "host:game"),
+        ("examples/embed/c-host/plugin.as", "host:plugin"),
+    ] {
+        let path = std::path::Path::new(root).join(rel);
+        let out = Command::new(bin).arg("run").arg(&path).output().unwrap();
+        assert!(
+            !out.status.success(),
+            "{rel}: plain `ascript run` of a host:-importing script must fail"
+        );
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            err.contains(&format!(
+                "host module '{host}' is not registered in this isolate"
+            )),
+            "{rel}: expected the host registry-miss panic for {host}; got stderr:\n{err}"
+        );
+    }
+}

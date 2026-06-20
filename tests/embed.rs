@@ -1006,3 +1006,61 @@ fn in_script_caps_drop_stays_monotone_after_a_grant() {
         .unwrap();
     assert_eq!(iso.take_output(), "false\n");
 }
+
+// ── Task 5.1: the rust-host EXAMPLE runs in CI (spec §12, Gate 9) ─────────────
+//
+// The example IS its own check (deny-all caps, a host:game module with a plain func +
+// a fallible func + a panic-raising func, container-handle shared state, async
+// auto-await, host-panic recovery, a caps-denial probe — happy AND edge). It exits 0
+// + prints `EMBED-RUST-HOST-OK` on success, non-zero on any assertion failure. This
+// runner builds it (incremental — cheap after the first build) and executes it.
+mod examples {
+    use std::process::Command;
+
+    // slow: builds + runs a cargo example binary. Not #[ignore]'d — it runs in the
+    // normal suite; the first build is the only real cost (incremental after).
+    #[test]
+    fn rust_host_example_builds_and_runs() {
+        let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_string());
+        let manifest_dir = env!("CARGO_MANIFEST_DIR");
+
+        // Build the example (incremental). `--features embed` is required by the
+        // `[[example]] required-features` declaration.
+        let build = Command::new(&cargo)
+            .current_dir(manifest_dir)
+            .args(["build", "--example", "embed-rust-host", "--features", "embed"])
+            .status()
+            .expect("invoke cargo build for the rust-host example");
+        assert!(build.success(), "building embed-rust-host failed");
+
+        // Locate the built binary under target/{debug,release}/examples.
+        let mut bin = None;
+        for profile in ["debug", "release"] {
+            let cand = std::path::Path::new(manifest_dir)
+                .join("target")
+                .join(profile)
+                .join("examples")
+                .join("embed-rust-host");
+            if cand.exists() {
+                bin = Some(cand);
+                break;
+            }
+        }
+        let bin = bin.expect("built embed-rust-host binary not found under target/*/examples");
+
+        let output = Command::new(&bin)
+            .output()
+            .expect("run the embed-rust-host example");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            output.status.success(),
+            "embed-rust-host exited non-zero: {:?}\nstdout: {stdout}\nstderr: {stderr}",
+            output.status
+        );
+        assert!(
+            stdout.lines().any(|l| l.trim() == "EMBED-RUST-HOST-OK"),
+            "missing EMBED-RUST-HOST-OK sentinel.\nstdout: {stdout}\nstderr: {stderr}"
+        );
+    }
+}
