@@ -25,9 +25,11 @@
 //! ```
 
 mod error;
+mod host;
 mod value;
 
 pub use error::{EmbedDiagnostic, EmbedError, EmbedPanic};
+pub use host::{HostCtx, HostError, HostModuleBuilder};
 pub use value::{AsKind, AsValue};
 
 use std::cell::RefCell;
@@ -126,6 +128,29 @@ pub struct IsolateBuilder {
     stdlib: StdlibFilter,
     output: OutputMode,
     args: Vec<String>,
+    /// Validated host modules to register on the isolate at `build()` (spec §6.2).
+    /// Each is `(full "host:<name>", HostModuleDef)`; a validation/duplicate error is
+    /// deferred to `build()` (the builder methods are infallible-chaining and return
+    /// `Result` per the spec signature, surfacing the error at registration).
+    host_modules: Vec<(String, crate::interp::HostModuleDef)>,
+    /// Per-isolate host-module FACTORIES (spec §6.4): `Arc<dyn Fn(&mut Builder) + Send +
+    /// Sync>` that also install the module into every worker isolate this Isolate spawns.
+    /// Carried as a side-channel beside `caps` on the worker spawn paths (§6.4).
+    host_factories: Vec<host::HostModuleFactory>,
+}
+
+impl std::fmt::Debug for IsolateBuilder {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Closures (host modules/factories) are not `Debug`; show only the shape.
+        f.debug_struct("IsolateBuilder")
+            .field("caps", &self.caps)
+            .field("stdlib", &self.stdlib)
+            .field("output", &self.output)
+            .field("args", &self.args)
+            .field("host_modules", &self.host_modules.len())
+            .field("host_factories", &self.host_factories.len())
+            .finish()
+    }
 }
 
 impl Default for IsolateBuilder {
@@ -135,6 +160,8 @@ impl Default for IsolateBuilder {
             stdlib: StdlibFilter::Full,
             output: OutputMode::Inherit,
             args: Vec::new(),
+            host_modules: Vec::new(),
+            host_factories: Vec::new(),
         }
     }
 }
@@ -164,6 +191,73 @@ impl IsolateBuilder {
         self
     }
 
+    /// Register a host module under the `host:` namespace (spec §6.2). The script
+    /// imports it as `import * as app from "host:app"`. The `name` is validated (§6.1:
+    /// `host:` + a `/`-segmented lowercase identifier path, no dots) and a duplicate is
+    /// rejected — both as [`EmbedError::Config`].
+    ///
+    /// # Security (§6.3)
+    ///
+    /// Host functions registered here are **native Rust** and **bypass the
+    /// [`Caps`](Caps) gate** — see [`HostModuleBuilder`] for the full note.
+    ///
+    /// # Errors
+    ///
+    /// [`EmbedError::Config`] on an invalid name (§6.1) or a duplicate registration.
+    pub fn host_module(
+        mut self,
+        name: &str,
+        f: impl FnOnce(&mut HostModuleBuilder),
+    ) -> Result<Self, EmbedError> {
+        host::validate_module_name(name).map_err(EmbedError::Config)?;
+        if self.host_modules.iter().any(|(n, _)| n == name)
+            || self.host_factories.iter().any(|(n, _)| &**n == name)
+        {
+            return Err(EmbedError::Config(format!(
+                "host module '{name}' is already registered in this isolate"
+            )));
+        }
+        let mut builder = HostModuleBuilder::new();
+        f(&mut builder);
+        self.host_modules.push((name.to_string(), builder.finish()));
+        Ok(self)
+    }
+
+    /// Register a per-isolate host-module FACTORY (spec §6.4): like [`host_module`], but
+    /// the module is ALSO installed into every worker isolate this Isolate spawns
+    /// (pooled `worker fn` AND dedicated `run_in_worker`). The closure runs INSIDE the
+    /// freshly-spawned isolate thread, so it is `Send + Sync` and the host fns it builds
+    /// may close over `Send + Sync` host state only.
+    ///
+    /// # Security (§6.3)
+    ///
+    /// Factory-built host functions are **native Rust** and **bypass the [`Caps`](Caps)
+    /// gate** — see [`HostModuleBuilder`].
+    ///
+    /// # Errors
+    ///
+    /// [`EmbedError::Config`] on an invalid name (§6.1) or a duplicate registration.
+    pub fn host_module_factory(
+        mut self,
+        name: &str,
+        f: std::sync::Arc<dyn Fn(&mut HostModuleBuilder) + Send + Sync>,
+    ) -> Result<Self, EmbedError> {
+        host::validate_module_name(name).map_err(EmbedError::Config)?;
+        if self.host_modules.iter().any(|(n, _)| n == name)
+            || self.host_factories.iter().any(|(n, _)| &**n == name)
+        {
+            return Err(EmbedError::Config(format!(
+                "host module '{name}' is already registered in this isolate"
+            )));
+        }
+        // A factory ALSO registers the module on the MAIN isolate (so the host can call
+        // into it directly), by running it once at build time.
+        let def = host::build_factory(&f);
+        self.host_modules.push((name.to_string(), def));
+        self.host_factories.push((std::rc::Rc::from(name), f));
+        Ok(self)
+    }
+
     /// Validate the configuration and construct the isolate.
     ///
     /// Does what the worker isolate bootstrap does, on the **calling** thread:
@@ -180,9 +274,16 @@ impl IsolateBuilder {
         };
         interp.set_caps(self.caps.into_capset());
         interp.set_cli_args(&self.args);
-        // The `StdlibFilter` field is carried for a later unit (host-module phase wires
-        // it into the import chokepoint); the facade core stores the default unchanged.
+        // The `StdlibFilter` field is wired into the import chokepoint in Task 3.4.
         let _ = &self.stdlib;
+        // EMBED §6.3: register the validated host modules on the isolate BEFORE any code
+        // runs. Names were validated + de-duplicated at builder time, so a registration
+        // error here is unreachable; surface it as Config defensively rather than panic.
+        for (name, def) in self.host_modules {
+            interp
+                .register_host_module(&name, def)
+                .map_err(EmbedError::Config)?;
+        }
         let interp = Rc::new(interp);
         interp.install_self();
         let vm = Vm::new(interp);
@@ -194,6 +295,21 @@ impl IsolateBuilder {
             .enable_all()
             .build()
             .map_err(|e| EmbedError::Config(format!("could not build isolate runtime: {e}")))?;
+
+        // EMBED §6.4: stash the host-module factories on the isolate (adapted to the
+        // CORE `Fn() -> HostModuleDef` form) so the worker spawn paths can ship them
+        // per-isolate. Each adapter runs the `Send + Sync` builder closure INSIDE the
+        // worker isolate to produce a fresh `HostModuleDef`.
+        let core_factories: Vec<crate::interp::HostFactoryEntry> = self
+            .host_factories
+            .into_iter()
+            .map(|(name, f)| {
+                let adapter: std::sync::Arc<crate::interp::HostModuleFactoryCore> =
+                    std::sync::Arc::new(move || host::build_factory(&f));
+                (name, adapter)
+            })
+            .collect();
+        vm.interp().set_host_factories(core_factories);
 
         Ok(Isolate {
             vm,

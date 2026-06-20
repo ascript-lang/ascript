@@ -581,3 +581,59 @@ fn asvalue_serde_serializes_via_the_json_model() {
 // (`ascript = { path = ".", features = ["fuzzgen"] }`) pulls DEFAULT features — so
 // `data` can never be off in this target. The lib unit test sees the real (no-default)
 // feature set and is the correct home for that cfg-gated assertion.
+
+// ── Task 3.1: host-module registry + name validation (spec §6.1, §6.2) ──────
+
+use ascript::embed::{HostError as HE, HostModuleBuilder as HMB};
+
+#[test]
+fn host_module_bad_names_are_config_errors() {
+    // Missing the `host:` scheme.
+    let e = Isolate::builder()
+        .host_module("app", |_m: &mut HMB| {})
+        .unwrap_err();
+    assert!(matches!(e, EmbedError::Config(_)), "missing prefix → Config; got {e:?}");
+
+    // A dot would mis-split the qualified `host:My.App.fn` dispatch name.
+    let e = Isolate::builder()
+        .host_module("host:My.App", |_m: &mut HMB| {})
+        .unwrap_err();
+    assert!(matches!(e, EmbedError::Config(_)), "dotted name → Config; got {e:?}");
+
+    // Empty after the scheme.
+    let e = Isolate::builder()
+        .host_module("host:", |_m: &mut HMB| {})
+        .unwrap_err();
+    assert!(matches!(e, EmbedError::Config(_)), "empty name → Config; got {e:?}");
+}
+
+#[test]
+fn host_module_duplicate_registration_is_a_config_error() {
+    let e = Isolate::builder()
+        .host_module("host:app", |m: &mut HMB| {
+            m.value("v", AsValue::from(1i64));
+        })
+        .unwrap()
+        .host_module("host:app", |m: &mut HMB| {
+            m.value("v", AsValue::from(2i64));
+        })
+        .unwrap_err();
+    assert!(matches!(e, EmbedError::Config(_)), "dup → Config; got {e:?}");
+}
+
+#[test]
+fn host_module_valid_registration_builds() {
+    let iso = Isolate::builder()
+        .host_module("host:app", |m: &mut HMB| {
+            m.value("version", AsValue::from("1.0"));
+            m.func("double", |_c, a| Ok(AsValue::from(a[0].as_int().unwrap_or(0) * 2)));
+            m.fallible_func("lookup", |_c, a| match a[0].as_str() {
+                Some("k") => Ok(AsValue::from(42i64)),
+                _ => Err(HE::Recoverable("no such key".into())),
+            });
+        })
+        .expect("valid host module registers")
+        .build()
+        .expect("build with a host module");
+    drop(iso);
+}
