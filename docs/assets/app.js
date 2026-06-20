@@ -40,6 +40,7 @@ const NAV = [
     ['spec/errors', 'Errors & recover'],
     ['spec/modules', 'Modules & packages'],
     ['spec/concurrency', 'Concurrency & workers'],
+    ['spec/capabilities', 'Capability model'],
   ]},
   { title: 'Standard library', items: [
     ['stdlib/overview', 'Overview'],
