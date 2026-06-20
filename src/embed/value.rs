@@ -80,6 +80,28 @@ impl AsValue {
             .map_err(|e| format!("invalid decimal '{s}': {e}"))
     }
 
+    /// Construct a host-side `bytes` handle from a byte vector.
+    pub fn bytes(b: Vec<u8>) -> Self {
+        AsValue(Value::bytes(b))
+    }
+
+    /// Construct a host-side `array` from a vector of values (a live handle the script
+    /// can then alias once it crosses in).
+    pub fn array(items: Vec<AsValue>) -> Self {
+        let vec: Vec<Value> = items.into_iter().map(AsValue::into_value).collect();
+        AsValue(Value::array_cell(crate::value::ArrayCell::new(vec)))
+    }
+
+    /// Construct a host-side `object` from `(key, value)` pairs (later-key-wins;
+    /// insertion-ordered, a live handle).
+    pub fn object(entries: Vec<(String, AsValue)>) -> Self {
+        let mut m = indexmap::IndexMap::new();
+        for (k, v) in entries {
+            m.insert(k, v.into_value());
+        }
+        AsValue(Value::object_cell(crate::value::ObjectCell::new(m)))
+    }
+
     /// This value's crossing-class [`AsKind`] (spec §5.2).
     pub fn kind(&self) -> AsKind {
         match self.0.kind() {
@@ -158,6 +180,169 @@ impl AsValue {
     /// vocabulary is NOT re-spelled here.
     pub fn type_name(&self) -> &'static str {
         crate::interp::type_name(&self.0)
+    }
+
+    // ── container handles (LIVE aliasing) ───────────────────────────────────
+    //
+    // Container `AsValue`s wrap the SAME `Rc`/`Cc` cell the script holds, so a host
+    // read/write IS a script read/write (and vice-versa) with no copy — the §5.1
+    // Lua-table model. Reads use the slab-safe sealed accessors (never the panicking
+    // `ObjectCell::borrow()` shim). Mutators route through the SAME engine helpers the
+    // stdlib/VM use so type contracts + the frozen-`Shared` guard + slab-shape
+    // bookkeeping are honored, never bypassed (§5.2).
+
+    /// The element/entry count for a container (`array`/`object`/`map`/`set`/`bytes`),
+    /// or `None` for a non-container.
+    pub fn len(&self) -> Option<usize> {
+        match self.0.kind() {
+            ValueKind::Array(a) => Some(a.borrow().len()),
+            ValueKind::Object(o) => Some(o.len()),
+            ValueKind::Map(m) => Some(m.map.borrow().len()),
+            ValueKind::Set(s) => Some(s.set.borrow().len()),
+            ValueKind::Bytes(b) => Some(b.borrow().len()),
+            _ => None,
+        }
+    }
+
+    /// `true` if this is an empty container; `None` for a non-container.
+    pub fn is_empty(&self) -> Option<bool> {
+        self.len().map(|n| n == 0)
+    }
+
+    /// Read element `i` of an `array` (or a `bytes` element as an `int`); `None` for an
+    /// out-of-range index or a non-indexable value.
+    pub fn get(&self, i: usize) -> Option<AsValue> {
+        match self.0.kind() {
+            ValueKind::Array(a) => a.borrow().get(i).cloned().map(AsValue),
+            ValueKind::Bytes(b) => b.borrow().get(i).map(|&byte| AsValue::from(byte as i64)),
+            _ => None,
+        }
+    }
+
+    /// Read the value at string `key` of an `object` (slab-safe), or a string-keyed
+    /// `map` entry; `None` for a missing key or a non-keyed value.
+    pub fn get_key(&self, key: &str) -> Option<AsValue> {
+        match self.0.kind() {
+            ValueKind::Object(o) => o.get(key).map(AsValue),
+            ValueKind::Map(m) => {
+                let mk = crate::value::MapKey::from_value(&Value::str(key))?;
+                m.map.borrow().get(&mk).cloned().map(AsValue)
+            }
+            _ => None,
+        }
+    }
+
+    /// Write `value` to element `i` of an `array`. Routes through the engine's
+    /// `index_set` (frozen guard + bounds check preserved); a host error surfaces as
+    /// [`EmbedError`].
+    ///
+    /// `map`/`set` are READ-ONLY host-side (their `MapKey` canonicalization stays
+    /// engine-owned — construct them script-side, §5.2).
+    pub fn set(&self, i: usize, value: AsValue) -> Result<(), crate::embed::EmbedError> {
+        use crate::span::Span;
+        match self.0.kind() {
+            ValueKind::Array(_) => {
+                crate::interp::index_set(
+                    &self.0,
+                    &Value::int(i as i64),
+                    value.into_value(),
+                    Span::new(0, 0),
+                    Span::new(0, 0),
+                )
+                .map(|_| ())
+                .map_err(|e| crate::embed::EmbedError::from_panic(&e))
+            }
+            _ => Err(crate::embed::EmbedError::Config(format!(
+                "set(index) is only valid on an array, got {}",
+                self.type_name()
+            ))),
+        }
+    }
+
+    /// Write `value` at string `key` of an `object`. Routes through the SAME engine
+    /// write the stdlib/VM use: the frozen guard (so a frozen `Object`/`Shared`
+    /// receiver surfaces the engine's `cannot mutate a frozen …` panic as
+    /// [`EmbedError::Panic`]) and the slab-safe sealed `ObjectCell::insert` accessor
+    /// (so slab-shape bookkeeping + the SHAPE delete-bug invariant hold — never the
+    /// panicking `borrow_mut()` shim).
+    ///
+    /// `map`/`set` are READ-ONLY host-side (§5.2).
+    ///
+    /// [`EmbedError::Panic`]: crate::embed::EmbedError::Panic
+    pub fn set_key(&self, key: &str, value: AsValue) -> Result<(), crate::embed::EmbedError> {
+        use crate::span::Span;
+        // The frozen guard FIRST — identical to the engine's `check_not_frozen` /
+        // `index_set` chokepoint, so a frozen `Object` OR a frozen `Shared` (whose
+        // `frozen_kind` reports its underlying container kind) surfaces the byte-
+        // identical `cannot mutate a frozen {kind}` panic, NOT a bypass.
+        if let Some(kind) = crate::value::frozen_kind(&self.0) {
+            let err = crate::error::AsError::at(
+                format!("cannot mutate a frozen {kind}"),
+                Span::new(0, 0),
+            );
+            return Err(crate::embed::EmbedError::from_panic(&err));
+        }
+        match self.0.kind() {
+            ValueKind::Object(o) => {
+                // The sealed slab-safe accessor (NOT `borrow_mut()`): a new key on a
+                // slab demotes to dict + resets shape 0 internally, an existing key
+                // updates in place — the SHAPE invariant.
+                o.insert(key, value.into_value());
+                Ok(())
+            }
+            _ => Err(crate::embed::EmbedError::Config(format!(
+                "set_key is only valid on an object, got {}",
+                self.type_name()
+            ))),
+        }
+    }
+
+    /// A snapshot of an `array`'s elements (or a `set`'s values in insertion order);
+    /// empty for a non-list value. The snapshot is a `Vec` of `Rc`-bumped handles — it
+    /// does NOT alias subsequent script mutations of the container's length.
+    pub fn items(&self) -> Vec<AsValue> {
+        match self.0.kind() {
+            ValueKind::Array(a) => a.borrow().iter().cloned().map(AsValue).collect(),
+            ValueKind::Set(s) => s.set.borrow().iter().map(|k| AsValue(k.to_value())).collect(),
+            ValueKind::Bytes(b) => b
+                .borrow()
+                .iter()
+                .map(|&byte| AsValue::from(byte as i64))
+                .collect(),
+            _ => Vec::new(),
+        }
+    }
+
+    /// A snapshot of an `object`'s `(key, value)` pairs in insertion order (or a
+    /// `map`'s string-keyed pairs; non-string map keys are skipped); empty for a
+    /// non-keyed value.
+    pub fn entries(&self) -> Vec<(String, AsValue)> {
+        match self.0.kind() {
+            ValueKind::Object(o) => o
+                .entries()
+                .into_iter()
+                .map(|(k, v)| (k.to_string(), AsValue(v)))
+                .collect(),
+            ValueKind::Map(m) => m
+                .map
+                .borrow()
+                .iter()
+                .filter_map(|(k, v)| {
+                    k.to_value()
+                        .as_str()
+                        .map(|s| (s.to_string(), AsValue(v.clone())))
+                })
+                .collect(),
+            _ => Vec::new(),
+        }
+    }
+
+    /// Copy the bytes out of a `bytes` handle, or `None` for a non-bytes value.
+    pub fn as_bytes(&self) -> Option<Vec<u8>> {
+        match self.0.kind() {
+            ValueKind::Bytes(b) => Some(b.borrow().clone()),
+            _ => None,
+        }
     }
 
     /// The underlying `Value` (crate-internal — the engine side of the boundary).

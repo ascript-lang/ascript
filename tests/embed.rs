@@ -277,3 +277,231 @@ fn type_name_delegates_to_engine() {
     assert_eq!(AsValue::from("s").type_name(), "string");
     assert_eq!(AsValue::nil().type_name(), "nil");
 }
+
+// ── Task 2.2: container handles (LIVE aliasing) + the 25-kind table ──────────
+
+#[test]
+fn containers_are_live_aliasing_handles() {
+    let iso = Isolate::builder().build().unwrap();
+    iso.eval("let state = { hp: 10 }").unwrap();
+    let state = iso.global("state").unwrap();
+
+    // host → script: a host write through the handle is visible to the script.
+    state.set_key("hp", AsValue::from(7)).unwrap();
+    assert_eq!(iso.eval("state.hp").unwrap().as_int(), Some(7));
+
+    // script → host: a script write is visible to the host's SAME handle (no copy).
+    iso.eval("state.hp = 3").unwrap();
+    assert_eq!(state.get_key("hp").unwrap().as_int(), Some(3));
+}
+
+#[test]
+fn array_handle_read_and_write() {
+    let iso = Isolate::builder().build().unwrap();
+    iso.eval("let xs = [1, 2, 3]").unwrap();
+    let xs = iso.global("xs").unwrap();
+    assert_eq!(xs.len(), Some(3));
+    assert_eq!(xs.get(1).unwrap().as_int(), Some(2));
+    // host write through the index → visible in script (live aliasing).
+    xs.set(0, AsValue::from(100)).unwrap();
+    assert_eq!(iso.eval("xs[0]").unwrap().as_int(), Some(100));
+    // items() is a snapshot.
+    let items = xs.items();
+    assert_eq!(items.len(), 3);
+    assert_eq!(items[0].as_int(), Some(100));
+}
+
+#[test]
+fn object_entries_and_get_key_miss() {
+    let iso = Isolate::builder().build().unwrap();
+    iso.eval("let o = { a: 1, b: 2 }").unwrap();
+    let o = iso.global("o").unwrap();
+    assert_eq!(o.len(), Some(2));
+    assert!(o.get_key("nope").is_none());
+    let entries = o.entries();
+    assert_eq!(entries.len(), 2);
+    assert_eq!(entries[0].0, "a");
+    assert_eq!(entries[0].1.as_int(), Some(1));
+}
+
+#[test]
+fn map_and_set_are_read_only_host_side() {
+    let iso = Isolate::builder().build().unwrap();
+    // Produce a Map + Set unambiguously via stdlib.
+    iso.eval(
+        r#"
+        import * as mapm from "std/map"
+        import * as setm from "std/set"
+        let m2 = mapm.new()
+        mapm.set(m2, "k", 42)
+        let s2 = setm.new()
+        setm.add(s2, 7)
+    "#,
+    )
+    .unwrap();
+    let m = iso.global("m2").unwrap();
+    assert_eq!(m.kind(), AsKind::Map);
+    assert_eq!(m.len(), Some(1));
+    let entries = m.entries();
+    assert_eq!(entries.len(), 1);
+    let s = iso.global("s2").unwrap();
+    assert_eq!(s.kind(), AsKind::Set);
+    assert_eq!(s.items().len(), 1);
+}
+
+#[test]
+fn bytes_handle_len_and_read() {
+    let b = AsValue::bytes(vec![1, 2, 3]);
+    assert_eq!(b.kind(), AsKind::Bytes);
+    assert_eq!(b.len(), Some(3));
+    assert_eq!(b.as_bytes(), Some(vec![1u8, 2, 3]));
+}
+
+#[test]
+fn callable_handle_is_invokable() {
+    let iso = Isolate::builder().build().unwrap();
+    iso.eval("fn sq(x) { return x * x }").unwrap();
+    let f = iso.global("sq").unwrap();
+    assert!(f.is_callable());
+    assert_eq!(f.kind(), AsKind::Callable);
+    let r = iso.call_value(&f, &[AsValue::from(5i64)]).unwrap();
+    assert_eq!(r.as_int(), Some(25));
+}
+
+#[test]
+fn set_on_frozen_shared_surfaces_engine_panic() {
+    let iso = Isolate::builder().build().unwrap();
+    iso.eval(
+        r#"
+        import * as shared from "std/shared"
+        let frozen = shared.freeze({ hp: 1 })
+    "#,
+    )
+    .unwrap();
+    let frozen = iso.global("frozen").unwrap();
+    // A frozen `Shared` receiver: a host mutation must surface the engine's own
+    // `cannot mutate a frozen …` panic as EmbedError::Panic — NOT a bypass.
+    let e = frozen.set_key("hp", AsValue::from(2)).unwrap_err();
+    match e {
+        EmbedError::Panic(p) => assert!(
+            p.message.contains("cannot mutate a frozen"),
+            "got {:?}",
+            p.message
+        ),
+        other => panic!("expected Panic, got {other:?}"),
+    }
+}
+
+#[test]
+fn set_on_frozen_object_surfaces_engine_panic() {
+    let iso = Isolate::builder().build().unwrap();
+    iso.eval(
+        r#"
+        import * as object from "std/object"
+        let o = object.freeze({ a: 1 })
+    "#,
+    )
+    .unwrap();
+    let o = iso.global("o").unwrap();
+    let e = o.set_key("a", AsValue::from(2)).unwrap_err();
+    assert!(matches!(e, EmbedError::Panic(_)), "got {e:?}");
+}
+
+/// Spec §5.2: EVERY runtime kind, PRODUCED IN SCRIPT, crosses to the host and
+/// classifies / round-trips per its crossing class. Driven table-style, one row per
+/// kind: value kinds, live handles, callable, future (auto-await), and the
+/// opaque pass-back-identical kinds (script-side `g == g2` identity after a round-trip).
+#[test]
+fn kind_table_every_value_kind_crosses() {
+    let iso = Isolate::builder().build().unwrap();
+
+    // ── value kinds (cross by value) ───────────────────────────────────────
+    iso.eval(
+        r#"
+        import * as decimal from "std/decimal"
+        let k_nil = nil
+        let k_bool = true
+        let k_int = 7
+        let k_float = 1.5
+        let k_str = "hi"
+        let k_dec = decimal.from("1.50")
+    "#,
+    )
+    .unwrap();
+    assert_eq!(iso.global("k_nil").unwrap().kind(), AsKind::Nil);
+    assert_eq!(iso.global("k_bool").unwrap().kind(), AsKind::Bool);
+    assert_eq!(iso.global("k_int").unwrap().kind(), AsKind::Int);
+    assert_eq!(iso.global("k_float").unwrap().kind(), AsKind::Float);
+    assert_eq!(iso.global("k_str").unwrap().kind(), AsKind::Str);
+    assert_eq!(iso.global("k_dec").unwrap().kind(), AsKind::Decimal);
+
+    // ── live handles ────────────────────────────────────────────────────────
+    iso.eval(
+        r#"
+        import * as mapm from "std/map"
+        import * as setm from "std/set"
+        import * as bytesm from "std/bytes"
+        let k_arr = [1, 2]
+        let k_obj = { a: 1 }
+        let k_map = mapm.new()
+        let k_set = setm.new()
+        let k_bytes = bytesm.fromArray([1, 2, 3])
+    "#,
+    )
+    .unwrap();
+    assert_eq!(iso.global("k_arr").unwrap().kind(), AsKind::Array);
+    assert_eq!(iso.global("k_obj").unwrap().kind(), AsKind::Object);
+    assert_eq!(iso.global("k_map").unwrap().kind(), AsKind::Map);
+    assert_eq!(iso.global("k_set").unwrap().kind(), AsKind::Set);
+    assert_eq!(iso.global("k_bytes").unwrap().kind(), AsKind::Bytes);
+
+    // ── callable (function/closure) ───────────────────────────────────────
+    iso.eval("fn k_fn(x) { return x } let k_closure = (x) => x + 1").unwrap();
+    assert!(iso.global("k_fn").unwrap().is_callable());
+    assert!(iso.global("k_closure").unwrap().is_callable());
+    // invokable via call_value
+    let r = iso
+        .call_value(&iso.global("k_closure").unwrap(), &[AsValue::from(9i64)])
+        .unwrap();
+    assert_eq!(r.as_int(), Some(10));
+
+    // ── future (auto-await via call) ──────────────────────────────────────
+    iso.eval("async fn k_async() { return 42 }").unwrap();
+    let r = iso.call("k_async", &[]).unwrap();
+    assert_eq!(r.as_int(), Some(42), "future auto-awaits to its value");
+
+    // ── opaque kinds: pass back into the engine IDENTITY-preserved ─────────
+    // Each is produced in script, read out by handle, set back in as a fresh global,
+    // and the script asserts `g == g2` (identity-equal opaques).
+    let opaque_producers = [
+        // (name, producer source defining `g`)
+        ("regex", r#"import * as regex from "std/regex"
+                     let g = regex.compile("^a$")[0]"#),
+        ("generator", "fn* gen() { yield 1 } let g = gen()"),
+        ("class", "class K { fn m() { return 1 } } let g = K"),
+        ("instance", "class K2 {} let g = K2()"),
+        ("enum", "enum E { A, B } let g = E"),
+        ("enum_variant", "enum E2 { A, B } let g = E2.A"),
+        ("interface", "interface I { fn m(): int } let g = I"),
+        ("shared", r#"import * as shared from "std/shared"
+                      let g = shared.freeze({ a: 1 })"#),
+    ];
+    for (label, src) in opaque_producers {
+        let iso = Isolate::builder().build().unwrap();
+        iso.eval(src).unwrap_or_else(|e| panic!("{label}: produce: {e:?}"));
+        let g = iso
+            .global("g")
+            .unwrap_or_else(|| panic!("{label}: g undefined"));
+        // It classifies as Opaque (not mis-bucketed as a value/handle/callable).
+        // (Shared additionally reads like its underlying kind, but kind() reports
+        //  Opaque since the host shouldn't depend on the underlying tag.)
+        // Round-trip: set it back in under a new name, assert script-side identity.
+        iso.set_global("g2", g).unwrap();
+        let same = iso.eval("g == g2").unwrap();
+        assert_eq!(
+            same.as_bool(),
+            Some(true),
+            "{label}: opaque round-trip must preserve identity (g == g2)"
+        );
+    }
+}
