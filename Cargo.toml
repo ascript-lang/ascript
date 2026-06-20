@@ -128,6 +128,7 @@ p256 = { version = "0.13", features = ["ecdsa"], optional = true }
 # fail-closed HTML sanitizer (std/html) tokenizer. quick-xml 0.39 is lock-resident
 # (apple-codesign). std/archive reuses the vendored tar/zip/flate2 (zero new deps).
 quick-xml = { version = "0.39", default-features = false, optional = true }
+pulldown-cmark = { version = "0.13", default-features = false, optional = true }
 rusqlite = { version = "0.32", features = ["bundled"], optional = true }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream", "multipart", "cookies", "gzip", "brotli", "deflate", "zstd", "socks", "http2"], optional = true }
 hyper = { version = "1", features = ["server", "http1"], optional = true }
@@ -216,7 +217,7 @@ indexmap = "2"
 ascript = { path = ".", features = ["fuzzgen"] }
 
 [features]
-default = ["data", "datetime", "intl", "sys", "crypto", "compress", "sql", "net", "tui", "lsp", "dap", "doc", "log", "sysinfo", "binary", "postgres", "redis", "workflow", "pkg", "telemetry", "ai", "ffi", "shared", "profile", "bundle-zstd", "rt-fetch", "resilience", "docker", "tls", "auth", "archive", "xml", "email", "blob"]
+default = ["data", "datetime", "intl", "sys", "crypto", "compress", "sql", "net", "tui", "lsp", "dap", "doc", "log", "sysinfo", "binary", "postgres", "redis", "workflow", "pkg", "telemetry", "ai", "ffi", "shared", "profile", "bundle-zstd", "rt-fetch", "resilience", "docker", "tls", "auth", "archive", "xml", "email", "blob", "cron", "semver", "markdown", "diff"]
 # RT §5.1/§5.2 — the signed-manifest verification + stub fetch half of the
 # runtime-stub distribution path. Pulls `net` (the pooled reqwest client used to fetch
 # the release manifest + stub blobs) and `ed25519-dalek` (verify the detached manifest
@@ -413,6 +414,15 @@ xml = ["data", "dep:quick-xml"]
 email = ["net", "tls", "data"]
 # blob: S3-compatible object storage (SigV4 signing) over the pooled HTTP client.
 blob = ["net", "crypto", "data", "xml"]
+# BATT Phase D — the T2 toolbelt.
+# cron: 5-field cron parsing + next/schedule (civil-time math via chrono).
+cron = ["datetime"]
+# semver: SemVer 2.0.0 parse/compare + node-semver-subset ranges (hand-rolled, no dep).
+semver = []
+# markdown: CommonMark → HTML over pulldown-cmark, piped through the html sanitizer.
+markdown = ["xml", "dep:pulldown-cmark"]
+# diff: Myers line/char diff + unified format + the assert.snapshot diff wiring.
+diff = []
 
 [lints.clippy]
 await_holding_refcell_ref = "deny"
