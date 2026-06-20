@@ -3760,6 +3760,20 @@ impl Interp {
             .insert(Rc::clone(name), Rc::new(def));
     }
 
+    /// EMBED §6.4: clear ALL registered host modules on this isolate. The POOLED worker
+    /// loop calls this at the top of each request (BEFORE installing the request's fresh
+    /// factory set) so a module installed by request A's factory cannot leak forward into
+    /// request B (the caps-floor no-leak discipline — two Isolates sharing one pool thread
+    /// must not see each other's host modules). The cached `ModuleEntry`s under `<host>/…`
+    /// in `modules` are dropped too, so a re-import re-resolves against the fresh registry.
+    pub fn clear_host_modules(&self) {
+        self.host_modules.borrow_mut().clear();
+        // Cached host `ModuleEntry`s are keyed under a `<host>/…` first component.
+        self.modules
+            .borrow_mut()
+            .retain(|k, _| !k.starts_with(std::path::Path::new("<host>")));
+    }
+
     /// Classify an `import` specifier three ways, SHARED byte-identically by both
     /// engines (SP6 §6). The split, in order:
     ///

@@ -178,6 +178,15 @@ pub(crate) fn dispatch_worker_job(
         // read-only floor (a `Send` side-channel field, not a `Value`). The isolate
         // installs it fresh per request + refuses a drop there.
         caps: Box::new(interp.caps()),
+        // EMBED §6.4: ship the dispatching isolate's host-module FACTORIES the SAME way
+        // `caps` rides (a `Send` side-channel, not a `Value`). The pooled isolate installs
+        // them FRESH per request (clear-then-install) so a `worker fn` importing a
+        // factory-registered `host:` module resolves it. Empty for a non-embed program.
+        host_factories: interp
+            .host_factories()
+            .into_iter()
+            .map(|(name, f)| (name.to_string(), f))
+            .collect(),
         reply: reply_tx,
         abort: abort_rx,
         // PAR §3.3.2: thread the chunk job through to the isolate (None = pre-PAR path).
@@ -199,6 +208,10 @@ pub(crate) fn dispatch_worker_job(
                 &req.args,
                 &req.shared,
                 *req.caps,
+                // EMBED §6.4: forward the host-module factories so the inline-degraded
+                // run installs them too (authority + host-module parity with the pooled
+                // path — a `worker fn` importing a factory module works either way).
+                &req.host_factories,
                 // PAR §3.5: forward the chunk job to the inline path (venue-invariance §5.1).
                 req.chunk,
                 span,
@@ -314,6 +327,7 @@ fn run_slice_inline(
     encoded_args: &[u8],
     encoded_shared: &[std::sync::Arc<crate::value::SharedNode>],
     caps: crate::stdlib::caps::CapSet,
+    host_factories: &[(String, std::sync::Arc<crate::interp::HostModuleFactoryCore>)],
     chunk: Option<ChunkJob>,
     span: Span,
 ) -> Result<Value, Control> {
@@ -325,6 +339,12 @@ fn run_slice_inline(
     // whether it runs on a pool isolate or degrades to inline (byte-identical authority).
     iso_interp.set_caps(caps);
     iso_interp.set_caps_drop_allowed(false);
+    // EMBED §6.4: install the host-module factories so a `worker fn` importing a
+    // factory-registered `host:` module resolves it on the inline-degraded path too.
+    for (name, factory) in host_factories {
+        let name_rc: Rc<str> = Rc::from(name.as_str());
+        iso_interp.install_host_factory(&name_rc, factory);
+    }
     let vm = crate::vm::Vm::new(iso_interp.clone());
 
     // Decode the args against the fresh interp (cycles / class reconstruction resolve
@@ -430,6 +450,14 @@ pub fn dispatch_worker_dedicated(
     // Task 1.6: capture the bundled program's archive bytes (if any) into the `Send`
     // `make_loop` closure so the dedicated isolate installs it before its re-run imports.
     let archive_bytes: Option<Vec<u8>> = interp.worker_archive_bytes().map(|b| b.to_vec());
+    // EMBED §6.4: capture the host-module FACTORIES (a `Send + Sync` list, like the
+    // `CapSet`) directly into the `Send` `make_loop` closure (path-a — it never rides the
+    // byte channel). The dedicated isolate installs them ONCE at boot (single-tenant).
+    let host_factories: Vec<(String, std::sync::Arc<crate::interp::HostModuleFactoryCore>)> = interp
+        .host_factories()
+        .into_iter()
+        .map(|(name, f)| (name.to_string(), f))
+        .collect();
 
     // `Send` back-channel for the one reply (the dedicated isolate is single-shot here).
     let (reply_tx, reply_rx) = std::sync::mpsc::channel::<isolate::WorkerReply>();
@@ -442,6 +470,14 @@ pub fn dispatch_worker_dedicated(
         // BEFORE running any plugin code. `caps_drop_allowed` stays true (the default):
         // a dedicated isolate is single-tenant, so an in-plugin drop is terminal.
         iso_interp.set_caps(caps);
+
+        // EMBED §6.4: install the captured host-module factories on the fresh, single-
+        // tenant isolate (once, at boot) so a `worker fn` importing a factory-registered
+        // `host:` module resolves it. Empty for a non-embed program.
+        for (name, factory) in &host_factories {
+            let name_rc: Rc<str> = Rc::from(name.as_str());
+            iso_interp.install_host_factory(&name_rc, factory);
+        }
 
         // Task 1.6: install the bundled program's archive BEFORE the slice loads (the slice
         // re-runs the program's top-level imports). `None` (unbundled) installs nothing.

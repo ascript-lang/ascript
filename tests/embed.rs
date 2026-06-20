@@ -707,3 +707,161 @@ fn unregistered_host_module_is_a_clean_recoverable_panic() {
         .unwrap();
     assert_eq!(iso2.take_output(), "kaboom\n");
 }
+
+// ── Task 3.3: worker host-module rules — miss panic + Send factories (§6.4) ──
+
+use std::sync::Arc;
+
+#[test]
+fn worker_fn_without_factory_misses_host_module() {
+    // `host:app` registered MAIN-isolate-only (host_module, not factory). A `worker fn`
+    // body importing it runs in a fresh worker isolate that has no registration → the
+    // §6.4 worker-specific miss panic. The whole program panics (the worker future's
+    // error propagates through await), surfaced as EmbedError::Panic with that message.
+    let iso = Isolate::builder()
+        .output(ascript::embed::OutputMode::Capture)
+        .host_module("host:app", |m: &mut HMB| {
+            m.func("double", |_c, a| Ok(AsValue::from(a[0].as_int().unwrap_or(0) * 2)));
+        })
+        .unwrap()
+        .build()
+        .unwrap();
+    let e = iso
+        .eval(
+            r#"
+            import * as task from "std/task"
+            worker fn w(n) {
+                import * as app from "host:app"
+                return app.double(n)
+            }
+            await w(21)
+        "#,
+        )
+        .unwrap_err();
+    match e {
+        EmbedError::Panic(p) => assert!(
+            p.message.contains(
+                "host module 'host:app' is not available in a worker isolate \
+                 (register it with host_module_factory to install it per-isolate)"
+            ),
+            "§6.4 worker miss message; got: {}",
+            p.message
+        ),
+        other => panic!("expected Panic, got {other:?}"),
+    }
+}
+
+#[test]
+fn worker_fn_with_factory_resolves_host_module_pooled() {
+    // A `host_module_factory` installs `host:app` in every worker isolate this Isolate
+    // spawns → the pooled `worker fn` resolves it and returns the doubled value.
+    let iso = Isolate::builder()
+        .output(ascript::embed::OutputMode::Capture)
+        .host_module_factory(
+            "host:app",
+            Arc::new(|m: &mut HMB| {
+                m.func("double", |_c, a| {
+                    Ok(AsValue::from(a[0].as_int().unwrap_or(0) * 2))
+                });
+            }),
+        )
+        .unwrap()
+        .build()
+        .unwrap();
+    iso.eval(
+        r#"
+        import * as task from "std/task"
+        worker fn w(n) {
+            import * as app from "host:app"
+            return app.double(n)
+        }
+        let r = await w(21)
+        print(r)
+    "#,
+    )
+    .expect("worker with factory resolves host:app");
+    assert_eq!(iso.take_output(), "42\n");
+}
+
+#[test]
+fn worker_fn_with_factory_resolves_host_module_dedicated() {
+    // The dedicated `run_in_worker` path captures the factory list in the Send make_loop
+    // closure and installs it at boot.
+    let iso = Isolate::builder()
+        .output(ascript::embed::OutputMode::Capture)
+        .caps(ascript::embed::Caps::all_granted())
+        .host_module_factory(
+            "host:app",
+            Arc::new(|m: &mut HMB| {
+                m.func("triple", |_c, a| {
+                    Ok(AsValue::from(a[0].as_int().unwrap_or(0) * 3))
+                });
+            }),
+        )
+        .unwrap()
+        .build()
+        .unwrap();
+    iso.eval(
+        r#"
+        worker fn w(n) {
+            import * as app from "host:app"
+            return app.triple(n)
+        }
+        let r = await run_in_worker(w, 10, { caps: { deny: [] } })
+        print(r)
+    "#,
+    )
+    .expect("dedicated run_in_worker resolves host:app via factory");
+    assert_eq!(iso.take_output(), "30\n");
+}
+
+#[test]
+fn pooled_workers_do_not_leak_host_modules_across_isolates() {
+    // §6.4 no-leak (the caps-floor discipline): Isolate A (factory) and Isolate B (none)
+    // dispatch `worker fn`s on the SAME host thread's pool. Each pooled request installs
+    // its OWN factory set FRESH (clear-then-install), so B's worker must still MISS
+    // `host:app` even though A registered it via a factory on the shared pool thread.
+    let prog = r#"
+        worker fn w(n) {
+            import * as app from "host:app"
+            return app.double(n)
+        }
+        await w(5)
+    "#;
+
+    // Isolate A: factory present → its worker resolves host:app.
+    let a = Isolate::builder()
+        .output(ascript::embed::OutputMode::Capture)
+        .host_module_factory(
+            "host:app",
+            Arc::new(|m: &mut HMB| {
+                m.func("double", |_c, x| Ok(AsValue::from(x[0].as_int().unwrap_or(0) * 2)));
+            }),
+        )
+        .unwrap()
+        .build()
+        .unwrap();
+    let ra = a.eval(prog);
+    assert!(ra.is_ok(), "A (factory) resolves: {ra:?}");
+
+    // Isolate B: NO factory → its worker (on the same pool thread) must STILL miss,
+    // proving A's factory did not leak forward to B's request.
+    let b = Isolate::builder()
+        .output(ascript::embed::OutputMode::Capture)
+        .host_module("host:app", |m: &mut HMB| {
+            // registered MAIN-only on B (not a factory) — so B's worker must miss.
+            m.func("double", |_c, x| Ok(AsValue::from(x[0].as_int().unwrap_or(0) * 2)));
+        })
+        .unwrap()
+        .build()
+        .unwrap();
+    let e = b.eval(prog).unwrap_err();
+    match e {
+        EmbedError::Panic(p) => assert!(
+            p.message.contains("is not available in a worker isolate"),
+            "B's worker must miss (no leak from A); got: {}",
+            p.message
+        ),
+        other => panic!("expected B's worker to miss, got {other:?}"),
+    }
+}
