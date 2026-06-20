@@ -456,6 +456,42 @@ impl Isolate {
         Ok(())
     }
 
+    /// Register (or REPLACE) a host module on this **already-built** isolate (spec §8.2,
+    /// the capi late-registration hook — the C API's `as_register_host_fn` accumulates a
+    /// module's functions one call at a time and re-installs the whole module each call).
+    ///
+    /// Most hosts register host modules on the [`IsolateBuilder`] before [`build`]; this
+    /// is the post-construction path the C API needs (where there is no builder to thread
+    /// closures through).
+    ///
+    /// # The memoization rule (the contract)
+    ///
+    /// A host module is memoized the FIRST time a script `import`s it; a late registration
+    /// of an ALREADY-IMPORTED module is a hard [`EmbedError::Config`] (the cached module
+    /// is not retro-patched, so a silently-invisible function would be a footgun). Register
+    /// a module's functions **before the first `import "host:<name>"`**. A never-imported
+    /// module re-resolves against the fresh registry, so replacing it is sound.
+    ///
+    /// # Errors
+    ///
+    /// [`EmbedError::Config`] on an invalid name (§6.1) or if the module was already
+    /// imported by a script.
+    ///
+    /// [`build`]: IsolateBuilder::build
+    pub fn register_host_module_late(
+        &self,
+        name: &str,
+        f: impl FnOnce(&mut HostModuleBuilder),
+    ) -> Result<(), EmbedError> {
+        host::validate_module_name(name).map_err(EmbedError::Config)?;
+        let mut builder = HostModuleBuilder::new();
+        f(&mut builder);
+        self.vm
+            .interp()
+            .register_host_module_late(name, builder.finish())
+            .map_err(EmbedError::Config)
+    }
+
     /// Parse a JSON string into a fresh [`AsValue`] (a DEEP COPY — explicitly distinct
     /// from the live aliasing handles, spec §5.3). Routes through `std/json`'s total
     /// parser. The inverse of [`AsValue::to_json`](AsValue::to_json).

@@ -1,0 +1,25 @@
+[package]
+name = "ascript-capi"
+version = "0.6.0"
+edition = "2021"
+publish = false
+description = "The C ABI for embedding the AScript engine (EMBED §8) — cdylib + staticlib over ascript::embed."
+
+[lib]
+name = "ascript_capi"
+crate-type = ["cdylib", "staticlib"]
+
+[dependencies]
+# The embedding facade — the ONLY surface this crate wraps (EMBED §8.1). `default-features`
+# stay on so the JSON bridge (`data`) is present.
+ascript = { path = "..", features = ["embed"] }
+
+[dev-dependencies]
+# Compile the C smoke test at test time (§8.3); `tempfile` stages the build dir.
+cc = "1"
+tempfile = "3"
+
+# Own empty workspace — the `tree-sitter-ascript/` precedent (CLAUDE.md): a sibling crate
+# that NEVER enters the root build graph, so `cargo build`/`cargo test` at the repo root are
+# byte-identically unaffected. Verify with `cargo tree -e normal` (ascript-capi absent).
+[workspace]

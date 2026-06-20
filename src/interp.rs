@@ -3759,6 +3759,37 @@ impl Interp {
         Ok(())
     }
 
+    /// EMBED §8.2 (capi late registration): register (or REPLACE) a host module
+    /// AFTER construction, e.g. the C API's `as_register_host_fn` accumulating a
+    /// module's fns one call at a time. Unlike [`Self::register_host_module`] a same-name
+    /// re-registration is NOT an error here (the capi caller re-installs the whole module
+    /// each call, accumulating fns host-side).
+    ///
+    /// **The memoization rule** (documented contract): a host module is memoized as a
+    /// `ModuleEntry` the FIRST time a script `import`s it. A module registered AFTER that
+    /// first import would NOT be visible (the cached `ModuleEntry` is not retro-patched),
+    /// so late registration of an ALREADY-IMPORTED module is a hard `Err` — the caller must
+    /// register a module's fns BEFORE the first `import "host:<name>"`. (A module that has
+    /// never been imported re-resolves against the fresh registry, so replacement is sound.)
+    pub fn register_host_module_late(
+        &self,
+        full_name: &str,
+        def: HostModuleDef,
+    ) -> Result<(), String> {
+        // The memoized `ModuleEntry` for a host module is keyed `<host>/<host:name>`.
+        let key = PathBuf::from(format!("<host>/{full_name}"));
+        if self.modules.borrow().contains_key(&key) {
+            return Err(format!(
+                "host module '{full_name}' was already imported by a script — \
+                 register its functions BEFORE the first import of that module"
+            ));
+        }
+        self.host_modules
+            .borrow_mut()
+            .insert(Rc::from(full_name), Rc::new(def));
+        Ok(())
+    }
+
     /// EMBED §6.3: the registered `HostModuleDef` for a `host:<name>` key (None if the
     /// isolate did not register it — the worker-miss / CLI-miss case). Consumed by the
     /// `host:` import + dispatch arms (Task 3.2).
