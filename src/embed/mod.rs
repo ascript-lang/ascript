@@ -832,6 +832,34 @@ print(v, e1 == nil, n, e2.message)
     }
 
     #[test]
+    fn late_registration_before_import_works_after_errors() {
+        // EMBED §8.2: `register_host_module_late` (the capi hook) — a module registered
+        // BEFORE its first import is visible; registering on an ALREADY-imported module
+        // is a hard `Config` error (the memoized ModuleEntry is not retro-patched).
+        let iso = Isolate::builder().output(OutputMode::Capture).build().unwrap();
+        // Register late, then import + call — visible.
+        iso.register_host_module_late("host:late", |m| {
+            m.func("ping", |_c, _a| Ok(AsValue::from("pong")));
+        })
+        .unwrap();
+        iso.eval("import * as l from \"host:late\"\nprint(l.ping())")
+            .unwrap();
+        assert_eq!(iso.take_output(), "pong\n");
+        // A SECOND late registration on the now-imported module errors.
+        let err = iso
+            .register_host_module_late("host:late", |m| {
+                m.func("ping2", |_c, _a| Ok(AsValue::nil()));
+            })
+            .unwrap_err();
+        match err {
+            EmbedError::Config(msg) => {
+                assert!(msg.contains("already imported"), "msg: {msg}");
+            }
+            other => panic!("expected Config, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn host_module_program_is_byte_identical_across_engines() {
         // The VM side blocks on its own owned runtime; the tree-walker side needs a
         // current-thread runtime to drive its LocalSet. Run the VM side first (it owns

@@ -23,11 +23,12 @@
 #![allow(clippy::missing_safety_doc)]
 
 use std::cell::{Cell, RefCell};
-use std::ffi::{c_char, c_int, CString};
+use std::collections::HashMap;
+use std::ffi::{c_char, c_int, c_void, CString};
 use std::panic::AssertUnwindSafe;
 use std::thread::ThreadId;
 
-use ascript::embed::{AsKind, AsValue, EmbedError, Isolate, OutputMode};
+use ascript::embed::{AsKind, AsValue, EmbedError, HostCtx, HostError, Isolate, OutputMode};
 
 // ── status codes (mirrors `as_status` in ascript.h) ─────────────────────────
 
@@ -114,8 +115,23 @@ fn embed_status(e: &EmbedError) -> (as_status, String) {
 
 // ── handles ─────────────────────────────────────────────────────────────────
 
+/// A single registered C host function: the callback, its userdata, and its tier.
+///
+/// `userdata` is a raw pointer the HOST promises is thread-affine to this isolate (the
+/// header documents it). `CHostFn` is `!Send` (it holds raw pointers), so it never
+/// crosses a thread by construction — the promise is structural on the Rust side.
+#[derive(Clone, Copy)]
+struct CHostFn {
+    func: as_host_fn,
+    userdata: *mut c_void,
+    /// `true` = a fallible (Tier-1 `[value, err]`) fn; `false` = plain (Tier-2 on error).
+    fallible: bool,
+}
+
 /// The C `as_isolate` handle: the embed [`Isolate`], its owning `ThreadId`, a
-/// per-isolate last-error buffer, and a poison flag (EMBED §8.2).
+/// per-isolate last-error buffer, a poison flag (EMBED §8.2), and the accumulator of
+/// C host functions registered per `host:<module>` (so repeated `as_register_host_fn`
+/// calls for one module ACCUMULATE — each call re-installs the whole module).
 pub struct CIsolate {
     iso: Isolate,
     thread: ThreadId,
@@ -125,6 +141,8 @@ pub struct CIsolate {
     /// Set when a caught Rust panic poisoned the isolate; every subsequent call (except
     /// `as_isolate_free`/`as_last_error`) returns `AS_ERR_POISONED`.
     poisoned: Cell<bool>,
+    /// `host:<module>` → its accumulated `fname → CHostFn` map.
+    host_fns: RefCell<HashMap<String, HashMap<String, CHostFn>>>,
 }
 
 impl CIsolate {
@@ -207,6 +225,7 @@ pub extern "C" fn as_isolate_new() -> *mut CIsolate {
             thread: std::thread::current().id(),
             last_error: RefCell::new(CString::new("").unwrap()),
             poisoned: Cell::new(false),
+            host_fns: RefCell::new(HashMap::new()),
         })),
         _ => std::ptr::null_mut(),
     }
@@ -584,6 +603,292 @@ pub unsafe extern "C" fn as_value_string(
     }
 }
 
+// ── JSON bridge + output (Task 4.2) ─────────────────────────────────────────
+
+/// Deep-serialize a value to a JSON string (`*out`/`*len`; free with [`as_string_free`]).
+/// Routes through the isolate's `std/json` serializer. `AS_ERR_CONFIG` on a
+/// non-serializable kind or a reference cycle (message in [`as_last_error`]).
+#[no_mangle]
+pub unsafe extern "C" fn as_value_to_json(
+    iso: *const CIsolate,
+    v: *const CValue,
+    out: *mut *mut c_char,
+    len: *mut usize,
+) -> as_status {
+    if iso.is_null() || out.is_null() || len.is_null() {
+        return AS_ERR_CONFIG;
+    }
+    // SAFETY: NULL checked; host promises a valid `iso`.
+    let c = &*iso;
+    if std::thread::current().id() != c.thread {
+        return AS_ERR_WRONG_THREAD;
+    }
+    if c.poisoned.get() {
+        return AS_ERR_POISONED;
+    }
+    match std::panic::catch_unwind(AssertUnwindSafe(|| {
+        let cv = value_ref(v)?;
+        if cv.thread != c.thread {
+            return Err(AS_ERR_WRONG_THREAD);
+        }
+        cv.v.to_json().map_err(|e| {
+            let (_s, msg) = embed_status(&e);
+            c.set_error(&msg);
+            AS_ERR_CONFIG
+        })
+    })) {
+        Ok(Ok(json)) => {
+            store_cstring(out, len, json);
+            AS_OK
+        }
+        Ok(Err(status)) => status,
+        Err(_) => {
+            c.poisoned.set(true);
+            c.set_error("internal panic (isolate poisoned)");
+            AS_ERR_INTERNAL
+        }
+    }
+}
+
+/// Parse `len` UTF-8 JSON bytes into a fresh value handle (a DEEP COPY). `*out` receives
+/// a caller-owned handle on `AS_OK`. `AS_ERR_CONFIG` on invalid JSON.
+#[no_mangle]
+pub unsafe extern "C" fn as_json_parse(
+    iso: *mut CIsolate,
+    json: *const c_char,
+    len: usize,
+    out: *mut *mut CValue,
+) -> as_status {
+    with_isolate(iso, |c| {
+        let text = match read_utf8(json, len) {
+            Ok(s) => s,
+            Err(status) => return status,
+        };
+        match c.iso.json_parse(text) {
+            Ok(v) => {
+                store_value(out, v, c.thread);
+                AS_OK
+            }
+            Err(e) => {
+                let (_s, msg) = embed_status(&e);
+                c.set_error(&msg);
+                AS_ERR_CONFIG
+            }
+        }
+    })
+}
+
+/// Drain the isolate's captured output (`*out`/`*len`; free with [`as_string_free`]).
+/// Empty under inherit/no-output. The buffer is cleared (drained), so repeated calls
+/// return only NEW output.
+#[no_mangle]
+pub unsafe extern "C" fn as_take_output(
+    iso: *mut CIsolate,
+    out: *mut *mut c_char,
+    len: *mut usize,
+) -> as_status {
+    if out.is_null() || len.is_null() {
+        return AS_ERR_CONFIG;
+    }
+    with_isolate(iso, |c| {
+        let s = c.iso.take_output();
+        store_cstring(out, len, s);
+        AS_OK
+    })
+}
+
+/// Box a Rust `String` into a heap C string (interior NULs replaced) + its byte length,
+/// transfer ownership to the caller (`as_string_free`).
+///
+/// SAFETY: `out`/`len` must be valid out-pointers (checked by callers).
+unsafe fn store_cstring(out: *mut *mut c_char, len: *mut usize, s: String) {
+    let cleaned = s.replace('\0', " ");
+    let byte_len = cleaned.len();
+    let c = CString::new(cleaned).unwrap_or_else(|_| CString::new("").unwrap());
+    *len = byte_len;
+    *out = c.into_raw();
+}
+
+/// Free a string returned by `as_value_to_json`/`as_take_output`. NULL-safe.
+#[no_mangle]
+pub unsafe extern "C" fn as_string_free(s: *mut c_char) {
+    if s.is_null() {
+        return;
+    }
+    // SAFETY: `s` came from `CString::into_raw` (the only producer).
+    let _ = CString::from_raw(s);
+}
+
+// ── host functions (Task 4.2) ───────────────────────────────────────────────
+
+/// A C host-function callback (EMBED §8.2). On success the callback writes a result
+/// handle to `*out` (ownership transfers to the engine — the engine frees it). On error
+/// it returns a non-`AS_OK` status and MAY write an `as_string_free`-able message to
+/// `*err_utf8`.
+///
+/// `tier` semantics are set at registration: a fallible (tier 1) fn's error becomes the
+/// script-visible `[nil, err]` pair; a plain (tier 0) fn's error becomes a Tier-2 panic.
+///
+/// `userdata` is the raw pointer passed at registration — the host promises it is
+/// thread-affine to the isolate.
+#[allow(non_camel_case_types)]
+pub type as_host_fn = unsafe extern "C" fn(
+    userdata: *mut c_void,
+    iso: *mut CIsolate,
+    args: *const *const CValue,
+    nargs: usize,
+    out: *mut *mut CValue,
+    err_utf8: *mut *mut c_char,
+) -> as_status;
+
+/// Register a C-callback host function under `host:<module>` on the isolate (late
+/// registration — must precede the FIRST `import` of that module, EMBED §8.2). Repeated
+/// calls for the same module ACCUMULATE; each call re-installs the whole module.
+///
+/// `tier`: 0 = plain (an error → Tier-2 panic); 1 = fallible (an error → the
+/// script-visible `[nil, err]` pair). The callback + `userdata` are wrapped in a Rust
+/// closure (the closure is `!Send`, so the host's thread-affinity promise on `userdata`
+/// is structural).
+#[no_mangle]
+pub unsafe extern "C" fn as_register_host_fn(
+    iso: *mut CIsolate,
+    module: *const c_char,
+    module_len: usize,
+    name: *const c_char,
+    name_len: usize,
+    func: Option<as_host_fn>,
+    userdata: *mut c_void,
+    tier: c_int,
+) -> as_status {
+    with_isolate(iso, |c| {
+        let module = match read_utf8(module, module_len) {
+            Ok(s) => s.to_string(),
+            Err(status) => return status,
+        };
+        let fname = match read_utf8(name, name_len) {
+            Ok(s) => s.to_string(),
+            Err(status) => return status,
+        };
+        let Some(func) = func else {
+            return AS_ERR_CONFIG;
+        };
+        let entry = CHostFn {
+            func,
+            userdata,
+            fallible: tier == 1,
+        };
+        // Accumulate this fn into the module's map.
+        {
+            let mut map = c.host_fns.borrow_mut();
+            map.entry(module.clone()).or_default().insert(fname, entry);
+        }
+        // Re-install the WHOLE module (late registration replaces the registry entry; the
+        // engine errors if the module was already imported by a script). Clone the fn map
+        // out of the borrow before building (the builder closure runs synchronously, but
+        // keep the borrow scope tight — the standing discipline).
+        let fns: HashMap<String, CHostFn> = c
+            .host_fns
+            .borrow()
+            .get(&module)
+            .cloned()
+            .unwrap_or_default();
+        // The isolate's own ThreadId — captured so the result/arg CValue boxes the
+        // callback bridge creates carry the right owning thread.
+        let thread = c.thread;
+        let result = c.iso.register_host_module_late(&module, move |b| {
+            for (fname, entry) in &fns {
+                let entry = *entry;
+                let bridge = make_c_bridge(entry, thread);
+                if entry.fallible {
+                    b.fallible_func(fname, bridge);
+                } else {
+                    b.func(fname, bridge);
+                }
+            }
+        });
+        match result {
+            Ok(()) => AS_OK,
+            Err(e) => {
+                let (status, msg) = embed_status(&e);
+                c.set_error(&msg);
+                status
+            }
+        }
+    })
+}
+
+/// Build the Rust closure that bridges a registered C host fn into the engine: marshal
+/// the `&[AsValue]` args into caller-owned `CValue` boxes, invoke the C callback, and
+/// adapt its result/`out`/`err` back to `Result<AsValue, HostError>`.
+fn make_c_bridge(
+    entry: CHostFn,
+    thread: ThreadId,
+) -> impl Fn(&mut HostCtx, &[AsValue]) -> Result<AsValue, HostError> + 'static {
+    move |_ctx: &mut HostCtx, args: &[AsValue]| {
+        // Box each arg as a CValue the callback can read; collect the raw pointers.
+        let boxes: Vec<*mut CValue> = args
+            .iter()
+            .map(|a| {
+                Box::into_raw(Box::new(CValue {
+                    v: a.clone(),
+                    thread,
+                }))
+            })
+            .collect();
+        let arg_ptrs: Vec<*const CValue> = boxes.iter().map(|&p| p as *const CValue).collect();
+        let mut out: *mut CValue = std::ptr::null_mut();
+        let mut err: *mut c_char = std::ptr::null_mut();
+        // SAFETY: the callback came from `as_register_host_fn`; we pass it valid arg
+        // pointers + out/err slots. `iso` is NULL here (re-entrant eval is rejected v1 —
+        // the callback must NOT call back into the isolate; a host that does gets a
+        // NULL-isolate AS_ERR_CONFIG, never UB).
+        let status = unsafe {
+            (entry.func)(
+                entry.userdata,
+                std::ptr::null_mut(),
+                arg_ptrs.as_ptr(),
+                arg_ptrs.len(),
+                &mut out,
+                &mut err,
+            )
+        };
+        // Reclaim the arg boxes (we own them).
+        for p in boxes {
+            // SAFETY: each `p` came from `Box::into_raw` just above and was not freed.
+            drop(unsafe { Box::from_raw(p) });
+        }
+        if status == AS_OK {
+            // Take ownership of the out handle (the callback transferred it).
+            let value = if out.is_null() {
+                AsValue::nil()
+            } else {
+                // SAFETY: `out` came from a CValue box the callback created via a value
+                // constructor (or our `store_value`), ownership transferred to us.
+                let boxed = unsafe { Box::from_raw(out) };
+                boxed.v
+            };
+            Ok(value)
+        } else {
+            // Read + free the error message if the callback supplied one.
+            let msg = if err.is_null() {
+                format!("host function failed (status {status})")
+            } else {
+                // SAFETY: `err` came from `as_string_free`-able `CString::into_raw`.
+                let cstr = unsafe { std::ffi::CStr::from_ptr(err) };
+                let s = cstr.to_string_lossy().into_owned();
+                unsafe {
+                    let _ = CString::from_raw(err);
+                }
+                s
+            };
+            // A fallible fn's recoverable error → the Tier-1 pair (via Recoverable); a
+            // plain fn upgrades Recoverable to Tier-2 (the embed builder's rule). Either
+            // way `Recoverable` is the right carrier; the builder form decides the tier.
+            Err(HostError::Recoverable(msg))
+        }
+    }
+}
+
 // ── test-only panic injection (Task 4.1) ─────────────────────────────────────
 
 /// `#[cfg(test)]`-only: inject an internal panic to exercise the poison path. NOT in the
@@ -773,5 +1078,255 @@ mod tests {
     fn version_and_abi() {
         assert_eq!(ascript_abi_version(), ASCRIPT_CAPI_ABI);
         assert!(ascript_version() >= (6u32 << 8));
+    }
+
+    // ── Task 4.2 ─────────────────────────────────────────────────────────────
+
+    /// A test C callback playing the host side: reads userdata as an `i64` bias, adds it
+    /// to arg0 (an int), returns the sum. Demonstrates userdata round-trip.
+    unsafe extern "C" fn add_bias(
+        userdata: *mut c_void,
+        _iso: *mut CIsolate,
+        args: *const *const CValue,
+        nargs: usize,
+        out: *mut *mut CValue,
+        _err: *mut *mut c_char,
+    ) -> as_status {
+        let bias = *(userdata as *const i64);
+        if nargs < 1 || args.is_null() {
+            return AS_ERR_CONFIG;
+        }
+        let a0 = *args;
+        let mut n: i64 = 0;
+        if as_value_int(a0, &mut n) != AS_OK {
+            return AS_ERR_TYPE;
+        }
+        *out = as_int(n + bias);
+        AS_OK
+    }
+
+    /// A fallible C callback: returns an error status + message when arg0 == 0.
+    unsafe extern "C" fn fail_on_zero(
+        _userdata: *mut c_void,
+        _iso: *mut CIsolate,
+        args: *const *const CValue,
+        nargs: usize,
+        out: *mut *mut CValue,
+        err: *mut *mut c_char,
+    ) -> as_status {
+        if nargs < 1 {
+            return AS_ERR_CONFIG;
+        }
+        let mut n: i64 = 0;
+        let _ = as_value_int(*args, &mut n);
+        if n == 0 {
+            let m = CString::new("zero not allowed").unwrap();
+            *err = m.into_raw();
+            return AS_ERR_PANIC; // any non-OK status
+        }
+        *out = as_int(n * 10);
+        AS_OK
+    }
+
+    #[test]
+    fn host_fn_userdata_roundtrip() {
+        unsafe {
+            let iso = as_isolate_new();
+            // userdata: a heap i64 bias of 100 (kept alive for the isolate's life).
+            let bias: Box<i64> = Box::new(100);
+            let ud = Box::into_raw(bias) as *mut c_void;
+            let (m, ml) = cstr("host:app");
+            let (f, fl) = cstr("addBias");
+            assert_eq!(
+                as_register_host_fn(
+                    iso,
+                    m.as_ptr() as *const c_char,
+                    ml,
+                    f.as_ptr() as *const c_char,
+                    fl,
+                    Some(add_bias),
+                    ud,
+                    0,
+                ),
+                AS_OK
+            );
+            let (src, len) = cstr("import * as app from \"host:app\"\napp.addBias(7)");
+            let mut out: *mut CValue = std::ptr::null_mut();
+            assert_eq!(
+                as_eval(iso, src.as_ptr() as *const c_char, len, &mut out),
+                AS_OK
+            );
+            let mut n: i64 = 0;
+            assert_eq!(as_value_int(out, &mut n), AS_OK);
+            assert_eq!(n, 107, "100 bias + 7");
+            as_value_free(out);
+            as_isolate_free(iso);
+            // Reclaim the userdata box.
+            drop(Box::from_raw(ud as *mut i64));
+        }
+    }
+
+    #[test]
+    fn host_fn_tier_mapping() {
+        unsafe {
+            let iso = as_isolate_new();
+            let (m, ml) = cstr("host:app");
+            // tier 1 (fallible) → script sees [nil, err].
+            let (f, fl) = cstr("checked");
+            assert_eq!(
+                as_register_host_fn(
+                    iso,
+                    m.as_ptr() as *const c_char,
+                    ml,
+                    f.as_ptr() as *const c_char,
+                    fl,
+                    Some(fail_on_zero),
+                    std::ptr::null_mut(),
+                    1,
+                ),
+                AS_OK
+            );
+            let prog = "import * as app from \"host:app\"\n\
+                        let [v, e] = app.checked(0)\n\
+                        print(v == nil, e.message)";
+            let (src, len) = cstr(prog);
+            let mut out: *mut CValue = std::ptr::null_mut();
+            assert_eq!(
+                as_eval(iso, src.as_ptr() as *const c_char, len, &mut out),
+                AS_OK
+            );
+            let mut o: *mut c_char = std::ptr::null_mut();
+            let mut ol: usize = 0;
+            assert_eq!(as_take_output(iso, &mut o, &mut ol), AS_OK);
+            let got = std::ffi::CStr::from_ptr(o).to_string_lossy().into_owned();
+            as_string_free(o);
+            assert_eq!(got.trim(), "true zero not allowed");
+            as_value_free(out);
+            as_isolate_free(iso);
+        }
+    }
+
+    #[test]
+    fn host_fn_plain_tier_panics() {
+        unsafe {
+            let iso = as_isolate_new();
+            let (m, ml) = cstr("host:app");
+            let (f, fl) = cstr("strict");
+            // tier 0 (plain) → an error upgrades to a Tier-2 panic.
+            assert_eq!(
+                as_register_host_fn(
+                    iso,
+                    m.as_ptr() as *const c_char,
+                    ml,
+                    f.as_ptr() as *const c_char,
+                    fl,
+                    Some(fail_on_zero),
+                    std::ptr::null_mut(),
+                    0,
+                ),
+                AS_OK
+            );
+            let (src, len) = cstr("import * as app from \"host:app\"\napp.strict(0)");
+            let mut out: *mut CValue = std::ptr::null_mut();
+            let st = as_eval(iso, src.as_ptr() as *const c_char, len, &mut out);
+            assert_eq!(st, AS_ERR_PANIC, "plain-fn error is a Tier-2 panic");
+            as_isolate_free(iso);
+        }
+    }
+
+    #[test]
+    fn late_registration_after_import_errors() {
+        unsafe {
+            let iso = as_isolate_new();
+            let (m, ml) = cstr("host:app");
+            let (f, fl) = cstr("a");
+            // Register one fn, import the module.
+            assert_eq!(
+                as_register_host_fn(
+                    iso,
+                    m.as_ptr() as *const c_char,
+                    ml,
+                    f.as_ptr() as *const c_char,
+                    fl,
+                    Some(add_bias),
+                    Box::into_raw(Box::new(0i64)) as *mut c_void,
+                    0,
+                ),
+                AS_OK
+            );
+            let (src, len) = cstr("import * as app from \"host:app\"\n1");
+            let mut out: *mut CValue = std::ptr::null_mut();
+            assert_eq!(
+                as_eval(iso, src.as_ptr() as *const c_char, len, &mut out),
+                AS_OK
+            );
+            as_value_free(out);
+            // Now a SECOND registration on the already-imported module → AS_ERR_CONFIG.
+            let (g, gl) = cstr("b");
+            let st = as_register_host_fn(
+                iso,
+                m.as_ptr() as *const c_char,
+                ml,
+                g.as_ptr() as *const c_char,
+                gl,
+                Some(add_bias),
+                Box::into_raw(Box::new(0i64)) as *mut c_void,
+                0,
+            );
+            assert_eq!(st, AS_ERR_CONFIG, "late reg after import is rejected");
+            as_isolate_free(iso);
+        }
+    }
+
+    #[test]
+    fn json_bridge_roundtrip() {
+        unsafe {
+            let iso = as_isolate_new();
+            // Parse → a value → serialize back.
+            let (j, jl) = cstr(r#"{"a":1,"b":[2,3]}"#);
+            let mut v: *mut CValue = std::ptr::null_mut();
+            assert_eq!(
+                as_json_parse(iso, j.as_ptr() as *const c_char, jl, &mut v),
+                AS_OK
+            );
+            let mut k: c_int = -1;
+            assert_eq!(as_value_kind(v, &mut k), AS_OK);
+            assert_eq!(k, AS_KIND_OBJECT);
+            let mut out: *mut c_char = std::ptr::null_mut();
+            let mut ol: usize = 0;
+            assert_eq!(as_value_to_json(iso, v, &mut out, &mut ol), AS_OK);
+            let got = std::ffi::CStr::from_ptr(out).to_string_lossy().into_owned();
+            as_string_free(out);
+            assert_eq!(got, r#"{"a":1,"b":[2,3]}"#);
+            as_value_free(v);
+            as_isolate_free(iso);
+        }
+    }
+
+    #[test]
+    fn take_output_drains() {
+        unsafe {
+            let iso = as_isolate_new();
+            let (src, len) = cstr("print(\"hi\")");
+            let mut out: *mut CValue = std::ptr::null_mut();
+            assert_eq!(
+                as_eval(iso, src.as_ptr() as *const c_char, len, &mut out),
+                AS_OK
+            );
+            as_value_free(out);
+            let mut o: *mut c_char = std::ptr::null_mut();
+            let mut ol: usize = 0;
+            assert_eq!(as_take_output(iso, &mut o, &mut ol), AS_OK);
+            let got = std::ffi::CStr::from_ptr(o).to_string_lossy().into_owned();
+            as_string_free(o);
+            assert_eq!(got, "hi\n");
+            // A second drain is empty (drained).
+            let mut o2: *mut c_char = std::ptr::null_mut();
+            let mut ol2: usize = 0;
+            assert_eq!(as_take_output(iso, &mut o2, &mut ol2), AS_OK);
+            assert_eq!(ol2, 0);
+            as_string_free(o2);
+            as_isolate_free(iso);
+        }
     }
 }

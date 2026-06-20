@@ -121,6 +121,41 @@ as_status as_value_bool(const as_value *v, bool *out);
 /* Borrow a string value's UTF-8 bytes (*ptr/*len; valid until the value is freed). */
 as_status as_value_string(const as_value *v, const char **ptr, size_t *len);
 
+/* JSON deep bridge (a COPY, distinct from the live aliasing handles). */
+/* Serialize a value to JSON (*out/*len; free with as_string_free). */
+as_status as_value_to_json(const as_isolate *iso, const as_value *v,
+                           char **out, size_t *len);
+/* Parse len UTF-8 JSON bytes into a fresh value handle (*out; free with as_value_free). */
+as_status as_json_parse(as_isolate *iso, const char *json, size_t len, as_value **out);
+
+/* Drain the isolate's captured output (*out/*len; free with as_string_free). The buffer
+ * is cleared, so repeated calls return only NEW output. */
+as_status as_take_output(as_isolate *iso, char **out, size_t *len);
+
+/* Free a string returned by as_value_to_json / as_take_output. NULL-safe. */
+void as_string_free(char *s);
+
+/* Host functions: a C callback + userdata bridged into the script's `host:<module>`.
+ *
+ * The callback writes a RESULT handle to *out on success (ownership transfers to the
+ * engine). On error it returns a non-AS_OK status and MAY write an as_string_free-able
+ * message to *err_utf8. `iso` is reserved (NULL in v1 — re-entrant eval from inside a
+ * host fn is rejected; do not call back into the isolate from the callback).
+ *
+ * `userdata` is an opaque pointer the HOST promises is thread-affine to the isolate (the
+ * callback only ever runs on the isolate's thread). */
+typedef as_status (*as_host_fn)(void *userdata, as_isolate *iso,
+                                const as_value *const *args, size_t nargs,
+                                as_value **out, char **err_utf8);
+
+/* Register a C host function under `host:<module>` (tier: 0 = plain → an error becomes a
+ * Tier-2 panic; 1 = fallible → an error becomes the script-visible [nil, err] pair).
+ * MUST be called BEFORE the script first imports that module (AS_ERR_CONFIG otherwise);
+ * repeated calls for one module accumulate. */
+as_status as_register_host_fn(as_isolate *iso, const char *module, size_t module_len,
+                              const char *name, size_t name_len,
+                              as_host_fn fn, void *userdata, int tier);
+
 #ifdef __cplusplus
 }
 #endif
