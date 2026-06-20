@@ -1293,6 +1293,29 @@ fn write_filter_corpus(tag: &str) -> (std::path::PathBuf, std::path::PathBuf) {
     (dir, file)
 }
 
+/// BATT C4: the `examples/property_testing.as` corpus example registers two
+/// properties that the corpus `ascript run` gate cannot execute (registered
+/// props only run under `ascript test`). This locks the prop-running path: under
+/// `ascript test --seed N` both seeded properties pass.
+#[test]
+fn property_testing_example_props_pass_under_test() {
+    let bin = env!("CARGO_BIN_EXE_ascript");
+    let file = concat!(env!("CARGO_MANIFEST_DIR"), "/examples/property_testing.as");
+    let out = std::process::Command::new(bin)
+        .arg("test")
+        .arg("--seed")
+        .arg("1")
+        .arg(file)
+        .output()
+        .unwrap();
+    let s = String::from_utf8_lossy(&out.stdout).into_owned();
+    assert!(
+        s.contains("2 passed; 0 failed"),
+        "expected both seeded properties to pass; got: {s}"
+    );
+    assert!(out.status.success(), "passing properties → exit 0; got: {s}");
+}
+
 /// A substring `--filter` runs only the matching tests; the rest are reported as
 /// "filtered", not passed/failed.
 #[test]

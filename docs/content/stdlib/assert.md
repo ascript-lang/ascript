@@ -271,27 +271,153 @@ test("stream result shape", () => {
 Run with `ascript test file.as`. See [the CLI docs](../cli) for details on the
 test runner.
 
+---
+
+## Deterministic test runs
+
+`ascript test` can run **deterministically** so that a failure replays exactly.
+Two independent, composable flags:
+
+| Flag | Effect |
+|---|---|
+| `--seed <U64>` | Each test body gets a **fresh, identical** RNG stream — `math.random*`, `uuid.v4`, and `crypto.randomBytes`/salts all draw from the same seeded sequence every run, independent of test order or `--filter`. |
+| `--frozen-time <RFC3339\|EPOCH_MS>` | Freezes the virtual clock for test bodies — `time.now`/`time.monotonic`/`date.now` return the fixed instant and `time.sleep` returns instantly. Accepts an RFC3339 timestamp (e.g. `2026-01-02T03:04:05Z`, needs the `datetime` feature) or a raw epoch-ms integer (every build). A malformed value is a clean error. |
+
+Both are optional and usable together. `--seed` alone also freezes time at the
+seed-derived deterministic epoch; `--frozen-time` alone implies seed `0`. With
+**neither** flag the runner is byte-identical to the pre-deterministic default
+(the inert discipline — nothing changes).
+
+```text
+ascript test billing_test.as --seed 42
+ascript test billing_test.as --seed 42 --frozen-time 2026-01-02T03:04:05Z
+ascript test billing_test.as --frozen-time 1672531200000
+```
+
+> [!NOTE] **Only test bodies are deterministic.** Module **top-level** load runs
+> on the real clock and RNG — a module-level `let now = time.now()` or
+> `let id = uuid.v4()` is **not** frozen/seeded (freezing load-time would change
+> module constants in surprising ways). Move any clock/RNG you want pinned
+> **inside** the `test()` / `prop()` body.
+
+---
+
 ## Property testing (std/test)
 
-`std/test` is a **core** module (available even in a minimal build) that provides
-**value generators** for property-based testing. A generator is an inert tagged
-object you compose with combinators; the property runner (and the `--seed` /
-`--frozen-time` flags) draws concrete values from it with a deterministic,
-edge-biased sampler — the same boundary-favouring philosophy as the internal
-fuzzer, so corner cases (`min`, `max`, `0`, `±1`, empty/single collections) are
-hit far more often than uniform sampling would.
+`std/test` is a **core** module (available even in a minimal build) for
+**property-based testing**: instead of asserting on a handful of literals, you
+state a property that should hold for *all* inputs and let the runner check it
+across many edge-biased random draws, shrinking any failure to a minimal
+counterexample.
 
 ```ascript
-import { gen } from "std/test"
+import { prop, gen } from "std/test"
+```
 
+### Generators
+
+A **generator** is an inert tagged object (`{__gen: "int", ...}` — no new value
+kind) that you compose with combinators. Generators do nothing until the runner
+**draws** from them with a deterministic, edge-biased sampler — the same
+boundary-favouring philosophy as the internal fuzzer, so corner cases (`min`,
+`max`, `0`, `±1`, empty/single collections, unicode boundaries) are hit far more
+often than uniform sampling would.
+
+| Combinator | Produces |
+|---|---|
+| `gen.int(min?, max?)` | an integer in `[min, max]`, biased toward boundaries (`0`, `±1`, `min`, `max`, `±2^53`, i64 bounds) |
+| `gen.float(min?, max?)` | a float in `[min, max]` with the same boundary bias |
+| `gen.bool()` | `true` / `false` |
+| `gen.string(opts?)` | a string; `opts = {minLen?, maxLen?, charset?}` where `charset` is `"ascii"` (default), `"alpha"`, `"alphanumeric"`, `"digit"`, `"unicode"`, or a literal set of characters |
+| `gen.constant(v)` | always `v` |
+| `gen.oneOf(...gens\|values)` | one of the given generators-or-values (or one element of a single array argument) |
+| `gen.frequency(pairs)` | a weighted choice over an array of `[weight, generator]` pairs |
+| `gen.arrayOf(g, opts?)` | an array whose elements come from `g`; `opts = {minLen? 0, maxLen? 32}` |
+| `gen.objectWith({k: g, ...})` | a fixed-shape object, drawing each field from its own generator |
+| `gen.map(g, fn)` | applies `fn` to each value drawn from `g` |
+| `gen.filter(g, pred, opts?)` | redraws from `g` until `pred` holds; `opts = {maxDiscard? 100}` (exhausting it is a Tier-1 error) |
+| `gen.nilOr(g)` | `nil` or a value from `g` |
+
+```ascript
 let smallInt = gen.int(0, 100)
 let names = gen.arrayOf(gen.string({ minLen: 1, maxLen: 8, charset: "alpha" }))
 let users = gen.objectWith({ id: gen.int(1, 999), active: gen.bool() })
 ```
 
-The combinators are: `gen.int`, `gen.float`, `gen.bool`, `gen.constant`,
-`gen.string`, `gen.oneOf`, `gen.frequency`, `gen.arrayOf`, `gen.objectWith`,
-`gen.map`, `gen.filter`, and `gen.nilOr`. Each returns a generator object; nested
-generators (`gen.arrayOf(gen.objectWith(...))`) compose freely up to a bounded
-recursion depth. The `prop()` runner that consumes these generators is documented
-alongside the deterministic-testing flags.
+Generators nest freely (`gen.arrayOf(gen.objectWith(...))`) up to a bounded
+recursion depth.
+
+### `test.prop(name, generators, fn, opts?)`
+
+Register a property test (into the **same** table `test()` uses — so `--filter`,
+`--parallel`, and coverage all work). Each of `opts.runs` iterations draws one
+value per generator and calls `fn(...values)`.
+
+- `generators` is an **array** of generators (positional → `fn(a, b, ...)`) or
+  an **object** of `name → generator` (→ `fn({name: value, ...})`).
+- `opts` (all optional): `{ runs?: 100, seed?: u64, maxShrinks?: 500 }`.
+
+```ascript
+import { prop, gen } from "std/test"
+
+prop("addition commutes", [gen.int(), gen.int()],
+  (a, b) => a + b == b + a, { seed: 1 })
+```
+
+> [!WARNING] **A property must RETURN A BOOL.** A **falsy** return (incl. `nil`)
+> or a **Tier-2 panic** counts as a failure (so `assert.*` works inside the body
+> — a failing assert panics). But beware: a passing `assert.eq` returns `nil`,
+> which is **falsy** — so a body that *ends* in `assert.eq(...)` is read as a
+> failure. End the body with an explicit boolean. Likewise, a body that ends in
+> an **unhandled fallible call** returns a `[value, err]` Tier-1 pair, which the
+> runner also treats as a failure — **destructure the pair and return a bool**
+> instead:
+>
+> ```ascript
+> // ✅  destructure the [value, err] pair, fold errors into the predicate
+> prop("base64 roundtrips", [gen.string()], (s) => {
+>   let dec = encoding.base64Decode(encoding.base64Encode(s))
+>   if (dec[1] != nil) { return false }
+>   return encoding.utf8Decode(dec[0])[0] == s
+> }, { seed: 1 })
+> ```
+
+### Seed precedence & replay
+
+The seed is chosen as **`opts.seed` > `--seed` > a fresh random seed**. A random
+seed is **printed on failure** so any run is replayable. On failure the report
+prints the **shrunken counterexample**, the failing iteration, the shrink count,
+and the seed line, plus the exact replay invocation:
+
+```text
+FAIL my property: property failed
+  counterexample: ...
+  failing iteration: 7
+  shrinks: 4
+  seed: 1234567890 (from --seed)
+  replay: ascript test file.as --seed 1234567890 --filter "my property"
+```
+
+### Shrinking
+
+On failure the runner greedily searches for a **simpler** still-failing input,
+re-running `fn` (deterministically re-seeded per candidate) and keeping any
+candidate that still fails, to a fixpoint or `maxShrinks`. The strategy is
+honest and bounded:
+
+- **int/float** — shrink toward `0` by halving the distance, then flip sign
+  toward positive;
+- **string/array** — drop the tail by halves, then shrink interior runs, then
+  shrink elements pointwise;
+- **objectWith** — shrink field values pointwise (shape is fixed);
+- **oneOf** — prefer earlier alternatives; **nilOr** — try `nil`, then shrink
+  the inner value;
+- **map/filter** — shrink the *source* and re-apply the mapping (filter discards
+  respect `maxDiscard`).
+
+It is a greedy local minimiser, not a global one — it finds *a* small
+counterexample, not provably *the* smallest.
+
+See `examples/property_testing.as` and `examples/advanced/prop_roundtrips.as` for
+runnable properties (encode/decode roundtrip laws), and [the CLI docs](../cli)
+for the test runner and its flags.

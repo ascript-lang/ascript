@@ -53,7 +53,7 @@ const NAV = [
     ['stdlib/log', 'Logging'],
     ['stdlib/cli', 'CLI & terminal'],
     ['stdlib/tui', 'Terminal UI'],
-    ['stdlib/assert', 'Test assertions'],
+    ['stdlib/assert', 'Testing & assertions'],
     ['stdlib/bench', 'Benchmarking'],
   ]},
   { title: 'Tooling', items: [

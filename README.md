@@ -251,6 +251,7 @@ ascript run hello.as
 | Terminal UI | `std/tui` |
 | Lazy streams | `std/stream` (lazy pull engine: `range` · `from` sources; `map` · `filter` · `take` · `drop` · `flatMap` · `enumerate` · `zip` combinators; `collect` · `reduce` · `count` · `find` · `first` · `forEach` terminals) |
 | Test assertions | `std/assert` (deep `eq`/`ne`, `isTrue`/`isFalse`/`isNil`/`notNil`, `gt`/`gte`/`lt`/`lte`, `contains`, `approxEq`, `throws`, `snapshot`) |
+| Property testing | `std/test` (`prop` property runner with edge-biased generators + automatic shrinking; `gen.int`/`float`/`bool`/`string`/`constant`/`oneOf`/`frequency`/`arrayOf`/`objectWith`/`map`/`filter`/`nilOr`; deterministic via `ascript test --seed`/`--frozen-time`; **core**, always present) |
 | Benchmarking | `std/bench` (`measure` · `compare`) |
 | FFI (C interop) | `std/ffi` (call any C library via `libloading`+`libffi`: `open` · `symbol` · `call`; sized C ints marshalled over `int`; `struct`/`cstr`/`read_cstr`; default-on `ffi` feature) |
 | Capabilities | `std/caps` (opt-OUT, default-all-granted; deny `fs`/`net`/`process`/`ffi`/`env` at CLI `--deny`/`--sandbox`, `ascript.toml [capabilities]`, or irreversible in-code `caps.drop`; per-isolate → sandbox an untrusted plugin via `run_in_worker({caps})`; **core**, always present) |
