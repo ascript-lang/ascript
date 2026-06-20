@@ -118,18 +118,18 @@ as_status as_value_kind(const as_value *v, int *out);            /* AS_KIND_* */
 as_status as_value_int(const as_value *v, int64_t *out);         /* AS_ERR_TYPE on mismatch */
 as_status as_value_float(const as_value *v, double *out);
 as_status as_value_bool(const as_value *v, bool *out);
-/* Borrow a string value's UTF-8 bytes (*ptr/*len; valid until the value is freed). */
+/* Borrow a string value's UTF-8 bytes (ptr+len out-params; valid until the value is freed). */
 as_status as_value_string(const as_value *v, const char **ptr, size_t *len);
 
 /* JSON deep bridge (a COPY, distinct from the live aliasing handles). */
-/* Serialize a value to JSON (*out/*len; free with as_string_free). */
+/* Serialize a value to JSON (out+len out-params; free with as_string_free). */
 as_status as_value_to_json(const as_isolate *iso, const as_value *v,
                            char **out, size_t *len);
 /* Parse len UTF-8 JSON bytes into a fresh value handle (*out; free with as_value_free). */
 as_status as_json_parse(as_isolate *iso, const char *json, size_t len, as_value **out);
 
-/* Drain the isolate's captured output (*out/*len; free with as_string_free). The buffer
- * is cleared, so repeated calls return only NEW output. */
+/* Drain the isolate's captured output (out+len out-params; free with as_string_free). The
+ * buffer is cleared, so repeated calls return only NEW output. */
 as_status as_take_output(as_isolate *iso, char **out, size_t *len);
 
 /* Free a string returned by as_value_to_json / as_take_output. NULL-safe. */
