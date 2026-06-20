@@ -622,6 +622,41 @@ Terse per-feature notes (the non-obvious bits; read the cited file for the rest)
   hardening:** per-model `OnceLock<InferCache>` (no repeated inference work per handler), fs-canonical
   `WorkspaceIndex` keys, `snippetSupport` gating, workspace-diagnostic yielding, folder-removal unindex,
   and `did_close` pending purge. LSP feature only (`lsp`, default-on); no tree-walker change.
+- **BATT — backend batteries (T1 + T2)** (spec `superpowers/specs/2026-06-12-backend-batteries-design.md`; one
+  multi-unit stdlib spec shipped in **4 merged phases**: A auth `fc21c1f`, B data `bf13fb3`, C testing `a1c92cf`,
+  D toolbelt). **Pure stdlib + cap-gate generalizations — NO engine/`.aso`/opcode/`Value`-size change** across the
+  whole campaign (`ASO_FORMAT_VERSION` 29 unchanged, `Value` 24; `tests/batt_negative_space.rs` pins both;
+  `vm_differential` four-mode unchanged at 445). **Modules** (all `#[cfg]`-gated, see Feature flags): **Phase A** —
+  `std/jwt` (typed `{__jwtkey}` keys; `algs_for_key_kind` intersection kills alg-confusion; `is_none_alg` reject;
+  RS256 pkcs1v15 / ES256 fixed-width; **libffi-return-width sibling lesson**: a sub-register int return read at
+  register width), `std/oauth` (PKCE S256 over the pooled HTTP client). **Phase B** — `std/archive` (streaming tar
+  writer + lazy entries generator + zip plane + **zip-slip defense**: lexical normalize + canonical-root
+  containment + symlink-nofollow), `std/xml` (**XXE-safe by construction** — no entity table, depth/node budgets),
+  `std/html` (**fail-closed emit-from-parse XSS sanitizer**; `javascript:`/`data:`/`vbscript:` hard-denied), `std/email`
+  (CRLF header-injection guard at builder **and** wire-layer + SMTP client **STARTTLS-strip → Tier-1** / plaintext-auth
+  → Tier-2), `std/blob` (hand-rolled **SigV4** + S3 client; the durable guard is a **signature-RECOMPUTING test stub** —
+  a double-encode bug that worked against a non-verifying mock but would fail real S3 was caught only because the stub
+  re-derives the signature from the wire bytes). **Phase C** — the **determinism test seam** (core `set_determinism`,
+  CLI `ascript test --seed/--frozen-time`, per-test install, INERT by default → no-flag run byte-identical) + `std/test`
+  (generator combinators as inert `{__gen}` tagged Objects + native recursion-budgeted `draw_gen` with 1-in-4 edge bias)
+  + `prop()` property runner with shrinking (registers as a `{__prop}` Object; failure → minimal counterexample +
+  seed + replay recipe). **Phase D** — `std/cron` (5-field parse + the **DOM/DOW OR rule** + `schedule` routed through
+  the det clock seam), `std/semver` (SemVer 2.0.0 + node-subset ranges; cross-checked vs node `semver`), `std/markdown`
+  (CommonMark via `pulldown-cmark` → the B4 sanitizer, **sanitize-by-default**), `std/diff` (Myers O(ND) + unified
+  format byte-matching `diff -u` + the cfg-conditional `assert.snapshot` `@@`-hunk wiring). **Caps:** every OS-touching
+  module is `required_cap`-gated (email/blob = whole-module `Net` incl. `blob.presign`; archive = PER-FUNC Fs); the pure
+  modules (xml/html/cron/semver/markdown/diff/test) are in `KNOWN_UNGATED`; `cap_audit` (Gate-10) + the
+  classification-completeness test enforce the partition. **The recurring SHAPE footgun (DX-load-bearing):** any stdlib
+  fn reading fields off a user-supplied Object MUST use the slab-safe `ObjectCell::get(key)`, NEVER the legacy
+  `.borrow()` shim — `borrow()` PANICS on a slab-mode source-literal object (the VM builds opts literals slab-mode while
+  the tree-walker uses Dict), a VM-only crash + four-mode divergence that unit tests built from `IndexMap` (Dict)
+  structurally cannot catch (only a VM-path test with a *source-literal* object exposes it; D1's cron blocker). Docs on
+  the owning pages per `MODULE_PAGES` (jwt/oauth/archive→system/email/blob own pages; xml/html/markdown→`data.md`;
+  cron→`time.md`; semver/diff→`utilities.md`; test→`assert.md`). **Carry-forward (Phase B):** B9's `blob_basics.as`
+  surfaced a pre-existing **tree-sitter** gap — `template_string` had no escape rule, so `` `${x}\n${y}` `` produced
+  editor ERROR nodes despite passing four-mode + `check` (tree-sitter is a THIRD parser; add a `template_escape` rule +
+  regen `parser.c` when an example uses a novel syntax combo). Examples in `examples/{*_adt,…}` + the per-module intro/
+  advanced files; the four security batteries are `tests/{archive_std,smtp,blob,…}.rs`.
 
 ## Commands
 
@@ -819,7 +854,12 @@ Native fns are ordinary `function` values; argument-type misuse is a Tier-2 pani
 The stdlib is split into Cargo features. The `default` set is `data` (json/regex/encoding/csv/toml/yaml/
 uuid/url), `binary` (msgpack/cbor; depends on `data`), `datetime`, `intl`, `sys` (fs/process/env), `sysinfo`
 (os metrics), `crypto`, `compress`, `sql` (sqlite), `postgres`, `redis`, `net` (tcp/udp/http/ws/server),
-`log`, `workflow`, `tui`, `pkg` (package manager), `lsp`, `telemetry`, `ai`. **The only opt-in feature is
+`log`, `workflow`, `tui`, `pkg` (package manager), `lsp`, `telemetry`, `ai`, plus the **BATT backend-batteries
+set** (all default-on): `tls` (rustls plumbing for `net_tcp.connectTls`/`server.serve({tls})`/email STARTTLS),
+`auth` (asymmetric JWT + OAuth/PKCE; `=["crypto","data","net","dep:rsa","dep:p256"]`), `archive` (`=["compress"]`),
+`xml` (`std/xml` + the `std/html` sanitizer tokenizer; `=["data","dep:quick-xml"]`), `email` (`=["net","tls","data"]`),
+`blob` (S3/SigV4; `=["net","crypto","data","xml"]`), `cron` (`=["datetime"]`), `semver` (`=[]`), `markdown`
+(`=["xml","dep:pulldown-cmark"]`), `diff` (`=[]`). **The only opt-in feature is
 `http3`** (reqwest's HTTP/3 is still unstable — it also needs `RUSTFLAGS="--cfg reqwest_unstable"` and would
 break a plain `cargo build`). Every module is `#[cfg]`-gated so `--no-default-features` builds the bare
 language.

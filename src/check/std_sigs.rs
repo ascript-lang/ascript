@@ -2451,6 +2451,125 @@ static TIME_SIGS: &[(&str, StdSig)] = &[
     ("throttle", StdSig { params: TIME_THROTTLE_PARAMS, ret: None, doc: "Return a throttled wrapper of f that fires at most once per ms window." }),
 ];
 
+// ── std/cron ────────────────────────────────────────────────────────────────
+
+static CRON_PARSE_PARAMS: &[StdParam] = &[StdParam::req("expr", "string")];
+static CRON_NEXT_PARAMS: &[StdParam] = &[
+    StdParam::req_untyped("schedule"),
+    StdParam::opt("opts", "object"),
+];
+static CRON_NEXT_N_PARAMS: &[StdParam] = &[
+    StdParam::req_untyped("schedule"),
+    StdParam::req("n", "int"),
+    StdParam::opt("opts", "object"),
+];
+static CRON_MATCHES_PARAMS: &[StdParam] = &[
+    StdParam::req_untyped("schedule"),
+    StdParam::req("epochMs", "int"),
+    StdParam::opt("opts", "object"),
+];
+static CRON_SCHEDULE_PARAMS: &[StdParam] = &[
+    StdParam::req("expr", "string"),
+    StdParam::req("f", "fn()"),
+    StdParam::opt("opts", "object"),
+];
+
+static CRON_SIGS: &[(&str, StdSig)] = &[
+    ("parse", StdSig { params: CRON_PARSE_PARAMS, ret: Some("[schedule, err]"), doc: "Parse a 5-field cron expression into a reusable schedule object." }),
+    ("next", StdSig { params: CRON_NEXT_PARAMS, ret: Some("[epochMs, err]"), doc: "Return the next fire time (epoch ms) at or after opts.after (default: now)." }),
+    ("nextN", StdSig { params: CRON_NEXT_N_PARAMS, ret: Some("[array, err]"), doc: "Return the next n fire times as an array of epoch ms." }),
+    ("matches", StdSig { params: CRON_MATCHES_PARAMS, ret: Some("[bool, err]"), doc: "Return whether the given epoch-ms time matches the schedule." }),
+    ("schedule", StdSig { params: CRON_SCHEDULE_PARAMS, ret: Some("[handle, err]"), doc: "Spawn a job that calls f at each scheduled fire time; returns a handle with start/stop/running/close." }),
+];
+
+static CRON_MEMBERS: &[(&str, MemberKind)] = &[
+    ("parse", MemberKind::Fn),
+    ("next", MemberKind::Fn),
+    ("nextN", MemberKind::Fn),
+    ("matches", MemberKind::Fn),
+    ("schedule", MemberKind::Fn),
+];
+
+// ── std/semver ────────────────────────────────────────────────────────────────
+
+static SEMVER_PARSE_PARAMS: &[StdParam] = &[StdParam::req("v", "string")];
+static SEMVER_VALID_PARAMS: &[StdParam] = &[StdParam::req("v", "string")];
+static SEMVER_COMPARE_PARAMS: &[StdParam] = &[
+    StdParam::req("a", "string"),
+    StdParam::req("b", "string"),
+];
+static SEMVER_SORT_PARAMS: &[StdParam] = &[StdParam::req("versions", "array")];
+static SEMVER_SATISFIES_PARAMS: &[StdParam] = &[
+    StdParam::req("version", "string"),
+    StdParam::req("range", "string"),
+];
+static SEMVER_MAX_SATISFYING_PARAMS: &[StdParam] = &[
+    StdParam::req("versions", "array"),
+    StdParam::req("range", "string"),
+];
+
+static SEMVER_SIGS: &[(&str, StdSig)] = &[
+    ("parse", StdSig { params: SEMVER_PARSE_PARAMS, ret: Some("[object, err]"), doc: "Parse a strict SemVer 2.0.0 version into {major, minor, patch, prerelease, build}." }),
+    ("valid", StdSig { params: SEMVER_VALID_PARAMS, ret: Some("bool"), doc: "Return whether the string is a valid strict SemVer 2.0.0 version." }),
+    ("compare", StdSig { params: SEMVER_COMPARE_PARAMS, ret: Some("int"), doc: "Compare two versions by SemVer precedence; returns -1, 0, or 1 (build metadata ignored)." }),
+    ("sort", StdSig { params: SEMVER_SORT_PARAMS, ret: Some("array"), doc: "Return the versions sorted ascending by SemVer precedence." }),
+    ("satisfies", StdSig { params: SEMVER_SATISFIES_PARAMS, ret: Some("[bool, err]"), doc: "Return whether the version satisfies the node-semver-subset range." }),
+    ("maxSatisfying", StdSig { params: SEMVER_MAX_SATISFYING_PARAMS, ret: Some("[string, err]"), doc: "Return the highest version in the list that satisfies the range (or nil)." }),
+    ("minSatisfying", StdSig { params: SEMVER_MAX_SATISFYING_PARAMS, ret: Some("[string, err]"), doc: "Return the lowest version in the list that satisfies the range (or nil)." }),
+];
+
+static SEMVER_MEMBERS: &[(&str, MemberKind)] = &[
+    ("parse", MemberKind::Fn),
+    ("valid", MemberKind::Fn),
+    ("compare", MemberKind::Fn),
+    ("sort", MemberKind::Fn),
+    ("satisfies", MemberKind::Fn),
+    ("maxSatisfying", MemberKind::Fn),
+    ("minSatisfying", MemberKind::Fn),
+];
+
+// ── std/markdown ──────────────────────────────────────────────────────────────
+
+static MARKDOWN_RENDER_PARAMS: &[StdParam] = &[
+    StdParam::req("text", "string"),
+    StdParam::opt("opts", "object"),
+];
+static MARKDOWN_ESCAPE_PARAMS: &[StdParam] = &[StdParam::req("s", "string")];
+
+static MARKDOWN_SIGS: &[(&str, StdSig)] = &[
+    ("render", StdSig { params: MARKDOWN_RENDER_PARAMS, ret: Some("string"), doc: "Render CommonMark to HTML, sanitized by default (opts.sanitize=false disables — trusted input only)." }),
+    ("escape", StdSig { params: MARKDOWN_ESCAPE_PARAMS, ret: Some("string"), doc: "Backslash-escape CommonMark metacharacters in the string." }),
+];
+
+static MARKDOWN_MEMBERS: &[(&str, MemberKind)] = &[
+    ("render", MemberKind::Fn),
+    ("escape", MemberKind::Fn),
+];
+
+// ── std/diff ────────────────────────────────────────────────────────────────
+
+static DIFF_AB_PARAMS: &[StdParam] = &[
+    StdParam::req("a", "string"),
+    StdParam::req("b", "string"),
+];
+static DIFF_UNIFIED_PARAMS: &[StdParam] = &[
+    StdParam::req("a", "string"),
+    StdParam::req("b", "string"),
+    StdParam::opt("opts", "object"),
+];
+
+static DIFF_SIGS: &[(&str, StdSig)] = &[
+    ("lines", StdSig { params: DIFF_AB_PARAMS, ret: Some("array"), doc: "Myers line diff of a→b as an array of {tag, aStart, aEnd, bStart, bEnd, lines} hunks." }),
+    ("unified", StdSig { params: DIFF_UNIFIED_PARAMS, ret: Some("string"), doc: "Render a unified diff (diff -u format) of a→b; opts {context? 3, fromFile?, toFile?}." }),
+    ("chars", StdSig { params: DIFF_AB_PARAMS, ret: Some("array"), doc: "Myers char-level diff of a→b as an array of hunks (intra-line, small inputs)." }),
+];
+
+static DIFF_MEMBERS: &[(&str, MemberKind)] = &[
+    ("lines", MemberKind::Fn),
+    ("unified", MemberKind::Fn),
+    ("chars", MemberKind::Fn),
+];
+
 static TIME_MEMBERS: &[(&str, MemberKind)] = &[
     ("now", MemberKind::Fn),
     ("monotonic", MemberKind::Fn),
@@ -3071,6 +3190,10 @@ static ALL_MODULES: &[(&str, &[(&str, MemberKind)])] = &[
     ("std/postgres", POSTGRES_MEMBERS),
     ("std/redis", REDIS_MEMBERS),
     ("std/docker", DOCKER_MEMBERS),
+    ("std/cron", CRON_MEMBERS),
+    ("std/semver", SEMVER_MEMBERS),
+    ("std/markdown", MARKDOWN_MEMBERS),
+    ("std/diff", DIFF_MEMBERS),
     // batch 3 — ai + assert + bench + cli + color + schema + shared + lru + events + template +
     //           caps + task + time + sync + stream + date + intl + log + workflow + telemetry +
     //           tui + ffi + resilience
@@ -3153,6 +3276,10 @@ pub fn std_sig(module: &str, name: &str) -> Option<&'static StdSig> {
         "std/postgres" => POSTGRES_SIGS,
         "std/redis" => REDIS_SIGS,
         "std/docker" => DOCKER_SIGS,
+        "std/cron" => CRON_SIGS,
+        "std/semver" => SEMVER_SIGS,
+        "std/markdown" => MARKDOWN_SIGS,
+        "std/diff" => DIFF_SIGS,
         // batch 3
         "std/ai" => AI_SIGS,
         "std/assert" => ASSERT_SIGS,
@@ -3334,6 +3461,10 @@ mod tests {
             ("std/postgres", POSTGRES_SIGS),
             ("std/redis", REDIS_SIGS),
             ("std/docker", DOCKER_SIGS),
+            ("std/cron", CRON_SIGS),
+            ("std/semver", SEMVER_SIGS),
+            ("std/markdown", MARKDOWN_SIGS),
+            ("std/diff", DIFF_SIGS),
             // batch 3
             ("std/ai", AI_SIGS),
             ("std/assert", ASSERT_SIGS),

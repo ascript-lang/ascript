@@ -217,7 +217,7 @@ const DEFAULT_TAGS: &[&str] = &[
 ];
 
 /// Void (self-closing, no end tag) elements.
-const VOID_TAGS: &[&str] = &["br", "img", "hr"];
+const VOID_TAGS: &[&str] = &["br", "img", "hr", "input"];
 
 /// Raw-text elements whose content is text (not markup) and which we DROP
 /// entirely (never echoing script/style payloads).
@@ -250,13 +250,28 @@ impl Policy {
     }
 
     fn from_opts(opts: Option<&Value>, span: Span) -> Result<Policy, Control> {
-        let mut policy = Policy::default_policy();
+        let policy = Policy::default_policy();
         let Some(opts) = opts else { return Ok(policy) };
         let ValueKind::Object(o) = opts.kind() else {
             // A non-object opts (e.g. nil) → defaults.
             return Ok(policy);
         };
+        Policy::apply_object(policy, o, span)
+    }
 
+    /// Build a policy by applying a `{tags, attrs, schemes}` object onto a base
+    /// policy. This is the SINGLE source of truth for policy construction —
+    /// `html.sanitize` and `std/markdown` (via [`sanitize_with`]) both reach it,
+    /// so the allowlist semantics can never diverge between the two paths.
+    ///
+    /// `o` is a slab-mode-safe `ObjectCell` view — every field read goes through
+    /// the `ObjectCell::get`/`entries` accessors (NEVER `o.borrow()`, which panics
+    /// on a slab-mode source-literal object).
+    fn apply_object(
+        mut policy: Policy,
+        o: &crate::value::ObjectCell,
+        span: Span,
+    ) -> Result<Policy, Control> {
         // opts.tags: array<string> → REPLACES the tag set (each gets the default
         // attrs for that tag if a default exists, else no attrs).
         if let Some(tags_v) = o.get("tags") {
@@ -310,6 +325,48 @@ impl Policy {
         }
 
         Ok(policy)
+    }
+
+    /// Permit `class` on any `code`/`pre` tag that is currently allowlisted.
+    /// `std/markdown` calls this so a fenced-code language hint
+    /// (`<code class="language-rust">`, emitted by pulldown-cmark) survives the
+    /// sanitize pass. A `class` value carries no executable surface (it is plain
+    /// text, HTML-escaped on emission), so this is safe to add by default for the
+    /// markdown pipeline. Tags not in the allowlist are left untouched.
+    fn allow_code_class(&mut self) {
+        for tag in ["code", "pre"] {
+            if let Some(attrs) = self.tags.get_mut(tag) {
+                if !attrs.iter().any(|a| a == "class") {
+                    attrs.push("class".to_string());
+                }
+            }
+        }
+    }
+
+    /// Permit the tags pulldown-cmark generates for the enabled GFM extensions
+    /// that are NOT in the default `html.sanitize` allowlist, so legitimate
+    /// rendered output survives the markdown pipeline:
+    ///   * `del` — strikethrough (`~~x~~`),
+    ///   * `input` (with `type`/`checked`/`disabled` only) — the task-list
+    ///     checkbox, which pulldown emits as `<input disabled type="checkbox">`.
+    ///
+    /// None of these carry an executable surface: the task-list `input` is always
+    /// `disabled` and value-less, and every attribute value is HTML-escaped on
+    /// emission. A tag the user has ALREADY removed via `allow.tags` is left
+    /// removed (we only ADD when not present — same posture as `allow_code_class`),
+    /// EXCEPT we always (re)add when missing so the extension output is not
+    /// silently corrupted; callers who do not want these can post-process. (In
+    /// practice the extension is what produced the tag, so allowing it is correct.)
+    fn allow_markdown_generated(&mut self) {
+        self.tags.entry("del".to_string()).or_default();
+        // `input` gets a fixed, inert attribute set (NOT user-overridable here —
+        // these are the only attrs the task-list renderer emits).
+        let input_attrs = self.tags.entry("input".to_string()).or_default();
+        for a in ["type", "checked", "disabled"] {
+            if !input_attrs.iter().any(|x| x == a) {
+                input_attrs.push(a.to_string());
+            }
+        }
     }
 
     fn tag_allowed(&self, tag: &str) -> bool {
@@ -723,6 +780,29 @@ fn sanitize(input: &str, policy: &Policy) -> String {
         out.push('>');
     }
     out
+}
+
+/// Rust-side sanitizer entry for `std/markdown` (BATT D3 §13). Sanitize `input`
+/// under the DEFAULT html.sanitize policy, optionally narrowed/widened by an
+/// `allow` object (`{tags, attrs, schemes}` — the SAME shape `html.sanitize`'s
+/// own opts use, applied through the single [`Policy::apply_object`] source of
+/// truth so the two sanitize paths can never diverge).
+///
+/// In addition, `class` is permitted on `code`/`pre` so a fenced-code language
+/// hint (`<code class="language-x">`) survives the pass.
+///
+/// `allow` is read slab-safely (it is a `ValueKind::Object` view → the
+/// `ObjectCell::get` accessors); a non-object `allow` (e.g. `nil`) is ignored.
+pub(crate) fn sanitize_with(input: &str, allow: Option<&Value>, span: Span) -> Result<String, Control> {
+    let mut policy = Policy::default_policy();
+    if let Some(allow) = allow {
+        if let ValueKind::Object(o) = allow.kind() {
+            policy = Policy::apply_object(policy, o, span)?;
+        }
+    }
+    policy.allow_code_class();
+    policy.allow_markdown_generated();
+    Ok(sanitize(input, &policy))
 }
 
 /// Reconstruct the textual form of a non-allowlisted tag so it can be ESCAPED

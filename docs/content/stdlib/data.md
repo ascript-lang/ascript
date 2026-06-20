@@ -809,6 +809,50 @@ html.sanitize("<mark>m</mark>", { tags: ["mark"] })
 - [`examples/xml_basics.as`](https://github.com/ascript-lang/ascript/blob/main/examples/xml_basics.as) — parse a document, read nodes + attributes, stringify (incl. pretty-print), and reject malformed XML.
 - [`examples/advanced/feed_reader.as`](https://github.com/ascript-lang/ascript/blob/main/examples/advanced/feed_reader.as) — the canonical `xml` → `html.sanitize` pipeline: parse an RSS feed, then sanitize each item's untrusted HTML description.
 
+## std/markdown
+
+CommonMark → HTML over `pulldown-cmark`, **sanitized by default** — `markdown.render` pipes its HTML through the same fail-closed allowlist sanitizer as `html.sanitize`, so any embedded raw HTML, `<script>`, or `javascript:` URL comes out inert.
+
+**Honest subset:** CommonMark plus GFM **tables**, **strikethrough**, and **task-lists** (on by default) and **footnotes** (off by default). No front-matter, no syntax highlighting (only a `class="language-x"` hint is emitted on fenced-code `<code>`), no MDX.
+
+### markdown.render
+
+Render CommonMark text to sanitized HTML.
+
+- `text` (string) — the CommonMark source.
+- `opts` (object) — *(optional)* `{ sanitize?: bool = true, gfmTables?: bool = true, strikethrough?: bool = true, taskLists?: bool = true, footnotes?: bool = false, allow?: object }`. `allow` is forwarded to the sanitizer (same `{ tags?, attrs?, schemes? }` shape as `html.sanitize`'s options) when sanitizing.
+- Returns `string` — the rendered HTML.
+
+> [!WARNING] `{ sanitize: false }` emits the **raw, un-sanitized** HTML — use it ONLY for input you fully trust. With untrusted markdown it is an XSS hole; the default (`sanitize: true`) is what defeats embedded scripts and `javascript:` links.
+
+```ascript
+markdown.render("# Hello\n\nA **bold** [link](https://example.test).")
+// == "<h1>Hello</h1>\n<p>A <strong>bold</strong> <a href=\"https://example.test\">link</a>.</p>\n"
+
+markdown.render("<script>alert(1)</script>")
+// == "&lt;script&gt;alert(1)&lt;/script&gt;"   (script is inert)
+
+markdown.render("```rust\nfn main() {}\n```")
+// keeps the language hint: <pre><code class="language-rust">...
+```
+
+### markdown.escape
+
+Backslash-escape CommonMark metacharacters so the string renders literally.
+
+- `s` (string) — the text to escape.
+- Returns `string` — `s` with every ASCII-punctuation character backslash-escaped.
+
+```ascript
+markdown.escape("a*b_c # heading")
+// == "a\\*b\\_c \\# heading"   (every ASCII-punctuation char is backslash-escaped)
+```
+
+### Examples
+
+- [`examples/markdown_render.as`](https://github.com/ascript-lang/ascript/blob/main/examples/markdown_render.as) — render a small document and demonstrate the sanitize-by-default XSS defense.
+- [`examples/advanced/docs_site_gen.as`](https://github.com/ascript-lang/ascript/blob/main/examples/advanced/docs_site_gen.as) — a mini static-site generator: render a baked page set, then package the HTML into a deterministic `tar.gz` (`std/markdown` + `std/archive` + `std/fs`).
+
 ## std/decimal
 
 Exact decimal arithmetic backed by a 96-bit scaled integer (`rust_decimal`). Use it wherever floating-point rounding is unacceptable: money, pricing, financial totals, or any domain where `0.1 + 0.2 == 0.3` must hold.

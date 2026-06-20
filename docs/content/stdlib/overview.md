@@ -66,26 +66,29 @@ json, crypto, …) need no `await`.
 | Page | Modules |
 |---|---|
 | [Core & collections](collections) | `string` · `array` · `object` · `map` · `set` · `math` · `decimal` · `convert` · `bytes` |
-| [Data & serialization](data) | `json` · `csv` · `toml` · `yaml` · `msgpack` · `cbor` · `encoding` · `regex` · `uuid` · `url` |
+| [Data & serialization](data) | `json` · `csv` · `toml` · `yaml` · `msgpack` · `cbor` · `encoding` · `regex` · `uuid` · `url` · `xml` · `html` · `markdown` |
 | [Validation & schema](schema) | `schema` (composable validators, constraints, refine, coerce, fromClass) |
-| [System & files](system) | `fs` · `env` · `os` · `io` · `process` · `crypto` · `compress` |
+| [System & files](system) | `fs` · `env` · `os` · `io` · `process` · `crypto` · `compress` · `jwt` · `oauth` · `archive` |
 | [Databases](db) | `sqlite` · `postgres` · `redis` |
 | [CLI & terminal](cli) | `cli` · `color` |
-| [Time & locale](time) | `time` (+ `interval`/`debounce`/`throttle`) · `date` · `intl` |
+| [Time & locale](time) | `time` (+ `interval`/`debounce`/`throttle`) · `date` · `intl` · `cron` |
 | [Networking & HTTP](net) | `net` (DNS) · `net/tcp` · `net/udp` · `net/http` · `http/server` · `net/ws` |
+| [Email (SMTP)](email) | `email` (message builder + CRLF guard · SMTP client with STARTTLS) |
+| [Object storage (S3)](blob) | `blob` (S3-compatible: put/get/list/presign/multipart · SigV4) |
 | [Async & concurrency](async) | `task` (+ `retry`) · `sync` (channels · semaphore · rateLimiter) |
 | [Lazy streams](stream) | `stream` (lazy pull engine: sources, combinators, terminals) |
-| [Utilities](utilities) | `lru` · `events` · `template` |
+| [Utilities](utilities) | `lru` · `events` · `template` · `semver` · `diff` |
 | [Durable workflows](workflow) | `workflow` (event-sourced replay: `run` · `resume` · `activity` · `ctx`) |
 | [AI](ai) | `ai` (multi-provider LLM: generate · stream · embed · tool) |
 | [Telemetry](telemetry) | `telemetry` (OTLP traces/metrics · Sentry · PostHog) |
 | [Logging](log) | `log` |
 | [Terminal UI](tui) | `tui` |
-| [Test assertions](assert) | `assert` (deep eq, comparisons, contains, approxEq, throws, snapshot) |
+| [Testing & assertions](assert) | `assert` (deep eq, comparisons, contains, approxEq, throws, snapshot) · `test` (generators · `prop()` property testing with shrinking) |
 | [Benchmarking](bench) | `bench` (measure · compare) |
 
 ## Feature flags
 
 Every module is behind a Cargo feature, all enabled by `default`. A build with
 `--no-default-features` exposes only the gateless core (`string`, `array`, `object`, `map`, `math`,
-`convert`, `time`, `cli`, `color`, `stream`, `bench`, and `assert` without snapshot). See [Getting started](../getting-started#feature-flags) for the full mapping.
+`convert`, `time`, `cli`, `color`, `stream`, `bench`, `test` (generators + `prop`), and `assert` without
+snapshot). See [Getting started](../getting-started#feature-flags) for the full mapping.

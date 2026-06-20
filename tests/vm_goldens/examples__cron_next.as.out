@@ -1,0 +1,13 @@
+# exit: none
+parse ok: true
+next weekday 9am: 2023-11-15 09:00 (Wed) UTC (err: nil)
+next four */15 runs:
+  2023-11-15 03:45 (Wed) UTC
+  2023-11-15 04:00 (Wed) UTC
+  2023-11-15 04:15 (Wed) UTC
+  2023-11-15 04:30 (Wed) UTC
+daily 9am at UTC+120: 2023-11-15 07:00 (Wed) UTC
+Wed 09:00 matches weekday-9am: true
+Fri the 10th matches "13th OR Friday": true
+impossible schedule errors: true
+cron_next ok

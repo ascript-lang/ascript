@@ -427,3 +427,85 @@ intl.compare("apple", "banana", "en")   // -1
 intl.compare("x", "x", "en")            //  0
 intl.compare("b", "a", "en")            //  1
 ```
+
+## Cron (`std/cron`)
+
+`std/cron` parses 5-field [Vixie cron](https://en.wikipedia.org/wiki/Cron) expressions
+(`min hour dom month dow`) and computes fire times with civil-time math (chrono). Fields
+support `*`, lists (`1,2,3`), ranges (`1-5`), steps (`*/5`, `10-30/5`), and case-insensitive
+names (`jan`–`dec`, `sun`–`sat`); `dow` 0 and 7 both mean Sunday. The `@yearly @annually
+@monthly @weekly @daily @hourly` shortcuts are accepted; `@reboot` is rejected (it has no
+meaning without a process to reboot — a Tier-2 misuse).
+
+**The DOM/DOW OR rule (load-bearing):** when BOTH the day-of-month and day-of-week fields are
+restricted (neither is `*`), a time matches if it matches DOM **OR** DOW. For example
+`0 0 13 * 5` fires at midnight on the 13th of every month **and** on every Friday. When only
+one of the two is restricted, only that field constrains the day.
+
+**Time zones (honest limitation):** schedules are interpreted in UTC by default; an
+`opts.tzOffset` (in minutes) shifts the civil interpretation by a **fixed offset with no DST
+transitions** — the same posture `std/date` documents. Named IANA zones (which need
+`chrono-tz`) are a shared recorded-future for `std/date` + `std/cron`.
+
+**Scheduling & determinism:** `cron.schedule` computes its delay from the determinism clock
+seam and sleeps through the same path `std/time` uses, so under a frozen/seeded clock the
+virtual time advances instantly and fire times are replay-deterministic by construction. The
+returned handle's loop is a spawned task with cancel-on-drop discipline: `stop()` is a graceful
+flag, `close()` aborts, and dropping the last handle aborts the loop (no zombie task). A
+callback that panics is logged and the scheduler continues (the server-handler rule).
+
+### `cron.parse(expr)`
+
+Parse a cron expression into a reusable, inspectable schedule object. A malformed expression
+(wrong field count, out-of-range value, `*/0`, garbage) is a Tier-1 `[nil, err]` — cron text is
+frequently user/config data.
+
+```ascript
+import * as cron from "std/cron"
+let [sched, err] = cron.parse("*/15 9-17 * * mon-fri")
+```
+
+### `cron.next(schedule, opts?)`
+
+Return the next fire time (epoch ms) strictly after `opts.after` (default: now). `opts` may
+carry `{after, tzOffset}`. Returns Tier-1 `[nil, err]` if the schedule cannot match within five
+years (e.g. `0 0 30 2 *` — February 30 never exists).
+
+```ascript
+let [ms, err] = cron.next("0 0 * * *", { after: 1767225600000 })
+```
+
+### `cron.nextN(schedule, n, opts?)`
+
+Return the next `n` fire times as an array of epoch ms.
+
+```ascript
+let [times, err] = cron.nextN("0 9 * * mon-fri", 5)
+```
+
+### `cron.matches(schedule, epochMs, opts?)`
+
+Return whether the given epoch-ms time matches the schedule (honoring the DOM/DOW OR rule).
+
+```ascript
+let [hit, err] = cron.matches("0 0 13 * 5", 1768262400000)
+```
+
+### `cron.schedule(expr, f, opts?)`
+
+Spawn a job that calls `f` at each scheduled fire time. Returns a `[handle, err]` pair; the
+handle exposes `start()`, `stop()`, `running()`, and `close()`. `opts` may carry `{tzOffset}`.
+
+```ascript
+let [job, err] = cron.schedule("*/5 * * * *", () => print("tick"))
+// later: job.stop()  // graceful;  job.close()  // abort
+```
+
+### Examples
+
+- [`examples/cron_next.as`](https://github.com/ascript-lang/ascript/blob/main/examples/cron_next.as)
+  — `parse`/`next`/`nextN`/`matches` with a fixed `after` anchor (pure, deterministic),
+  the `tzOffset` shift, and the DOM/DOW OR rule.
+- [`examples/advanced/job_scheduler.as`](https://github.com/ascript-lang/ascript/blob/main/examples/advanced/job_scheduler.as)
+  — the `cron.schedule` handle lifecycle (`running`/`stop`/`close`) and a deterministic
+  upcoming-runs preview.

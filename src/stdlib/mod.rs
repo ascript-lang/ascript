@@ -34,6 +34,14 @@ pub mod html;
 pub mod email;
 #[cfg(feature = "crypto")]
 pub mod crypto;
+#[cfg(feature = "cron")]
+pub mod cron;
+#[cfg(feature = "semver")]
+pub mod semver;
+#[cfg(feature = "markdown")]
+pub mod markdown;
+#[cfg(feature = "diff")]
+pub mod diff;
 #[cfg(feature = "docker")]
 pub mod docker;
 pub mod events;
@@ -250,6 +258,14 @@ pub fn std_module_exports(path: &str) -> Option<Vec<(String, Value)>> {
         "std/ffi" => ffi::exports(),
         #[cfg(feature = "docker")]
         "std/docker" => docker::exports(),
+        #[cfg(feature = "cron")]
+        "std/cron" => cron::exports(),
+        #[cfg(feature = "semver")]
+        "std/semver" => semver::exports(),
+        #[cfg(feature = "markdown")]
+        "std/markdown" => markdown::exports(),
+        #[cfg(feature = "diff")]
+        "std/diff" => diff::exports(),
         #[cfg(feature = "auth")]
         "std/jwt" => jwt::exports(),
         #[cfg(feature = "auth")]
@@ -339,11 +355,15 @@ pub const STD_MODULES: &[&str] = &[
     "std/ffi",
     "std/resilience",
     "std/docker",
+    "std/cron",
+    "std/semver",
     "std/jwt",
     "std/oauth",
     "std/archive",
     "std/xml",
     "std/html",
+    "std/markdown",
+    "std/diff",
     "std/email",
     "std/blob",
 ];
@@ -739,6 +759,10 @@ impl Interp {
             "ffi" => self.call_ffi(func, args, span).await,
             #[cfg(feature = "docker")]
             "docker" => self.call_docker(func, args, span).await,
+            #[cfg(feature = "cron")]
+            "cron" => self.call_cron(func, args, span).await,
+            #[cfg(feature = "semver")]
+            "semver" => self.call_semver(func, args, span).await,
             #[cfg(feature = "auth")]
             "jwt" => self.call_jwt_async(func, args, span).await,
             #[cfg(feature = "auth")]
@@ -749,6 +773,10 @@ impl Interp {
             "xml" => xml::call(func, args, span),
             #[cfg(feature = "xml")]
             "html" => html::call(func, args, span),
+            #[cfg(feature = "markdown")]
+            "markdown" => markdown::call(func, args, span),
+            #[cfg(feature = "diff")]
+            "diff" => self.call_diff(func, args, span),
             #[cfg(feature = "email")]
             "email" => match func {
                 // The SMTP client funcs need `&self` (resource registration + async
@@ -1353,12 +1381,26 @@ mod cap_gate_tests {
             "msgpack", "cbor", "tui",
             // RESIL §0: pure / in-memory policy kit — no OS resource, no cap.
             "resilience",
+            // BATT T2-1 §11: std/cron is pure cron computation + the (already
+            // ungated) timer machinery — the module itself touches no OS; a
+            // `cron.schedule` callback that hits the OS is independently capped.
+            "cron",
+            // BATT T2-2 §12: std/semver is pure version parsing/comparison/range
+            // math — no OS resource, so it acquires no cap.
+            "semver",
             // BATT B3 §7.2: std/xml is pure parsing/serialization — no net/fs (the
             // structural XXE / external-entity defense), so it acquires no cap.
             "xml",
             // BATT B4 §7.3: std/html is a pure string transform (escape/unescape/
             // sanitize) — no OS resource, so it acquires no cap.
             "html",
+            // BATT T2-3 §13: std/markdown is a pure CommonMark→HTML transform
+            // (render pipes through the html sanitizer; escape is a string op) —
+            // no OS resource, so it acquires no cap.
+            "markdown",
+            // BATT T2-4 §14: std/diff is a pure Myers line/char diff + unified
+            // renderer — no OS resource, so it acquires no cap.
+            "diff",
         ];
         for full in STD_MODULES {
             let key = full.strip_prefix("std/").unwrap().replace('/', "_");
