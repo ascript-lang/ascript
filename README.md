@@ -273,6 +273,47 @@ python3 -m http.server 8000
 - **`docs/reader.html`** — the documentation reader (language guide + stdlib reference, with search).
 - **`docs/content/`** — every page as plain Markdown, readable straight from the repo if you prefer.
 
+## Embedding
+
+AScript embeds into host applications from **Rust** (`ascript::embed`) and **C** (`ascript-capi`).
+The model is one `!Send` `Isolate` per host thread — parallelism by *more isolates*, never by
+sharing. Embedded scripts default to **deny-all** capabilities (the inverse of the CLI's
+all-granted), and the host grants explicitly.
+
+```rust
+use ascript::embed::{Isolate, AsValue, OutputMode};
+
+let iso = Isolate::builder()
+    .output(OutputMode::Capture)
+    .host_module("host:app", |m| {
+        m.func("greet", |_ctx, args| {
+            let name = args.first().and_then(AsValue::as_str).unwrap_or("world");
+            Ok(AsValue::from(format!("hello, {name}")))
+        });
+    })?
+    .build()?;
+iso.eval(r#"import * as app from "host:app"
+            fn on_tick(n) { return app.greet("tick " + n) }"#)?;
+let out = iso.call("on_tick", &[AsValue::from(7)])?;   // → "hello, tick 7"
+# Ok::<(), ascript::embed::EmbedError>(())
+```
+
+```c
+#include "ascript.h"
+as_isolate *iso = as_isolate_new();              /* deny-all caps, captured output */
+as_value *out = NULL;
+as_eval(iso, "fn add(a,b){return a+b}", 22, &out);  as_value_free(out);
+as_value *a = as_int(2), *b = as_int(40);
+const as_value *args[] = { a, b };
+as_call(iso, "add", 3, args, 2, &out);           /* → 42 */
+int64_t n; as_value_int(out, &n);
+as_value_free(out); as_value_free(a); as_value_free(b);
+as_isolate_free(iso);
+```
+
+See [`docs/content/embedding.md`](docs/content/embedding.md) for the threading contract, the
+capability model, host modules, the `AsValue` bridge, and the C ABI rules.
+
 ## Examples
 
 Runnable programs live in [`examples/`](examples/) (introductory) and

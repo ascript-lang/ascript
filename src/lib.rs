@@ -1,3 +1,23 @@
+//! # AScript
+//!
+//! The AScript language runtime, compiler, and toolchain as a single Rust library.
+//!
+//! ## Stability
+//!
+//! **The only semver-contracted Rust surface is [`ascript::embed`](crate::embed)** (the
+//! host-embedding facade — a `!Send` [`Isolate`](crate::embed::Isolate), the `AsValue` value
+//! bridge, host modules, and host-decided capabilities). The companion `ascript-capi` crate's C
+//! ABI (`ascript.h`, guarded by its `_CAPI_ABI` version constant) is the only stable *ABI*. Embed
+//! AScript through one of those two surfaces.
+//!
+//! Everything else `pub` in this crate is **internal — public only for the `ascript` bin target,
+//! the integration tests, and the fuzz/conformance harnesses — and carries NO stability promise.**
+//! It may change in any release. The root-level CLI entry points ([`run_file`], [`run_source`], …)
+//! return CLI-shaped results (exit codes, captured stdout) and are **not** the embedding contract;
+//! to drive AScript from a host, use [`ascript::embed`](crate::embed), never these.
+//!
+//! See `docs/content/embedding.md` for the embedding guide and the stability policy.
+
 // RT §2.2/§2.3(g): under the runtime-only build a number of items compile but are
 // statically unreachable (their only callers are the gated-out source/toolchain entry
 // points) — e.g. the tree-walker eval helpers, the source-running test entries, and the
@@ -129,6 +149,13 @@ use std::rc::Rc;
 /// drive the engines directly (`vm_run_source` / `run_source_exit`) and want the
 /// same headroom. `make_fut` builds the (`!Send`) future INSIDE the worker thread,
 /// so only `make_fut` (and the returned `R`) need be `Send`.
+///
+/// `#[doc(hidden)]` — an **internal seam** (consumed by the differential/property/limit
+/// test harnesses), NOT part of the embedding contract. Its spawn-per-call shape is wrong
+/// for a persistent isolate; an embedder that wants CLI-identical stack headroom runs the
+/// isolate on its own `std::thread::Builder::stack_size(..)` thread and drives the blocking
+/// [`embed::Isolate`](crate::embed::Isolate) API from inside it (see `embedding.md` §4.3).
+#[doc(hidden)]
 pub fn run_on_worker_stack<R, F, Fut>(make_fut: F) -> R
 where
     R: Send + 'static,
@@ -211,6 +238,11 @@ pub fn paranoid_enabled() -> bool {
 
 #[cfg(not(ascript_rt))]
 /// Run a `.as` file as the entry module (with import resolution relative to it).
+///
+/// **CLI entry, not the embedding contract** — this returns a CLI-shaped process exit
+/// code, not a value, and runs a one-shot program. To drive AScript from a host (hold a
+/// long-lived engine, call script functions, read values out), embed via
+/// [`ascript::embed`](crate::embed) instead.
 ///
 /// Returns the process exit code: `Ok(0)` for clean termination, `Ok(n)` when
 /// the program calls `exit(n)`, `Err(e)` on a Tier-2 panic.
@@ -791,6 +823,11 @@ fn worker_isolate_cap() -> usize {
 
 #[cfg(not(ascript_rt))]
 /// Lex → parse → evaluate in a fresh global environment. Returns captured output.
+///
+/// **CLI entry, not the embedding contract** — output-as-a-`String` is a CLI/test harness
+/// shape, not a value bridge, and each call runs a fresh one-shot program (no persistent
+/// state). To eval against a long-lived isolate and read out the trailing value, embed via
+/// [`ascript::embed`](crate::embed) (`Isolate::eval`).
 ///
 /// `exit(n)` is treated as a clean termination (the captured output is returned
 /// and no error is raised). Use [`run_source_exit`] when you need the exit code.

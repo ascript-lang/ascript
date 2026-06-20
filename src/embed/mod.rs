@@ -212,7 +212,7 @@ impl IsolateBuilder {
     /// # Security (§6.3)
     ///
     /// Host functions registered here are **native Rust** and **bypass the
-    /// [`Caps`](Caps) gate** — see [`HostModuleBuilder`] for the full note.
+    /// [`Caps`] gate** — see [`HostModuleBuilder`] for the full note.
     ///
     /// # Errors
     ///
@@ -236,7 +236,7 @@ impl IsolateBuilder {
         Ok(self)
     }
 
-    /// Register a per-isolate host-module FACTORY (spec §6.4): like [`host_module`], but
+    /// Register a per-isolate host-module FACTORY (spec §6.4): like [`Self::host_module`], but
     /// the module is ALSO installed into every worker isolate this Isolate spawns
     /// (pooled `worker fn` AND dedicated `run_in_worker`). The closure runs INSIDE the
     /// freshly-spawned isolate thread, so it is `Send + Sync` and the host fns it builds
@@ -244,7 +244,7 @@ impl IsolateBuilder {
     ///
     /// # Security (§6.3)
     ///
-    /// Factory-built host functions are **native Rust** and **bypass the [`Caps`](Caps)
+    /// Factory-built host functions are **native Rust** and **bypass the [`Caps`]
     /// gate** — see [`HostModuleBuilder`].
     ///
     /// # Errors

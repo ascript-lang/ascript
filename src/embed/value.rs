@@ -234,7 +234,7 @@ impl AsValue {
 
     /// Write `value` to element `i` of an `array`. Routes through the engine's
     /// `index_set` (frozen guard + bounds check preserved); a host error surfaces as
-    /// [`EmbedError`].
+    /// [`EmbedError`](crate::embed::EmbedError).
     ///
     /// `map`/`set` are READ-ONLY host-side (their `MapKey` canonicalization stays
     /// engine-owned — construct them script-side, §5.2).

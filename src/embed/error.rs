@@ -86,7 +86,7 @@ impl EmbedError {
 }
 
 /// `From<AsError>` defaults a raw engine error to the `Panic` tier (a Tier-2 runtime
-/// panic). Compile-time diagnostics use [`EmbedError::from_compile`] explicitly at the
+/// panic). Compile-time diagnostics use `EmbedError::from_compile` explicitly at the
 /// compile site, where the `Compile` framing is correct.
 impl From<AsError> for EmbedError {
     fn from(err: AsError) -> Self {
