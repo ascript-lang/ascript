@@ -1025,11 +1025,53 @@ impl Interp {
             // SP9 §3: in deterministic mode do NOT sleep real time — advance the
             // virtual clock by `ms` and record a durable timer; replay/resume then
             // fast-forwards with no real delay. Default mode sleeps for real.
+            //
+            // REPLAY §0.5 (bug fix): in REPLAY mode a bare `time.sleep` must CONSUME the
+            // recorded `TimerSet` at the cursor (advance + `set_now`), mirroring the
+            // `std/workflow` `ctx.sleep` arm — NOT unconditionally APPEND a fresh one.
+            // Appending desynced replay: the recorded `TimerSet` stayed at the cursor, so
+            // the next `ctx.call`/seam read found a non-activity event there and raised a
+            // FALSE "non-determinism" error. On a non-`TimerSet` event at the cursor:
+            //   - Workflow origin keeps today's lenient behavior (crash-point: switch to
+            //     Record + append), so a bare-sleep workflow body is behavior-compatible;
+            //   - strict CliTrace sets a pending divergence (LOUD, raised at the Interp
+            //     chokepoint) and does NOT mutate the clock or the stream.
             if self
                 .with_determinism_mut(|ctx| {
+                    use crate::det::{DetEvent, Mode, Origin};
+                    if ctx.mode == Mode::Replay {
+                        match ctx.events.get(ctx.cursor).cloned() {
+                            Some(DetEvent::TimerSet { wake }) => {
+                                // Consume the recorded durable timer + fast-forward.
+                                ctx.cursor += 1;
+                                ctx.clock.set_now(wake);
+                                return;
+                            }
+                            other => {
+                                if ctx.origin == Origin::CliTrace && ctx.strict {
+                                    // A wrong-kind event (or exhaustion) at the cursor is
+                                    // a strict divergence — record it, leave the stream
+                                    // and clock untouched.
+                                    let at = ctx.cursor;
+                                    match other {
+                                        Some(ev) => ctx.set_divergence_public(
+                                            at,
+                                            "TimerSet",
+                                            crate::det::DeterminismContext::kind_name(&ev),
+                                        ),
+                                        None => ctx.set_exhausted_public(at, "TimerSet"),
+                                    }
+                                    return;
+                                }
+                                // Workflow crash-point: nothing (or a different kind)
+                                // recorded here → switch to Record and append below.
+                                ctx.mode = Mode::Record;
+                            }
+                        }
+                    }
                     ctx.clock.advance(ms);
                     let wake = ctx.clock.now_ms();
-                    let _ = ctx.record_event(crate::det::DetEvent::TimerSet { wake });
+                    let _ = ctx.record_event(DetEvent::TimerSet { wake });
                 })
                 .is_some()
             {
