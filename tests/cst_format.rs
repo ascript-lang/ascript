@@ -114,6 +114,43 @@ fn formats_inclusive_and_step_ranges() {
 }
 
 #[test]
+fn formats_anonymous_fn_expression_as_arrow() {
+    // LSPEC: an anonymous `fn(params){body}` EXPRESSION desugars to a block-bodied
+    // arrow `(params) => {body}` (the single canonical lambda form). The formatter
+    // never sees a distinct `fn`-expression node, so it ALWAYS canonicalizes
+    // `fn(…){…}` → `(…) => {…}`. This pins that intended canonicalization +
+    // idempotence + reparse.
+    for (src, want) in [
+        (
+            "let f = fn(x){ return x }\n",
+            "let f = (x) => {\n  return x\n}\n",
+        ),
+        (
+            "let g = fn(a: int, b = 2){ return a + b }\n",
+            "let g = (a: int, b = 2) => {\n  return a + b\n}\n",
+        ),
+        (
+            "let r = recover(fn() { return 5 })\n",
+            "let r = recover(() => {\n  return 5\n})\n",
+        ),
+        // async anonymous fn → async arrow.
+        (
+            "let p = recover(async fn() { return 1 })\n",
+            "let p = recover(async () => {\n  return 1\n})\n",
+        ),
+    ] {
+        let once = ascript::syntax::format_tree(src);
+        assert_eq!(once, want, "unexpected format for {src:?}");
+        let twice = ascript::syntax::format_tree(&once);
+        assert_eq!(once, twice, "not idempotent for {src:?}");
+        assert!(
+            ascript::syntax::parser::parse(&once).errors.is_empty(),
+            "formatted fn-expression output does not reparse: {once:?}"
+        );
+    }
+}
+
+#[test]
 fn formats_static_methods() {
     // SP1 §3: `static fn` / `static async fn` / `static fn*` format with the
     // `static` modifier first, then `async`, then `fn`; statics sit with the other

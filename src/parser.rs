@@ -112,10 +112,20 @@ impl<'a> Parser<'a> {
                     self.fn_decl(is_async, true)
                 }
             }
+            // `fn name(…)` is a declaration; `fn(…)` (no name) is an anonymous
+            // fn EXPRESSION used as an expression statement (the closure is
+            // discarded — useless but must parse). Branch on the token after `fn`.
+            Tok::Fn if self.tokens[self.pos + 1].tok == Tok::LParen => {
+                Ok(Stmt::Expr(self.expr()?))
+            }
             Tok::Fn => self.fn_decl(false, false),
-            // `async fn` is a declaration; `async (…) =>` / `async x =>` are
-            // arrow expressions, handled by the expression path below.
-            Tok::Async if self.tokens[self.pos + 1].tok == Tok::Fn => {
+            // `async fn name(…)` is a declaration; `async fn(…)` is an anonymous
+            // async fn expression. `async (…) =>` / `async x =>` are arrow
+            // expressions, handled by the expression path below.
+            Tok::Async
+                if self.tokens[self.pos + 1].tok == Tok::Fn
+                    && self.tokens.get(self.pos + 2).map(|t| &t.tok) != Some(&Tok::LParen) =>
+            {
                 self.advance(); // consume `async`
                 self.fn_decl(true, false)
             }
@@ -1515,6 +1525,15 @@ impl<'a> Parser<'a> {
     /// `Ok(None)` (without consuming) if what follows is not an arrow.
     fn try_arrow(&mut self) -> Result<Option<Expr>, AsError> {
         let start = self.span().start;
+        // Anonymous `fn(params){body}` EXPRESSION (LSPEC) — desugars to the
+        // existing block-bodied arrow `(params) => {body}` (an `ExprKind::Arrow`
+        // with `ArrowBody::Block`), so the compiler/interp/VM/fmt are unchanged.
+        // Disambiguation: `fn` followed by `(` (no name) is an expression; a
+        // `fn name(…)` declaration is dispatched in `statement` and never reaches
+        // here. Also handles a leading `async fn(…)` expression.
+        if let Some(arrow) = self.try_fn_expr(start)? {
+            return Ok(Some(arrow));
+        }
         // Optional leading `async`: `async x => …` / `async (params) => …`. Only
         // commit to consuming it if an arrow actually follows.
         let is_async = if *self.peek() == Tok::Async {
@@ -1583,6 +1602,64 @@ impl<'a> Parser<'a> {
                 span: Span::new(start, end),
             }));
         }
+        Ok(None)
+    }
+
+    /// Attempt to parse an anonymous `fn(params){body}` expression at the current
+    /// position (`fn(…){…}` or `async fn(…){…}`), returning `Ok(None)` without
+    /// consuming if what follows is not one. It desugars to a block-bodied
+    /// `ExprKind::Arrow` (the same closure the `() => {…}` form produces), so no
+    /// new `ExprKind` variant is introduced. `start` is the span start captured by
+    /// the caller (at the `async`/`fn` keyword). Reuses `param_list` — the SAME
+    /// param parser `fn_decl` and the parenthesized arrow form use — so typed,
+    /// defaulted, and rest params behave identically to the arrow equivalent.
+    fn try_fn_expr(&mut self, start: usize) -> Result<Option<Expr>, AsError> {
+        // `async fn(` → an anonymous async fn expression. Only commit if `fn (`
+        // actually follows (otherwise leave `async` for the arrow detector).
+        let is_async = if *self.peek() == Tok::Async {
+            if self.tokens[self.pos + 1].tok == Tok::Fn
+                && self.tokens.get(self.pos + 2).map(|t| &t.tok) == Some(&Tok::LParen)
+            {
+                self.advance(); // consume `async`
+                true
+            } else {
+                return Ok(None);
+            }
+        } else {
+            false
+        };
+        // `fn(` (no name) → an anonymous fn expression. `fn name(…)` is a
+        // declaration, dispatched in `statement`, and never reaches the expression
+        // parser, so a bare `fn` here is always followed by `(`.
+        if *self.peek() == Tok::Fn && self.tokens[self.pos + 1].tok == Tok::LParen {
+            self.advance(); // consume `fn`
+            let params = self.param_list()?;
+            // A RETURN-type annotation (`: T`) is REJECTED — a fn-expression
+            // desugars to an arrow closure, which carries no return-type contract.
+            // Enforcing it (VM) vs dropping it (tree-walker) would be a four-mode
+            // divergence; a named `fn` declaration is the way to get an enforced
+            // return type. Same clean error as the CST front-end.
+            if *self.peek() == Tok::Colon {
+                return Err(AsError::at(
+                    "anonymous function expressions cannot declare a return type — use a named 'fn' declaration for an enforced return type, or drop the annotation",
+                    self.span(),
+                ));
+            }
+            let body = ArrowBody::Block(self.block()?);
+            let end = self.prev_end();
+            return Ok(Some(Expr {
+                kind: ExprKind::Arrow {
+                    params,
+                    body: Box::new(body),
+                    is_async,
+                    is_generator: false,
+                },
+                span: Span::new(start, end),
+            }));
+        }
+        // We consumed `async` above but no `fn(` followed — unreachable given the
+        // guard, but restore defensively rather than mis-parse.
+        debug_assert!(!is_async, "consumed `async` without a following `fn(`");
         Ok(None)
     }
 
@@ -2587,10 +2664,16 @@ fn starts_expression(tok: &Tok) -> bool {
             | Tok::HashBrace
             | Tok::Minus
             | Tok::Bang
+            | Tok::Tilde
             | Tok::Await
             | Tok::Yield
             | Tok::Async
             | Tok::Match
+            // `fn` (LSPEC): an anonymous `fn(…){…}` EXPRESSION is a valid operand
+            // (`yield fn(){…}`), so a leading `fn` starts an expression. The
+            // `fn`-vs-declaration ambiguity is settled in `statement` (`fn name` →
+            // declaration), never here in operand position.
+            | Tok::Fn
             | Tok::TemplateStr(_)
             | Tok::TemplateStart(_)
     )
@@ -3687,6 +3770,21 @@ mod tests {
                 o => panic!("expected Stmt::Defer, got {o:?}"),
             },
             o => panic!("expected Stmt::Fn, got {o:?}"),
+        }
+    }
+
+    #[test]
+    fn starts_expression_includes_all_prefix_unary_operators() {
+        // `starts_expression` gates speculative operand parsing (e.g. a `yield`
+        // operand). It MUST list every prefix-unary operator, or that operator's
+        // operand is silently dropped on the legacy front-end while the CST/VM
+        // front-end parses it — a four-mode divergence (e.g. `yield ~5` yielded the
+        // bitwise-not on VM but `nil` on the tree-walker until `Tilde` was added).
+        for tok in [Tok::Minus, Tok::Bang, Tok::Tilde] {
+            assert!(
+                starts_expression(&tok),
+                "prefix-unary operator {tok:?} must start an expression"
+            );
         }
     }
 }

@@ -104,6 +104,55 @@ fn treesitter_parses_template_escapes_with_interpolation() {
 }
 
 #[test]
+fn treesitter_parses_anonymous_fn_expressions() {
+    // Anonymous `fn(params){body}` EXPRESSIONS (LSPEC) — a value-position closure
+    // mirroring the block-bodied arrow. The grammar must parse them with NO error
+    // nodes in every expression position, while keeping `fn name(…){…}` a
+    // DECLARATION (the disambiguation is `fn` followed by `(` vs an identifier).
+    let lang = language();
+    let mut parser = tree_sitter::Parser::new();
+    parser.set_language(&lang).expect("set_language");
+    for src in [
+        "let f = fn() { return 5 }",
+        "let g = fn(x) { return x + 1 }",
+        "let r = recover(fn() { return 5 })",
+        "let xs = array.map([1,2,3], fn(x) { return x * 2 })",
+        "let v = (fn() { return 7 })()",
+        "let a = fn(x: int, y = 2) { return x + y }",
+        "let b = fn(...xs: array<int>) { return len(xs) }",
+        // bare expression statement.
+        "fn() { return 1 }",
+        // a declaration and an expression coexisting — disambiguation proof.
+        "fn named() { return 1 }\nlet h = fn() { return 2 }",
+        // async anonymous fn expression.
+        "let p = recover(async fn() { return 1 })",
+        // BLOCKER 1: a fn-expression as a `return` / `yield` / ternary operand.
+        "fn make(n) { return fn() { return n * 2 } }",
+        "fn* g() { yield fn() { return 1 } }",
+        "let f = (c) => c ? fn() { return 1 } : nil",
+    ] {
+        let tree = parser.parse(src.as_bytes(), None).expect("parse");
+        assert!(
+            !tree.root_node().has_error(),
+            "tree-sitter error on anonymous-fn-expression snippet: {src}"
+        );
+    }
+    // BLOCKER 2: a RETURN-type annotation on a fn-expression is NOT allowed (the
+    // `function_expression` rule has no return-type slot) — it must produce an
+    // error node, mirroring the hand front-ends' clean parse-error rejection.
+    for src in [
+        "let f = fn(x: int): string { return x }",
+        "let g = fn(): int { return 1 }",
+    ] {
+        let tree = parser.parse(src.as_bytes(), None).expect("parse");
+        assert!(
+            tree.root_node().has_error(),
+            "tree-sitter UNEXPECTEDLY accepted a fn-expr return type: {src}"
+        );
+    }
+}
+
+#[test]
 fn treesitter_parses_inclusive_and_step_ranges() {
     // `..=` (inclusive) and a trailing contextual `step <expr>` must parse in
     // for-range, value, and match-pattern position — and `step` must stay an

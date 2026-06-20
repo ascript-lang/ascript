@@ -280,49 +280,146 @@ fn run_error_shows_source_caret() {
     assert!(err.contains("undefined variable 'missing'"));
 }
 
-/// An anonymous `fn(){...}` EXPRESSION is not a language feature (the spec's
-/// only anonymous function is the arrow `() => ...`). It must be rejected as a
-/// clean SYNTAX error on BOTH engines — never the legacy "unexpected token Fn"
-/// on the tree-walker while the VM emits a confusing internal
-/// "compiler bug" message (the regression this guards). The arrow equivalent
-/// must keep working.
+/// An anonymous `fn(params){body}` EXPRESSION is now a valid anonymous function
+/// (LSPEC: it desugars to the existing block-bodied arrow `(params) => {body}`).
+/// It must run identically on BOTH engines (tree-walker == VM) in every
+/// expression position: direct call argument, RHS of a `let`, nested stdlib
+/// call arg, and an immediately-invoked form. The carry-forward
+/// `recover(fn(){...})` bug — which previously failed with "function
+/// declaration has no resolver binding" / a VM "compiler bug" — is now fixed.
 #[test]
-fn anon_fn_expression_is_a_syntax_error_on_both_engines() {
+fn anon_fn_expression_runs_on_both_engines() {
     let bin = env!("CARGO_BIN_EXE_ascript");
-    // `fn(){...}` in several expression positions: direct call argument, RHS of
-    // a `let`, nested call arg, and an immediately-invoked form.
+    // (source, expected stdout) — `fn(){...}` in several expression positions.
     let cases = [
-        "let r = recover(fn() { return 5 })\nprint(r[0])\n",
-        "let f = fn() { return 5 }\nprint(f())\n",
-        "let xs = array.map([1, 2, 3], fn(x) { return x * 2 })\nprint(xs)\n",
-        "let v = (fn() { return 7 })()\nprint(v)\n",
+        ("let r = recover(fn() { return 5 })\nprint(r[0])\n", "5\n"),
+        ("let f = fn() { return 5 }\nprint(f())\n", "5\n"),
+        // a fn-expression passed as a callback to a user fn (higher-order use).
+        (
+            "fn apply(g, x) { return g(x) }\nprint(apply(fn(x) { return x * 2 }, 3))\n",
+            "6\n",
+        ),
+        ("let v = (fn() { return 7 })()\nprint(v)\n", "7\n"),
+        // The carry-forward recover case: assert(false,…) → a recoverable Tier-2
+        // panic captured as a `[nil, err]` pair.
+        (
+            "let [v, e] = recover(fn() { assert(false, \"boom\") })\nprint(e.message)\n",
+            "boom\n",
+        ),
+        // typed + defaulted params behave like the arrow equivalent.
+        (
+            "let g = fn(a: int, b = 2) { return a + b }\nprint(g(3))\n",
+            "5\n",
+        ),
+        // rest param.
+        (
+            "let h = fn(...xs: array<int>) { return len(xs) }\nprint(h(1, 2, 3))\n",
+            "3\n",
+        ),
+        // bare expression statement — the closure is discarded, must still parse + run.
+        ("fn() { return 1 }\nprint(\"ok\")\n", "ok\n"),
+        // BLOCKER 1: a fn-expression as a `return` operand (the CST front-end used
+        // to omit `FnKw` from `can_start_expr`, so `return fn(){…}` parsed as
+        // `return;` + a discarded stmt → nil on VM/.aso, the closure on TW).
+        (
+            "fn make(n) { return fn() { return n * 2 } }\nprint(make(21)())\n",
+            "42\n",
+        ),
+        // BLOCKER 1: a fn-expression as a `yield` operand inside a generator.
+        // `g().next()` returns the yielded closure; calling it returns 7.
+        (
+            "fn* g() { yield fn() { return 7 } }\nlet it = g()\nprint(it.next()())\n",
+            "7\n",
+        ),
+        // BLOCKER 1: a fn-expression as a ternary branch (the `?`-lookahead also
+        // routes through the starter predicate).
+        (
+            "let pick = (c) => c ? fn() { return 1 } : fn() { return 2 }\nprint(pick(true)())\n",
+            "1\n",
+        ),
     ];
-    for src in cases {
+    for (src, expected) in cases {
         let file = std::env::temp_dir().join(format!(
             "ascript_anonfn_{}_{}.as",
             std::process::id(),
             src.len()
         ));
         std::fs::write(&file, src).unwrap();
-        for engine_args in [vec!["run"], vec!["run", "--tree-walker"]] {
-            let out = Command::new(bin)
-                .args(&engine_args)
-                .arg(&file)
-                .output()
-                .unwrap();
+        // Four-mode: VM, tree-walker, AND the compiled `.aso` (build then run) —
+        // all three must produce byte-identical output.
+        let aso = std::env::temp_dir().join(format!(
+            "ascript_anonfn_{}_{}.aso",
+            std::process::id(),
+            src.len()
+        ));
+        let built = Command::new(bin)
+            .args(["build"])
+            .arg(&file)
+            .arg("-o")
+            .arg(&aso)
+            .output()
+            .unwrap();
+        assert!(
+            built.status.success(),
+            "expected `{src}` to BUILD to .aso: {}",
+            String::from_utf8_lossy(&built.stderr)
+        );
+        let modes: [Vec<std::ffi::OsString>; 3] = [
+            vec!["run".into(), file.clone().into()],
+            vec!["run".into(), "--tree-walker".into(), file.clone().into()],
+            vec!["run".into(), aso.clone().into()],
+        ];
+        for args in &modes {
+            let out = Command::new(bin).args(args).output().unwrap();
             assert!(
-                !out.status.success(),
-                "expected `{src}` to FAIL on {engine_args:?}, but it succeeded"
+                out.status.success(),
+                "expected `{src}` to SUCCEED for {args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
             );
-            let err = String::from_utf8_lossy(&out.stderr);
-            // The defining regression: the VM must NOT surface the internal
-            // "compiler bug" message for this user-syntax mistake.
-            assert!(
-                !err.contains("compiler bug"),
-                "`{src}` on {engine_args:?} leaked an internal compiler-bug error:\n{err}"
+            assert_eq!(
+                String::from_utf8_lossy(&out.stdout),
+                expected,
+                "`{src}` for {args:?} produced wrong output"
             );
         }
     }
+}
+
+/// BLOCKER 2: a fn-expression with a RETURN-type annotation (`fn(x): T {…}`) must
+/// be a clean, IDENTICAL parse error on BOTH engines — never a four-mode runtime
+/// divergence (the VM enforced the contract while the tree-walker dropped it). The
+/// arrow form has no return-type surface, so a fn-expression cannot carry one
+/// either; a named `fn` declaration is the way to get an enforced return type.
+#[test]
+fn anon_fn_expr_return_type_is_a_syntax_error_on_both_engines() {
+    let bin = env!("CARGO_BIN_EXE_ascript");
+    let src = "let f = fn(x: int): string { return x + 1 }\nprint(f(5))\n";
+    let file = std::env::temp_dir().join(format!("ascript_anonfnret_{}.as", std::process::id()));
+    std::fs::write(&file, src).unwrap();
+    let mut errs = Vec::new();
+    for engine_args in [vec!["run"], vec!["run", "--tree-walker"]] {
+        let out = Command::new(bin)
+            .args(&engine_args)
+            .arg(&file)
+            .output()
+            .unwrap();
+        assert!(
+            !out.status.success(),
+            "expected `{src}` to FAIL on {engine_args:?}, but it succeeded"
+        );
+        let err = String::from_utf8_lossy(&out.stderr).to_string();
+        assert!(
+            err.contains("anonymous function expressions cannot declare a return type"),
+            "`{src}` on {engine_args:?} produced the wrong error:\n{err}"
+        );
+        errs.push(err);
+    }
+    // The message is identical across engines (it is the SAME parse-error string).
+    assert!(
+        errs[0].contains("anonymous function expressions cannot declare a return type")
+            && errs[1].contains("anonymous function expressions cannot declare a return type"),
+        "the return-type rejection differs across engines"
+    );
 }
 
 /// The arrow equivalent (`() => ...`) — the real anonymous-function syntax — must

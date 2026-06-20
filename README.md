@@ -272,6 +272,7 @@ python3 -m http.server 8000
 - **`docs/index.html`** — landing page.
 - **`docs/reader.html`** — the documentation reader (language guide + stdlib reference, with search).
 - **`docs/content/`** — every page as plain Markdown, readable straight from the repo if you prefer.
+- **Specification** — `docs/content/spec/` (normative; stability policy + 1.0 criteria in `spec/stability`).
 
 ## Embedding
 
