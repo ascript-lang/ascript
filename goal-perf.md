@@ -358,7 +358,8 @@ stated, results are measured.
   mapping, docs page + NAV (DOCS tripwires apply), intro + advanced examples, four-mode tests.
   - Spec: `superpowers/specs/2026-06-12-backend-batteries-design.md` · Plan: `superpowers/plans/2026-06-12-backend-batteries.md`
 
-- 🔒 **LSPEC — language specification + stability policy.** A versioned normative spec
+- ✅ **LSPEC — language specification + stability policy. MERGED to `main` (`--no-ff`, `0064be93`). See EXECUTION LOG.**
+  A versioned normative spec
   (grammar derived from the tree-sitter grammar with a drift check; semantics chapters; the
   examples corpus formally adopted as the conformance suite), a stability-tier policy
   (stable/experimental surface), the pre-1.0 → 1.0 breaking-change criteria checklist, and an
@@ -398,6 +399,40 @@ stated, results are measured.
   revisit inline short strings ONLY behind its measured-win gate.
 
 ## EXECUTION LOG (live)
+
+- **LSPEC** — ✅ MERGED to `main` (`--no-ff`, `0064be93`). The AScript normative language specification + its
+  stability/governance policy, plus the owner-approved grammar feature that resolved the recover-contract triage.
+  **The owner-triage (plan-marked):** the `recover(fn(){…})` carry-forward — the owner chose to **ADD anonymous
+  fn-expressions** (over documenting a restriction). Implemented as `fn(params){body}` value expressions DESUGARED to
+  `ExprKind::Arrow` (parsers-only: legacy + CST + tree-sitter regen; **NO new `ExprKind` variant, NO opcode/`.aso`
+  change, `ASO_FORMAT_VERSION` 29 unchanged**; `vm_differential` 446/0 four-mode BOTH configs). So `recover(fn(){…})`
+  now works (alongside arrow + named-fn); `fn(x):T{}` is REJECTED (Arrow has no ret_type field; enforce-both would
+  break fmt idempotence — arrows carry no return contract). **The independent review caught THREE four-mode divergences
+  the 445-corpus + both conformance suites missed** — all in speculative-parse *expression-starter predicates* the
+  corpus never exercised with these token combos: `return fn(){}` (CST `can_start_expr`/`token_can_start_expr` +
+  `ternary_ahead` + legacy `starts_expression` omitted the `fn`-keyword), `fn(x):T{}` (return-annotation enforced on VM,
+  dropped on tree-walker), and `yield ~x` (legacy `starts_expression` omitted `Tilde` — a pre-existing gap, fixed +
+  regression-tested). The controller's full-suite run ALSO caught a stale `check::rules::workflow_determinism` test
+  (it asserted the fn-form was a syntax error; updated to assert the rule now *walks* the fn-form — strictly better).
+  **THE SPEC:** 16 normative chapters under `docs/content/spec/` (intro · lexical · grammar [all **108** tree-sitter
+  rules covered] · values · expressions · statements · classes · patterns · errors · modules · concurrency ·
+  capabilities · types · stdlib · conformance · stability), each **Gate-14-grounded** (the `## Conformance` section
+  cites real examples/tests that were RUN to confirm every normative claim — the spec describes the IMPLEMENTED
+  language, not aspiration; the final holistic re-probed 6 cross-chapter claims against the live binary, all matched).
+  `tests/spec_drift.rs` is the permanent drift guardrail (grammar-rule coverage anchored to `grammar.js` + chapter
+  existence + citation resolution + a mutation self-test) — **fully GREEN** both configs. **Governance:**
+  `spec/stability.md` (version = crate 0.6; STABLE [chapters 2–13 + stdlib surface] / EXPERIMENTAL [`http3`, DAP
+  stepping, record/replay surface, lint inventory, …] / INTERNAL [`.aso` by `ASO_FORMAT_VERSION` name, opcodes, worker
+  wire tags, shape/IC; `ascript::embed` is the carved-out STABLE Rust host surface post-EMBED] tiers, each
+  owner-editable; the road-to-1.0 checklist) + `superpowers/rfcs/{0000-template,README}.md` (the RFC process) +
+  `CONTRIBUTING.md` "Language changes & stability" + a pointer in the 2026-05-29 design doc (now the historical
+  record). Reality-corrections written into the chapters (not papered over): there is **no decimal literal** (decimal
+  is `std/decimal.parse` only); redeclaration is a runtime error for module-scope globals only (block-local `let` may
+  shadow). The governance loop demonstrably CLOSES (a fake grammar rule → `spec_drift` RED with a CLAUDE.md-citing
+  message; the three governance views are one consistent process). Docs-only + parsers-only branch — zero engine/
+  compiler/interp diff. CLAUDE.md gained the spec-staleness "Touching syntax" bullet; README + NAV name
+  `docs/content/spec/` as the normative set. EDITOR-PIN follow-up (the tree-sitter regen): mirror sync + Zed/Nvim rev
+  bump is a publish step CI handles.
 
 - **EMBED** — ✅ MERGED to `main` (`--no-ff`, `aa512616`). A host-embedding API in **6 units** (subagent-driven; fresh
   implementer + independent opus reviewer per unit; the host-module security phase + the C-FFI safety phase + a final
