@@ -505,3 +505,79 @@ fn kind_table_every_value_kind_crosses() {
         );
     }
 }
+
+// ── Task 2.3: the explicit JSON/serde deep bridge ───────────────────────────
+
+#[cfg(feature = "data")]
+#[test]
+fn to_json_of_an_object_handle() {
+    let iso = Isolate::builder().build().unwrap();
+    iso.eval("let o = { a: 1, b: [2, 3], c: \"x\" }").unwrap();
+    let o = iso.global("o").unwrap();
+    let json = o.to_json().unwrap();
+    assert_eq!(json, r#"{"a":1,"b":[2,3],"c":"x"}"#);
+}
+
+#[cfg(feature = "data")]
+#[test]
+fn json_parse_produces_a_handle_readable_by_script() {
+    let iso = Isolate::builder().build().unwrap();
+    let v = iso.json_parse(r#"{"hp": 42, "name": "hero"}"#).unwrap();
+    assert_eq!(v.kind(), AsKind::Object);
+    // It is a DEEP COPY, distinct from a live handle: set it in and read in script.
+    iso.set_global("decoded", v).unwrap();
+    assert_eq!(iso.eval("decoded.hp").unwrap().as_int(), Some(42));
+    assert_eq!(iso.eval("decoded.name").unwrap().as_str(), Some("hero"));
+}
+
+#[cfg(feature = "data")]
+#[test]
+fn to_json_of_a_function_is_a_typed_error_with_the_offending_type() {
+    let iso = Isolate::builder().build().unwrap();
+    iso.eval("fn f() { return 1 }").unwrap();
+    let f = iso.global("f").unwrap();
+    let e = f.to_json().unwrap_err();
+    // A non-serializable value → a typed error naming the offending value (the "path"
+    // json's serializer provides). NOT a panic / hang.
+    match e {
+        EmbedError::Config(msg) | EmbedError::Panic(ascript::embed::EmbedPanic { message: msg, .. }) => {
+            assert!(msg.contains("function"), "got {msg:?}");
+        }
+        other => panic!("expected a typed serialize error, got {other:?}"),
+    }
+}
+
+#[cfg(feature = "data")]
+#[test]
+fn to_json_of_a_cyclic_object_errors_never_hangs() {
+    let iso = Isolate::builder().build().unwrap();
+    // A self-referential object: `o.self = o`. to_json must ERROR (match
+    // from_ascript's cycle behavior), never hang.
+    iso.eval("let o = {}\no.self = o").unwrap();
+    let o = iso.global("o").unwrap();
+    let e = o.to_json().unwrap_err();
+    match e {
+        EmbedError::Config(msg) | EmbedError::Panic(ascript::embed::EmbedPanic { message: msg, .. }) => {
+            assert!(msg.contains("cyclic") || msg.contains("cycle"), "got {msg:?}");
+        }
+        other => panic!("expected a cycle error, got {other:?}"),
+    }
+}
+
+#[cfg(all(feature = "data", feature = "embed"))]
+#[test]
+fn asvalue_serde_serializes_via_the_json_model() {
+    let v = AsValue::object(vec![
+        ("n".to_string(), AsValue::from(5i64)),
+        ("s".to_string(), AsValue::from("hi")),
+    ]);
+    let out = serde_json::to_string(&v).unwrap();
+    assert_eq!(out, r#"{"n":5,"s":"hi"}"#);
+}
+
+// NOTE: the `to_json`/`json_parse` Config-fallback when the `data` feature is OFF is
+// pinned by a LIB UNIT test in `src/embed/value.rs`, not here: an integration test
+// always links the crate's normal build, and the self-dev-dependency
+// (`ascript = { path = ".", features = ["fuzzgen"] }`) pulls DEFAULT features — so
+// `data` can never be off in this target. The lib unit test sees the real (no-default)
+// feature set and is the correct home for that cfg-gated assertion.

@@ -325,6 +325,35 @@ impl Isolate {
         Ok(())
     }
 
+    /// Parse a JSON string into a fresh [`AsValue`] (a DEEP COPY — explicitly distinct
+    /// from the live aliasing handles, spec §5.3). Routes through `std/json`'s total
+    /// parser. The inverse of [`AsValue::to_json`](AsValue::to_json).
+    ///
+    /// # Errors
+    ///
+    /// [`EmbedError::Config`] when the crate is built without the `data` feature (the
+    /// `std/json` parser is absent — documented, not silently compiled away);
+    /// otherwise [`EmbedError::Config`] on invalid JSON (carrying the parser's message).
+    #[cfg(feature = "data")]
+    pub fn json_parse(&self, text: &str) -> Result<AsValue, EmbedError> {
+        let jv: serde_json::Value = serde_json::from_str(text)
+            .map_err(|e| EmbedError::Config(format!("invalid JSON: {e}")))?;
+        Ok(AsValue::from_value(crate::stdlib::json::to_ascript(&jv)))
+    }
+
+    /// Parse a JSON string into a fresh [`AsValue`].
+    ///
+    /// # Errors
+    ///
+    /// Always [`EmbedError::Config`] in this build: the crate was compiled without the
+    /// `data` feature, so the `std/json` parser is absent (spec §5.3).
+    #[cfg(not(feature = "data"))]
+    pub fn json_parse(&self, _text: &str) -> Result<AsValue, EmbedError> {
+        Err(EmbedError::Config(
+            "json_parse requires the 'data' Cargo feature (the std/json parser)".to_string(),
+        ))
+    }
+
     /// Load + run a compiled module archive (a single `.aso` `ascript build` output) as
     /// the entry program on this isolate, verified through the same `.aso` trust
     /// boundary the CLI uses ([`Chunk::from_bytes_verified`](crate::vm::chunk::Chunk)).

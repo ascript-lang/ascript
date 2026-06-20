@@ -345,6 +345,47 @@ impl AsValue {
         }
     }
 
+    // ── the explicit JSON deep bridge (§5.3) ────────────────────────────────
+    //
+    // `to_json` / `Isolate::json_parse` are DEEP COPIES — explicitly distinct from
+    // the live aliasing handles. They route through `std/json`'s shipped Rust
+    // serializer/parser (NOT script-level dispatch), reusing its cycle guard
+    // (a self-referential graph ERRORS, never hangs) and its non-serializable-value
+    // errors (which name the offending type — the "path" json provides).
+
+    /// Deep-serialize this value to a JSON string (a COPY, distinct from the live
+    /// handle). Routes through `std/json`'s total serializer.
+    ///
+    /// # Errors
+    ///
+    /// [`EmbedError::Config`](crate::embed::EmbedError::Config) when the crate is built
+    /// without the `data` feature (the `std/json` serializer is absent — documented, not
+    /// silently compiled away). Otherwise a serialize failure — a non-serializable kind
+    /// (a function, native handle, …) or a reference CYCLE — is surfaced carrying the
+    /// json serializer's message (which names the offending type); a cyclic graph
+    /// ERRORS, never hangs.
+    #[cfg(feature = "data")]
+    pub fn to_json(&self) -> Result<String, crate::embed::EmbedError> {
+        let jv = crate::stdlib::json::from_ascript(&self.0, &mut Vec::new())
+            .map_err(crate::embed::EmbedError::Config)?;
+        serde_json::to_string(&jv)
+            .map_err(|e| crate::embed::EmbedError::Config(format!("could not encode JSON: {e}")))
+    }
+
+    /// Deep-serialize this value to a JSON string.
+    ///
+    /// # Errors
+    ///
+    /// Always [`EmbedError::Config`](crate::embed::EmbedError::Config) in this build: the
+    /// crate was compiled without the `data` feature, so the `std/json` serializer is
+    /// absent (spec §5.3 — documented, never silently compiled away).
+    #[cfg(not(feature = "data"))]
+    pub fn to_json(&self) -> Result<String, crate::embed::EmbedError> {
+        Err(crate::embed::EmbedError::Config(
+            "to_json requires the 'data' Cargo feature (the std/json serializer)".to_string(),
+        ))
+    }
+
     /// The underlying `Value` (crate-internal — the engine side of the boundary).
     pub(crate) fn into_value(self) -> Value {
         self.0
@@ -396,5 +437,51 @@ impl From<&str> for AsValue {
 impl From<String> for AsValue {
     fn from(s: String) -> Self {
         AsValue(Value::str(s))
+    }
+}
+
+/// Serde `Serialize` via the JSON model (§5.3) — a COPY, like [`AsValue::to_json`].
+/// A non-serializable value or a reference cycle is a serde error (never a hang).
+#[cfg(all(feature = "embed", feature = "data"))]
+impl serde::Serialize for AsValue {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        let jv = crate::stdlib::json::from_ascript(&self.0, &mut Vec::new())
+            .map_err(serde::ser::Error::custom)?;
+        jv.serialize(serializer)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The JSON deep bridge's feature-gating contract (spec §5.3). A LIB unit test
+    /// (not an integration test) because only the lib target sees the genuine
+    /// `--no-default-features` feature set — an integration test always pulls DEFAULT
+    /// features through the self-dev-dependency, so `data` can never be off there.
+    ///
+    /// - With `data` ON: `to_json` of a plain object round-trips to a JSON string.
+    /// - With `data` OFF: `to_json` returns the DOCUMENTED `EmbedError::Config` naming
+    ///   the missing feature — never silently compiled away.
+    #[test]
+    fn to_json_feature_gating() {
+        let obj = AsValue::object(vec![("a".to_string(), AsValue::from(1i64))]);
+        let r = obj.to_json();
+        #[cfg(feature = "data")]
+        {
+            assert_eq!(r.unwrap(), r#"{"a":1}"#);
+        }
+        #[cfg(not(feature = "data"))]
+        {
+            match r.unwrap_err() {
+                crate::embed::EmbedError::Config(msg) => {
+                    assert!(msg.contains("data"), "Config error must name the feature: {msg}");
+                }
+                other => panic!("expected Config, got {other:?}"),
+            }
+        }
     }
 }
