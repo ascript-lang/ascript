@@ -71,6 +71,17 @@ pub enum StdlibFilter {
     Allow(Vec<String>),
 }
 
+impl StdlibFilter {
+    /// Adapt to the CORE `StdlibFilterCore` the `Interp` import chokepoint checks.
+    fn to_core(&self) -> crate::interp::StdlibFilterCore {
+        match self {
+            StdlibFilter::Full => crate::interp::StdlibFilterCore::Full,
+            StdlibFilter::Core => crate::interp::StdlibFilterCore::Core,
+            StdlibFilter::Allow(list) => crate::interp::StdlibFilterCore::Allow(list.clone()),
+        }
+    }
+}
+
 /// Host-decided capabilities for an embedded isolate (spec §7).
 ///
 /// The embedded default is **deny-all** — the loud inversion of the CLI's
@@ -274,8 +285,10 @@ impl IsolateBuilder {
         };
         interp.set_caps(self.caps.into_capset());
         interp.set_cli_args(&self.args);
-        // The `StdlibFilter` field is wired into the import chokepoint in Task 3.4.
-        let _ = &self.stdlib;
+        // EMBED §6.5: install the stdlib AVAILABILITY filter, checked at the
+        // `load_std_module` import chokepoint. An availability knob, NOT a security
+        // boundary — capabilities (above) are the security boundary.
+        interp.set_stdlib_filter(self.stdlib.to_core());
         // EMBED §6.3: register the validated host modules on the isolate BEFORE any code
         // runs. Names were validated + de-duplicated at builder time, so a registration
         // error here is unreachable; surface it as Config defensively rather than panic.

@@ -865,3 +865,144 @@ fn pooled_workers_do_not_leak_host_modules_across_isolates() {
         other => panic!("expected B's worker to miss, got {other:?}"),
     }
 }
+
+// ── Task 3.4: deny-all caps default + StdlibFilter + (checker skip in lib) ───
+
+use ascript::embed::{Caps, StdlibFilter};
+
+#[cfg(feature = "sys")]
+#[test]
+fn deny_all_is_the_default_and_all_granted_lifts_it() {
+    // Default builder → deny-all: a script `fs.read` raises `capability 'fs' denied`.
+    let iso = Isolate::builder()
+        .output(ascript::embed::OutputMode::Capture)
+        .build()
+        .unwrap();
+    let e = iso
+        .eval("import * as fs from \"std/fs\"\nfs.read(\"/etc/hostname\")\n")
+        .unwrap_err();
+    match e {
+        EmbedError::Panic(p) => assert!(
+            p.message.contains("capability 'fs' denied"),
+            "deny-all default blocks fs; got: {}",
+            p.message
+        ),
+        other => panic!("expected fs denial Panic, got {other:?}"),
+    }
+
+    // .caps(Caps::all_granted()) → the same program reads a real temp file.
+    let dir = std::env::temp_dir().join("ascript_embed_caps_test");
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("hello.txt");
+    std::fs::write(&path, "hi there").unwrap();
+    let iso2 = Isolate::builder()
+        .output(ascript::embed::OutputMode::Capture)
+        .caps(Caps::all_granted())
+        .build()
+        .unwrap();
+    iso2.eval(&format!(
+        "import * as fs from \"std/fs\"\nlet [t, e] = fs.read({:?})\nprint(t)\n",
+        path.to_string_lossy()
+    ))
+    .expect("all_granted permits fs.read");
+    assert_eq!(iso2.take_output(), "hi there\n");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[cfg(feature = "sys")]
+#[test]
+fn granting_carves_in_exactly_one_capability() {
+    // granting(&[Cap::Fs]) permits fs but still denies env.
+    let iso = Isolate::builder()
+        .output(ascript::embed::OutputMode::Capture)
+        .caps(Caps::granting(&[ascript::stdlib::caps::Cap::Fs]))
+        .build()
+        .unwrap();
+    // env is NOT granted → denied.
+    let e = iso
+        .eval("import * as env from \"std/env\"\nenv.get(\"PATH\")\n")
+        .unwrap_err();
+    match e {
+        EmbedError::Panic(p) => assert!(
+            p.message.contains("capability 'env' denied"),
+            "granting(Fs) still denies env; got: {}",
+            p.message
+        ),
+        other => panic!("expected env denial, got {other:?}"),
+    }
+}
+
+#[cfg(feature = "data")]
+#[test]
+fn stdlib_filter_allow_blocks_unlisted_modules() {
+    // StdlibFilter::Allow(["std/math"]) → std/json import is unavailable, std/math works.
+    let iso = Isolate::builder()
+        .output(ascript::embed::OutputMode::Capture)
+        .stdlib(StdlibFilter::Allow(vec!["std/math".to_string()]))
+        .build()
+        .unwrap();
+    let e = iso
+        .eval("import * as json from \"std/json\"\n")
+        .unwrap_err();
+    match e {
+        EmbedError::Panic(p) => assert!(
+            p.message
+                .contains("module 'std/json' is not available in this isolate"),
+            "§6.5 availability message; got: {}",
+            p.message
+        ),
+        other => panic!("expected availability Panic, got {other:?}"),
+    }
+    // std/math is allowed.
+    iso.eval("import * as math from \"std/math\"\nprint(math.abs(-3))\n")
+        .expect("allowed module imports");
+    assert_eq!(iso.take_output(), "3\n");
+}
+
+#[test]
+fn stdlib_filter_core_excludes_os_modules_and_ffi() {
+    // StdlibFilter::Core excludes every required_cap-mapped module + std/ffi, but keeps
+    // the pure ones (std/math). Table-driven AGAINST required_cap (drift-proof).
+    let iso = Isolate::builder()
+        .output(ascript::embed::OutputMode::Capture)
+        .stdlib(StdlibFilter::Core)
+        .caps(Caps::all_granted()) // caps granted: prove the FILTER (not caps) blocks it
+        .build()
+        .unwrap();
+    // std/math is pure → available.
+    iso.eval("import * as math from \"std/math\"\nprint(math.abs(-4))\n")
+        .expect("pure module available under Core");
+    assert_eq!(iso.take_output(), "4\n");
+    // std/ffi is explicitly excluded from Core (even though caps are all granted).
+    let e = iso.eval("import * as ffi from \"std/ffi\"\n").unwrap_err();
+    assert!(
+        matches!(&e, EmbedError::Panic(p) if p.message.contains("not available in this isolate")),
+        "Core excludes std/ffi; got: {e:?}"
+    );
+}
+
+#[test]
+fn in_script_caps_drop_stays_monotone_after_a_grant() {
+    // Granting at construction does not violate monotonicity (construction precedes all
+    // drops). After a grant, an in-script caps.drop is IRREVERSIBLE — caps.has stays
+    // false; there is no re-grant.
+    let iso = Isolate::builder()
+        .output(ascript::embed::OutputMode::Capture)
+        .caps(Caps::all_granted())
+        .build()
+        .unwrap();
+    iso.eval(
+        r#"
+        import * as caps from "std/caps"
+        print(caps.has("fs"))   // true (granted at construction)
+        caps.drop("fs")
+        print(caps.has("fs"))   // false (dropped — irreversible)
+    "#,
+    )
+    .unwrap();
+    assert_eq!(iso.take_output(), "true\nfalse\n");
+    // A later eval in the same session: fs is still dropped (monotone across the session).
+    iso.eval("import * as caps from \"std/caps\"\nprint(caps.has(\"fs\"))\n")
+        .unwrap();
+    assert_eq!(iso.take_output(), "false\n");
+}

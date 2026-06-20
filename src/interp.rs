@@ -353,6 +353,21 @@ pub type HostModuleFactoryCore = dyn Fn() -> HostModuleDef + Send + Sync;
 /// worker isolates: `(full "host:<name>", factory)`.
 pub type HostFactoryEntry = (Rc<str>, std::sync::Arc<HostModuleFactoryCore>);
 
+/// EMBED §6.5: the CORE stdlib AVAILABILITY filter (the type-erased form of the embed
+/// `StdlibFilter`). Checked at the `load_std_module` import chokepoint ONLY — an
+/// availability knob, NOT a security boundary (capabilities are the security boundary;
+/// an allowlisted module's transitively-reachable builtins are not re-walked).
+#[derive(Debug, Clone)]
+pub enum StdlibFilterCore {
+    /// Every compiled-in module is importable (the default; `None` on the Interp means
+    /// this too — the filter is absent → zero-cost).
+    Full,
+    /// Only the no-OS subset: every module whose `required_cap` is empty, minus `std/ffi`.
+    Core,
+    /// Only the listed `std/*` specifiers are importable.
+    Allow(Vec<String>),
+}
+
 /// RESIL §5.4: the canonical `[nil, {message, code:"deadline-exceeded"}]` Tier-1
 /// err pair returned when a deadline budget is exhausted. ONE construction site so
 /// the shape is byte-identical across the deadline race ([`crate::stdlib::resilience`]),
@@ -914,6 +929,10 @@ pub struct Interp {
     /// spawn paths — a plain field, NOT serialized, NO wire tag. CORE (always empty under
     /// `--no-default-features`).
     host_factories: RefCell<Vec<HostFactoryEntry>>,
+    /// EMBED §6.5: the stdlib availability filter (embed-set). `None` = no filter (the
+    /// default — every compiled-in module importable, zero-cost). Checked ONLY at the
+    /// `load_std_module` import chokepoint. CORE (always `None` under non-embed runs).
+    stdlib_filter: RefCell<Option<StdlibFilterCore>>,
     /// Workers Spec A: the entry program's full source text, retained so a
     /// `worker fn` dispatch can (re)compile it to a top-level [`crate::vm::chunk::Chunk`]
     /// and build the shippable code slice (entry fn + transitive top-level deps).
@@ -1417,6 +1436,8 @@ impl Interp {
             host_modules: RefCell::new(HashMap::new()),
             // EMBED §6.4: no host factories until the embed builder installs them.
             host_factories: RefCell::new(Vec::new()),
+            // EMBED §6.5: no stdlib filter by default (every module importable).
+            stdlib_filter: RefCell::new(None),
             iface_verdict_cache: RefCell::new(HashMap::new()),
             iface_cache_gen: std::cell::Cell::new(0),
             // FFI §4.3: default = ALL granted → byte-identical for every existing
@@ -3619,6 +3640,15 @@ impl Interp {
     /// Resolve a `std/*` built-in module to a cached `ModuleEntry`, building it
     /// from the static export registry. Bypasses the filesystem entirely.
     fn load_std_module(&self, source: &str) -> Result<ModuleEntry, Control> {
+        // EMBED §6.5: the stdlib AVAILABILITY filter chokepoint (the ONE place it is
+        // checked — an availability knob, NOT a security boundary; capabilities are the
+        // security boundary). Zero-cost when no filter is set (the default). A filtered
+        // module reports the §6.5 message.
+        if !self.stdlib_module_available(source) {
+            return Err(Control::Panic(AsError::new(format!(
+                "module '{source}' is not available in this isolate"
+            ))));
+        }
         let key = PathBuf::from(format!("<std>/{}", &source[4..]));
         if let Some(entry) = self.modules.borrow().get(&key) {
             return Ok(entry.clone());
@@ -3758,6 +3788,46 @@ impl Interp {
         self.host_modules
             .borrow_mut()
             .insert(Rc::clone(name), Rc::new(def));
+    }
+
+    /// EMBED §6.5: install the stdlib availability filter (the embed builder sets it).
+    /// `StdlibFilterCore::Full` clears any filter (the zero-cost default).
+    pub fn set_stdlib_filter(&self, filter: StdlibFilterCore) {
+        *self.stdlib_filter.borrow_mut() = match filter {
+            StdlibFilterCore::Full => None,
+            other => Some(other),
+        };
+    }
+
+    /// EMBED §6.5: whether a `std/<name>` module is AVAILABLE under the current filter
+    /// (an availability knob — NOT the security boundary). `true` when no filter is set
+    /// (the default → zero-cost). For `Core`, a module is available iff its
+    /// `required_cap` is empty AND it is not `std/ffi`. For `Allow`, iff it is listed.
+    /// `source` is the full `std/<name>` specifier.
+    fn stdlib_module_available(&self, source: &str) -> bool {
+        let filter = self.stdlib_filter.borrow();
+        let Some(filter) = filter.as_ref() else {
+            return true; // no filter → everything available (zero-cost default)
+        };
+        match filter {
+            StdlibFilterCore::Full => true,
+            StdlibFilterCore::Core => {
+                // The no-OS subset: `required_cap` is empty AND not `std/ffi`. The gate
+                // key is the `std/`-stripped name with `/` → `_` (the SAME mapping the
+                // cap-completeness test uses: `std/net/tcp` → `net_tcp`), so this is
+                // DRIFT-PROOF against `required_cap` itself — a module that gains a cap
+                // automatically drops out of Core.
+                if source == "std/ffi" {
+                    return false;
+                }
+                let Some(stripped) = source.strip_prefix("std/") else {
+                    return false;
+                };
+                let key = stripped.replace('/', "_");
+                crate::stdlib::required_cap(&key, "__probe__").is_empty()
+            }
+            StdlibFilterCore::Allow(list) => list.iter().any(|m| m == source),
+        }
     }
 
     /// EMBED §6.4: clear ALL registered host modules on this isolate. The POOLED worker
