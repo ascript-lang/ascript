@@ -31,6 +31,7 @@ const NAV = [
   { title: 'Specification', items: [
     ['spec/intro', 'Notation & conformance'],
     ['spec/lexical', 'Lexical structure'],
+    ['spec/grammar', 'Grammar (EBNF)'],
   ]},
   { title: 'Standard library', items: [
     ['stdlib/overview', 'Overview'],
