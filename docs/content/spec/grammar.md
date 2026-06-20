@@ -145,8 +145,8 @@ type_bound      = ":" type ;
 
 `covers: type_parameters, type_parameter, type_bound`
 
-Type parameters are checked statically and erased at runtime (see
-[types](types)). A bound is interface-constrained by the checker; the grammar
+Type parameters are checked statically and erased at runtime (see the
+*Types* chapter). A bound is interface-constrained by the checker; the grammar
 accepts any type.
 
 ### Classes
@@ -434,7 +434,7 @@ the `match_subject` branch (a range pattern reuses `range_expression`; a
 positional variant pattern reuses `call_expression`). The named-variant form
 `variant_pattern` (`Rect(w: ww)`) is the only payload-pattern that needs a
 dedicated rule. The binding rule (compare-if-defined vs bind-if-new) is in the
-[patterns chapter](patterns).
+*Patterns* chapter.
 
 ## Types
 

@@ -135,7 +135,7 @@ print(2e-2)     // 0.02
 ```
 
 A float always prints with a fractional digit and an int never does, so the two
-numeric subtypes are visually distinguishable (see [values](values)).
+numeric subtypes are visually distinguishable (see the *Values* chapter).
 
 ### Decimal values
 

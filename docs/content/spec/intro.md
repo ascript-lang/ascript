@@ -17,8 +17,8 @@ This chapter is written first because every other chapter uses its terms.
 ## Status & versioning
 
 The **language version is the crate version**: AScript is at **0.6.0** as of this
-edition. Before 1.0, a breaking change to a STABLE part of the surface (see
-[stability](stability)) requires a minor version bump with migration notes. Each
+edition. Before 1.0, a breaking change to a STABLE part of the surface (see the
+*Stability* chapter) requires a minor version bump with migration notes. Each
 chapter is verified against the implementation at edition time; a chapter MUST NOT
 assert behavior that the reference implementation does not exhibit.
 
@@ -50,12 +50,12 @@ These terms are used throughout the specification.
   **kinds** (`nil`, `bool`, `int`, `float`, `decimal`, `string`, function, array,
   object, map, set, bytes, regex, native handle, enum variant, class/instance,
   plus `future`, `generator`, and structural `interface` descriptors). The
-  [values](values) chapter is the authoritative inventory.
+  *Values* chapter is the authoritative inventory.
 - **Kind** — the runtime category of a value, as reported by the `type(x)`
   builtin. Kinds are disjoint; there is no implicit cross-kind coercion.
 - **Isolate** — a single, independent runtime instance: its own heap, its own
   garbage collector, its own event loop. The main program runs in one isolate;
-  each [worker](concurrency) runs in its own. An isolate is single-threaded and
+  each worker (the *Concurrency* chapter) runs in its own. An isolate is single-threaded and
   shares no memory with any other; values cross between isolates only by a
   structured deep copy through the serializer **airlock** (or, for frozen
   `shared` values, by reference).
@@ -68,20 +68,20 @@ These terms are used throughout the specification.
 - **Four-mode / differential** — the reference toolchain runs the same program
   in four modes: the tree-walker, the specialized VM, the generic VM
   (`--no-specialize`), and from compiled `.aso` bytecode. These four modes MUST
-  produce byte-identical observable behavior. The [conformance](conformance)
-  chapter formalizes this as the conformance criterion; the differential test
+  produce byte-identical observable behavior. The *Conformance* chapter
+  formalizes this as the conformance criterion; the differential test
   battery checks it continuously.
 - **Tier-1 error** — a *recoverable error value*. Fallible operations return a
   `[value, err]` pair (`error` is `object | nil`); the error is an ordinary
-  value, not a panic. The `?` operator early-returns such a pair. See
-  [errors](errors).
+  value, not a panic. The `?` operator early-returns such a pair. See the
+  *Errors* chapter.
 - **Tier-2 panic** — an *unrecoverable bug* (a wrong type, a bad arity, an
   undefined name, a contract violation). A panic unwinds to the host, prints a
   source-pointed diagnostic, and exits non-zero; it is caught only by `recover`
-  at a host boundary. See [errors](errors).
+  at a host boundary. See the *Errors* chapter.
 - **Capability** — a coarse permission (`fs`, `net`, `process`, `ffi`, `env`)
   governing access to operating-system resources. Capabilities are opt-out:
-  all are granted by default. See [capabilities](capabilities).
+  all are granted by default. See the *Capabilities* chapter.
 
 ## Behavior categories
 
@@ -110,7 +110,7 @@ explicitly where they occur.
 An implementation of AScript **conforms** iff, over the adopted conformance suite,
 it produces byte-identical observable behavior — standard output, exit status,
 and panic/diagnostic messages — to the suite's recorded goldens and the reference
-implementation. The [conformance](conformance) chapter gives the formal
+implementation. The *Conformance* chapter gives the formal
 definition; the criterion is the **four-mode byte-identity** described above.
 
 One **engine asymmetry** is documented and intentional: bytecode-capacity limits
@@ -126,7 +126,7 @@ A formal operational semantics for AScript is recorded as a future possibility,
 not a v1 deliverable. Today the differential oracle — the tree-walking
 interpreter, kept byte-for-byte identical to the VM — IS the executable semantics:
 where this prose and the oracle disagree, the oracle is presumed correct and the
-prose is a defect (see [conformance](conformance)).
+prose is a defect (see the *Conformance* chapter).
 
 ## Conformance
 
