@@ -36,6 +36,8 @@ pub mod email;
 pub mod crypto;
 #[cfg(feature = "cron")]
 pub mod cron;
+#[cfg(feature = "semver")]
+pub mod semver;
 #[cfg(feature = "docker")]
 pub mod docker;
 pub mod events;
@@ -254,6 +256,8 @@ pub fn std_module_exports(path: &str) -> Option<Vec<(String, Value)>> {
         "std/docker" => docker::exports(),
         #[cfg(feature = "cron")]
         "std/cron" => cron::exports(),
+        #[cfg(feature = "semver")]
+        "std/semver" => semver::exports(),
         #[cfg(feature = "auth")]
         "std/jwt" => jwt::exports(),
         #[cfg(feature = "auth")]
@@ -344,6 +348,7 @@ pub const STD_MODULES: &[&str] = &[
     "std/resilience",
     "std/docker",
     "std/cron",
+    "std/semver",
     "std/jwt",
     "std/oauth",
     "std/archive",
@@ -746,6 +751,8 @@ impl Interp {
             "docker" => self.call_docker(func, args, span).await,
             #[cfg(feature = "cron")]
             "cron" => self.call_cron(func, args, span).await,
+            #[cfg(feature = "semver")]
+            "semver" => self.call_semver(func, args, span).await,
             #[cfg(feature = "auth")]
             "jwt" => self.call_jwt_async(func, args, span).await,
             #[cfg(feature = "auth")]
@@ -1364,6 +1371,9 @@ mod cap_gate_tests {
             // ungated) timer machinery — the module itself touches no OS; a
             // `cron.schedule` callback that hits the OS is independently capped.
             "cron",
+            // BATT T2-2 §12: std/semver is pure version parsing/comparison/range
+            // math — no OS resource, so it acquires no cap.
+            "semver",
             // BATT B3 §7.2: std/xml is pure parsing/serialization — no net/fs (the
             // structural XXE / external-entity defense), so it acquires no cap.
             "xml",

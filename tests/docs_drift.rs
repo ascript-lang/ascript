@@ -175,6 +175,7 @@ const MODULE_PAGES: &[(&str, &str)] = &[
     ("std/lru", "utilities.md"),
     ("std/events", "utilities.md"),
     ("std/template", "utilities.md"),
+    ("std/semver", "utilities.md"),
     ("std/bytes", "collections.md"),
     ("std/caps", "caps.md"),
     ("std/convert", "collections.md"),

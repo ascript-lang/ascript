@@ -86,6 +86,9 @@ pub const STD_MODULE_FEATURES: &[(&str, Option<&str>)] = &[
     // BATT T2-1 §11 — std/cron is gated on the `cron` feature (cron = datetime).
     // A cron bundle therefore pulls the datetime tier (chrono civil-time math).
     ("std/cron",        Some("cron")),
+    // BATT T2-2 §12 — std/semver is gated on the `semver` feature (semver = [],
+    // no deps): pure SemVer parsing/comparison/range math, no FEATURE_DEPS edge.
+    ("std/semver",      Some("semver")),
     // BATT Phase A — std/jwt + std/oauth are gated on the `auth` feature
     // (auth = crypto + data + net + rsa/p256). An auth-using bundle therefore
     // needs the net tier (jwks fetch + oauth token calls) — see FEATURE_DEPS.

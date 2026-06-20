@@ -2490,6 +2490,44 @@ static CRON_MEMBERS: &[(&str, MemberKind)] = &[
     ("schedule", MemberKind::Fn),
 ];
 
+// ── std/semver ────────────────────────────────────────────────────────────────
+
+static SEMVER_PARSE_PARAMS: &[StdParam] = &[StdParam::req("v", "string")];
+static SEMVER_VALID_PARAMS: &[StdParam] = &[StdParam::req("v", "string")];
+static SEMVER_COMPARE_PARAMS: &[StdParam] = &[
+    StdParam::req("a", "string"),
+    StdParam::req("b", "string"),
+];
+static SEMVER_SORT_PARAMS: &[StdParam] = &[StdParam::req("versions", "array")];
+static SEMVER_SATISFIES_PARAMS: &[StdParam] = &[
+    StdParam::req("version", "string"),
+    StdParam::req("range", "string"),
+];
+static SEMVER_MAX_SATISFYING_PARAMS: &[StdParam] = &[
+    StdParam::req("versions", "array"),
+    StdParam::req("range", "string"),
+];
+
+static SEMVER_SIGS: &[(&str, StdSig)] = &[
+    ("parse", StdSig { params: SEMVER_PARSE_PARAMS, ret: Some("[object, err]"), doc: "Parse a strict SemVer 2.0.0 version into {major, minor, patch, prerelease, build}." }),
+    ("valid", StdSig { params: SEMVER_VALID_PARAMS, ret: Some("bool"), doc: "Return whether the string is a valid strict SemVer 2.0.0 version." }),
+    ("compare", StdSig { params: SEMVER_COMPARE_PARAMS, ret: Some("int"), doc: "Compare two versions by SemVer precedence; returns -1, 0, or 1 (build metadata ignored)." }),
+    ("sort", StdSig { params: SEMVER_SORT_PARAMS, ret: Some("array"), doc: "Return the versions sorted ascending by SemVer precedence." }),
+    ("satisfies", StdSig { params: SEMVER_SATISFIES_PARAMS, ret: Some("[bool, err]"), doc: "Return whether the version satisfies the node-semver-subset range." }),
+    ("maxSatisfying", StdSig { params: SEMVER_MAX_SATISFYING_PARAMS, ret: Some("[string, err]"), doc: "Return the highest version in the list that satisfies the range (or nil)." }),
+    ("minSatisfying", StdSig { params: SEMVER_MAX_SATISFYING_PARAMS, ret: Some("[string, err]"), doc: "Return the lowest version in the list that satisfies the range (or nil)." }),
+];
+
+static SEMVER_MEMBERS: &[(&str, MemberKind)] = &[
+    ("parse", MemberKind::Fn),
+    ("valid", MemberKind::Fn),
+    ("compare", MemberKind::Fn),
+    ("sort", MemberKind::Fn),
+    ("satisfies", MemberKind::Fn),
+    ("maxSatisfying", MemberKind::Fn),
+    ("minSatisfying", MemberKind::Fn),
+];
+
 static TIME_MEMBERS: &[(&str, MemberKind)] = &[
     ("now", MemberKind::Fn),
     ("monotonic", MemberKind::Fn),
@@ -3111,6 +3149,7 @@ static ALL_MODULES: &[(&str, &[(&str, MemberKind)])] = &[
     ("std/redis", REDIS_MEMBERS),
     ("std/docker", DOCKER_MEMBERS),
     ("std/cron", CRON_MEMBERS),
+    ("std/semver", SEMVER_MEMBERS),
     // batch 3 — ai + assert + bench + cli + color + schema + shared + lru + events + template +
     //           caps + task + time + sync + stream + date + intl + log + workflow + telemetry +
     //           tui + ffi + resilience
@@ -3194,6 +3233,7 @@ pub fn std_sig(module: &str, name: &str) -> Option<&'static StdSig> {
         "std/redis" => REDIS_SIGS,
         "std/docker" => DOCKER_SIGS,
         "std/cron" => CRON_SIGS,
+        "std/semver" => SEMVER_SIGS,
         // batch 3
         "std/ai" => AI_SIGS,
         "std/assert" => ASSERT_SIGS,
@@ -3376,6 +3416,7 @@ mod tests {
             ("std/redis", REDIS_SIGS),
             ("std/docker", DOCKER_SIGS),
             ("std/cron", CRON_SIGS),
+            ("std/semver", SEMVER_SIGS),
             // batch 3
             ("std/ai", AI_SIGS),
             ("std/assert", ASSERT_SIGS),
