@@ -28,6 +28,9 @@ const NAV = [
     ['language/workers', 'Workers & parallelism'],
     ['language/bundles', 'Self-contained bundles'],
   ]},
+  { title: 'Specification', items: [
+    ['spec/intro', 'Notation & conformance'],
+  ]},
   { title: 'Standard library', items: [
     ['stdlib/overview', 'Overview'],
     ['stdlib/collections', 'Core & collections'],
