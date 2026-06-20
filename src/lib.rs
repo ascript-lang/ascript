@@ -301,7 +301,17 @@ pub async fn run_tests_with_packages(
     packages: Option<crate::interp::PackageMap>,
     caps: Option<crate::stdlib::caps::CapSet>,
 ) -> Result<TestSummary, AsError> {
-    run_tests_with_options(files, packages, caps, None, false, None, ELIDE_DEFAULT_ON).await
+    run_tests_with_options(
+        files,
+        packages,
+        caps,
+        None,
+        false,
+        None,
+        ELIDE_DEFAULT_ON,
+        None,
+    )
+    .await
 }
 
 /// DX D2 Task 5 — the test runner with the `--parallel[=N]` option.
@@ -315,6 +325,7 @@ pub async fn run_tests_with_packages(
 ///     byte-identical regardless of which isolate finishes first (the §7 contract). A
 ///     single file (or `n <= 1`) degrades to the serial path — one isolate sequential is
 ///     the serial path with extra overhead, so we reuse the serial path directly.
+#[allow(clippy::too_many_arguments)]
 pub async fn run_tests_with_options(
     files: &[String],
     packages: Option<crate::interp::PackageMap>,
@@ -323,6 +334,9 @@ pub async fn run_tests_with_options(
     update_snapshots: bool,
     filter: Option<&str>,
     elide: bool,
+    // BATT C1 (§10.1): the deterministic config from `--seed`/`--frozen-time`. `None` =
+    // INERT (byte-identical default). Threaded into serial/parallel/coverage runners.
+    det: Option<crate::det::DetTestConfig>,
 ) -> Result<TestSummary, AsError> {
     // Parallelize only when asked for >1 isolate AND there is more than one file. A
     // single file in one isolate is the serial path with extra cost — degrade to serial
@@ -343,9 +357,9 @@ pub async fn run_tests_with_options(
             // ISOLATE; worker slices NEVER elide (full checks in the isolate), so the
             // `elide` decision is intentionally NOT propagated across the airlock here.
             let _ = elide;
-            run_tests_parallel(files, packages, caps, n, update_snapshots, filter).await
+            run_tests_parallel(files, packages, caps, n, update_snapshots, filter, det).await
         }
-        _ => run_tests_serial(files, packages, caps, update_snapshots, filter, elide).await,
+        _ => run_tests_serial(files, packages, caps, update_snapshots, filter, elide, det).await,
     }
 }
 
@@ -372,6 +386,7 @@ pub async fn run_tests_with_coverage(
     caps: Option<crate::stdlib::caps::CapSet>,
     filter: Option<&str>,
     format: crate::vm::coverage_report::CoverageFormat,
+    det: Option<crate::det::DetTestConfig>,
 ) -> Result<(TestSummary, String), AsError> {
     use crate::vm::instrument::CoverageTable;
 
@@ -389,7 +404,7 @@ pub async fn run_tests_with_coverage(
     for file in files {
         let path = std::path::Path::new(file);
         let (file_summary, table, src_pair) =
-            run_one_file_with_coverage(path, packages.clone(), caps.clone(), filter).await?;
+            run_one_file_with_coverage(path, packages.clone(), caps.clone(), filter, det).await?;
         // Stable input-file-order aggregation (mirrors the serial path's determinism).
         summary.passed += file_summary.passed;
         summary.failed += file_summary.failed;
@@ -415,6 +430,7 @@ async fn run_one_file_with_coverage(
     packages: Option<crate::interp::PackageMap>,
     caps: Option<crate::stdlib::caps::CapSet>,
     filter: Option<&crate::test_filter::TestFilter>,
+    det: Option<crate::det::DetTestConfig>,
 ) -> Result<
     (
         TestSummary,
@@ -500,7 +516,7 @@ async fn run_one_file_with_coverage(
                 }
             }
             // Run the registered tests (each re-enters the same armed VM).
-            match interp.run_registered_tests_filtered(filter).await {
+            match interp.run_registered_tests_det(filter, det).await {
                 Ok(s) => {
                     file_summary = s;
                     Ok(())
@@ -548,6 +564,7 @@ fn render_coverage(
 }
 
 /// The serial test path: every file loaded into one `Interp`, all tests run together.
+#[allow(clippy::too_many_arguments)]
 async fn run_tests_serial(
     files: &[String],
     packages: Option<crate::interp::PackageMap>,
@@ -555,6 +572,7 @@ async fn run_tests_serial(
     update_snapshots: bool,
     filter: Option<&str>,
     elide: bool,
+    det: Option<crate::det::DetTestConfig>,
 ) -> Result<TestSummary, AsError> {
     // Parse the (CLI-validated) raw filter once for this serial run. A re-parse of an
     // already-validated filter cannot realistically fail, but a defensive `?` keeps the
@@ -593,7 +611,7 @@ async fn run_tests_serial(
                     }
                 }
             }
-            match interp.run_registered_tests_filtered(filter).await {
+            match interp.run_registered_tests_det(filter, det).await {
                 Ok(summary) => Ok(summary),
                 // exit() inside a test is likewise a hard error: surface a clear
                 // failure (non-zero exit) instead of an empty success summary.
@@ -664,6 +682,7 @@ fn report_orphan_snapshots(interp: &Interp, update_snapshots: bool) {
 /// A file that fails to load / `exit()`s / dies in its isolate becomes a synthetic FAILED
 /// entry (`"<file>": <reason>`) so the OTHER files' results are never lost, and the run
 /// still reports a non-zero exit. No reachable path panics or unwraps.
+#[allow(clippy::too_many_arguments)]
 async fn run_tests_parallel(
     files: &[String],
     packages: Option<crate::interp::PackageMap>,
@@ -671,6 +690,7 @@ async fn run_tests_parallel(
     n: usize,
     update_snapshots: bool,
     filter: Option<&str>,
+    det: Option<crate::det::DetTestConfig>,
 ) -> Result<TestSummary, AsError> {
     use std::sync::Arc;
     // Cap the in-flight isolate count: the requested `n`, bounded by the same
@@ -712,6 +732,7 @@ async fn run_tests_parallel(
                         caps,
                         update_snapshots,
                         filter,
+                        det,
                     )
                     .await
                 }));

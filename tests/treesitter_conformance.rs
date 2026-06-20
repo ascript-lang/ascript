@@ -79,6 +79,31 @@ fn treesitter_parses_match_guard_ending_in_ident() {
 }
 
 #[test]
+fn treesitter_parses_template_escapes_with_interpolation() {
+    // A backslash escape (`\n`, `\t`, `\\`, `\``, `\$`) inside a template literal —
+    // especially ADJACENT to a `${…}` interpolation — must parse without error
+    // nodes. `template_chars` stops at `\`, so the grammar needs a `template_escape`
+    // rule; its absence produced ERROR nodes in `examples/blob_basics.as`
+    // (`${method}\n${path}` etc.) while the legacy + CST front-ends accepted them.
+    let lang = language();
+    let mut parser = tree_sitter::Parser::new();
+    parser.set_language(&lang).expect("set_language");
+    for src in [
+        r#"let s = `${a}\n${b}`"#,
+        r#"let s = `AWS4-HMAC-SHA256\n${amzDate}\n${scope}`"#,
+        r#"let s = `${name}:${value}\n`"#,
+        r#"let s = `tab\there and a backtick \` and dollar \$`"#,
+        r#"let s = `plain \n no interpolation`"#,
+    ] {
+        let tree = parser.parse(src.as_bytes(), None).expect("parse");
+        assert!(
+            !tree.root_node().has_error(),
+            "tree-sitter error on template-escape snippet: {src}"
+        );
+    }
+}
+
+#[test]
 fn treesitter_parses_inclusive_and_step_ranges() {
     // `..=` (inclusive) and a trailing contextual `step <expr>` must parse in
     // for-range, value, and match-pattern position — and `step` must stay an

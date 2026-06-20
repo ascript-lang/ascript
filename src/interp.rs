@@ -1804,28 +1804,46 @@ impl Interp {
             .replace(crate::det::DeterminismContext::record(seed, start_ms))
     }
 
+    /// BATT C1 (§10.2) — the CORE determinism install seam: swap the determinism cell to
+    /// `ctx` (Record/Replay, or `None` to clear), returning the PREVIOUS context. This is
+    /// the single primitive all callers route through — the test runner (`--seed`/
+    /// `--frozen-time`) and the `workflow`-named wrappers below. It must compile under
+    /// `--no-default-features` (`DeterminismContext` is core), hence NOT feature-gated.
+    ///
+    /// Caller invariant: never hold the returned context (or the cell borrow) across an
+    /// `.await` — set, run, set-back (the swap-out pattern, as the test runner does).
+    pub(crate) fn set_determinism(
+        &self,
+        ctx: Option<crate::det::DeterminismContext>,
+    ) -> Option<crate::det::DeterminismContext> {
+        std::mem::replace(&mut *self.determinism.borrow_mut(), ctx)
+    }
+
     /// Install an explicit determinism context (Record or Replay), returning the
     /// previous one. Used by `workflow.resume` to prime a Replay context with the
-    /// recorded event stream.
+    /// recorded event stream. A thin wrapper over the core [`Self::set_determinism`]
+    /// (replace = swap-in `Some(ctx)`, return previous — identical semantics).
     #[cfg(feature = "workflow")]
     pub(crate) fn install_determinism(
         &self,
         ctx: crate::det::DeterminismContext,
     ) -> Option<crate::det::DeterminismContext> {
-        self.determinism.borrow_mut().replace(ctx)
+        self.set_determinism(Some(ctx))
     }
 
     /// Remove and return the current determinism context (end of a workflow), so the
-    /// caller can read the recorded `events` to persist + restore the previous one.
+    /// caller can read the recorded `events` to persist + restore the previous one. A
+    /// thin wrapper over [`Self::set_determinism`] (take = swap-in `None`, return previous).
     #[cfg(feature = "workflow")]
     pub(crate) fn take_determinism(&self) -> Option<crate::det::DeterminismContext> {
-        self.determinism.borrow_mut().take()
+        self.set_determinism(None)
     }
 
-    /// Restore a previously-saved determinism context (or clear it when `None`).
+    /// Restore a previously-saved determinism context (or clear it when `None`). A thin
+    /// wrapper over [`Self::set_determinism`] (set the cell to `prev`, discard the return).
     #[cfg(feature = "workflow")]
     pub(crate) fn restore_determinism(&self, prev: Option<crate::det::DeterminismContext>) {
-        *self.determinism.borrow_mut() = prev;
+        self.set_determinism(prev);
     }
 
     /// True iff deterministic mode is active. A cheap `is_some` check on the seam
@@ -1917,6 +1935,32 @@ impl Interp {
     #[cfg(feature = "ffi")] // only the FFI seam consults these
     pub(crate) fn determinism_mode(&self) -> Option<crate::det::Mode> {
         self.determinism.borrow().as_ref().map(|ctx| ctx.mode)
+    }
+
+    /// BATT C3 (§10.4): the RNG seed of the active determinism context (the CLI
+    /// `--seed`), or `None` when no det context is installed. Used by the `prop()`
+    /// runner's seed-precedence ladder (`opts.seed > CLI seed > random`). The borrow
+    /// is read-and-drop (never held across an `.await`).
+    /// BATT C3 — register a `(name, func)` into the shared test table. `func` is a
+    /// plain `test()` closure OR a `{__prop}` registration Object (the runner branches
+    /// on `is_prop`). One chokepoint so `test_mod::call_test`'s `prop` arm need not
+    /// touch the private `tests` field.
+    pub(crate) fn register_test(&self, name: String, func: Value) {
+        self.tests.borrow_mut().push((name, func));
+    }
+
+    pub(crate) fn determinism_borrow_seed(&self) -> Option<u64> {
+        self.determinism.borrow().as_ref().map(|ctx| ctx.seed)
+    }
+
+    /// BATT C3 (§10.3): the frozen virtual-clock wall time (ms-epoch) of the active
+    /// determinism context, for the `frozen-time: T` suffix in a `prop()` failure
+    /// report. `None` when no det context is installed.
+    pub(crate) fn determinism_borrow_frozen_ms(&self) -> Option<f64> {
+        self.determinism
+            .borrow()
+            .as_ref()
+            .map(|ctx| ctx.clock.now_ms())
     }
 
     /// FFI Task 10 (§7A): in Record mode, append an `FfiCall` event (the marshalled
@@ -3313,6 +3357,21 @@ impl Interp {
         &self,
         filter: Option<&crate::test_filter::TestFilter>,
     ) -> Result<TestSummary, Control> {
+        self.run_registered_tests_det(filter, None).await
+    }
+
+    /// BATT C1 (§10.2) — run the registered tests with an optional deterministic config.
+    /// When `det` is `Some`, a FRESH `DeterminismContext::record(seed, start_ms)` is
+    /// installed at the top of EACH test iteration (so every test gets an INDEPENDENT,
+    /// identical RNG/clock stream — order- and `--filter`-invariant per §10.2) and is
+    /// cleared after the body on BOTH the ok and error paths. When `det` is `None` the
+    /// loop is byte-identical to the pre-C1 path (the determinism cell is never touched —
+    /// the INERT default).
+    pub async fn run_registered_tests_det(
+        &self,
+        filter: Option<&crate::test_filter::TestFilter>,
+        det: Option<crate::det::DetTestConfig>,
+    ) -> Result<TestSummary, Control> {
         let mut summary = TestSummary::default();
         // Clone out the registrations first so the table borrow is not held across
         // each `call_value` await.
@@ -3325,7 +3384,33 @@ impl Interp {
                     continue;
                 }
             }
-            match self.call_value(func, Vec::new(), Span::new(0, 0)).await {
+            // Install a FRESH per-test determinism context (if requested), saving the
+            // previous one. The borrow is NOT held across the await — `set_determinism`
+            // swaps the cell and returns, so the await below holds no `RefCell` borrow.
+            let prev = det.map(|cfg| {
+                self.set_determinism(Some(crate::det::DeterminismContext::record(
+                    cfg.seed,
+                    cfg.start_ms,
+                )))
+            });
+            // BATT C3 (§10.3): a `prop()` registration is a `{__prop}`-tagged Object,
+            // not a callable — drive the property runner (draw + shrink + report)
+            // instead of the plain `call_value` path. The per-test det context is
+            // already installed above (so a seeded prop reads the CLI seed and a
+            // frozen-time prop sees the frozen clock). The unchanged `call_value` path
+            // handles every plain `test()` closure.
+            let outcome = if crate::stdlib::test_mod::is_prop(&func) {
+                self.run_property(&func, Span::new(0, 0)).await
+            } else {
+                self.call_value(func, Vec::new(), Span::new(0, 0)).await
+            };
+            // Clear the per-test context on EVERY exit path (before recording the result
+            // or propagating exit) so the runner's own bookkeeping is never deterministic
+            // and the next test starts from a clean cell.
+            if let Some(prev) = prev {
+                self.set_determinism(prev);
+            }
+            match outcome {
                 Ok(_) | Err(Control::Propagate(_)) => summary.passed += 1,
                 Err(Control::Panic(e)) => {
                     summary.failed += 1;

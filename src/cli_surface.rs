@@ -327,6 +327,21 @@ pub enum Command {
             default_missing_value = "text"
         )]
         coverage: Option<String>,
+        /// BATT C1 (§10.1): run tests DETERMINISTICALLY with a fixed RNG seed. Each test
+        /// body gets a fresh, identical `math.random`/`uuid.v4`/`crypto.randomBytes`
+        /// stream. Independently usable with `--frozen-time`. When omitted, RNG is the
+        /// normal thread-local stream (the inert default). `--seed` alone also freezes
+        /// time at the seed-derived deterministic epoch.
+        #[arg(long = "seed", value_name = "U64")]
+        seed: Option<u64>,
+        /// BATT C1 (§10.1): freeze the virtual clock for test bodies (`time.now`/
+        /// `time.monotonic`/`date.now`; `time.sleep` returns instantly). Accepts an
+        /// RFC3339 timestamp (e.g. `2026-01-02T03:04:05Z`, requires the `datetime`
+        /// feature) OR a raw epoch-ms integer (accepted in every build). `--frozen-time`
+        /// alone implies seed 0. Only TEST BODIES are frozen — module top-level load runs
+        /// on the real clock (§10.2).
+        #[arg(long = "frozen-time", value_name = "RFC3339|EPOCH_MS")]
+        frozen_time: Option<String>,
     },
     /// Run the language server (LSP over stdio)
     #[cfg(feature = "lsp")]

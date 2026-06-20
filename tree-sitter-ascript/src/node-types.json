@@ -6068,6 +6068,10 @@
           "named": true
         },
         {
+          "type": "template_escape",
+          "named": true
+        },
+        {
           "type": "template_substitution",
           "named": true
         }
@@ -7783,6 +7787,10 @@
   },
   {
     "type": "template_chars",
+    "named": true
+  },
+  {
+    "type": "template_escape",
     "named": true
   },
   {

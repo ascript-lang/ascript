@@ -1,0 +1,9 @@
+# exit: none
+smallInt: int
+coin: bool
+intList: arrayOf
+user: objectWith
+smallInt bounds: 0..100
+3 + 4 == 4 + 3: true
+reverse(reverse([1,2,3])) == [1,2,3]: true
+property tour complete

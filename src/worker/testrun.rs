@@ -65,6 +65,9 @@ pub async fn run_test_file_in_isolate(
     caps: Option<CapSet>,
     update_snapshots: bool,
     filter: Option<String>,
+    // BATT C1 (§10.2): the deterministic config crosses the airlock as plain `Copy` scalars
+    // (no new sendable kind) so each isolate installs the SAME per-test context.
+    det: Option<crate::det::DetTestConfig>,
 ) -> FileRunResult {
     let path_str = path.to_string_lossy().into_owned();
 
@@ -99,7 +102,7 @@ pub async fn run_test_file_in_isolate(
             return;
         }
 
-        let result = run_one_file(&interp, &path_iso, filter_iso.as_deref()).await;
+        let result = run_one_file(&interp, &path_iso, filter_iso.as_deref(), det).await;
         let _ = reply_tx.send(result);
         // Loop ends when `rx` closes (handle dropped after the reply).
     });
@@ -120,7 +123,7 @@ pub async fn run_test_file_in_isolate(
             }
             interp.set_snapshot_update(update_snapshots);
             interp.install_self();
-            return match run_one_file(&interp, &path_str, filter.as_deref()).await {
+            return match run_one_file(&interp, &path_str, filter.as_deref(), det).await {
                 Ok(bytes) => decode_summary(&bytes, &path_str),
                 Err(reason) => Err(reason),
             };
@@ -189,6 +192,7 @@ async fn run_one_file(
     interp: &crate::interp::Interp,
     path: &str,
     filter: Option<&str>,
+    det: Option<crate::det::DetTestConfig>,
 ) -> Result<Vec<u8>, String> {
     // The hosting thread is a worker isolate (its `IN_ISOLATE` flag is TRUE), but the test
     // FILE must behave like a normal top-level program: a `worker fn` it dispatches should
@@ -196,13 +200,14 @@ async fn run_one_file(
     // path (which assumes the entry is already a VM global from an enclosing slice). So we
     // force the flag FALSE for the file run; the file's own workers then spawn their own
     // (per-thread) pool isolates — correct shared-nothing semantics, no deadlock.
-    isolate::with_isolate_flag(false, || run_one_file_inner(interp, path, filter)).await
+    isolate::with_isolate_flag(false, || run_one_file_inner(interp, path, filter, det)).await
 }
 
 async fn run_one_file_inner(
     interp: &crate::interp::Interp,
     path: &str,
     filter: Option<&str>,
+    det: Option<crate::det::DetTestConfig>,
 ) -> Result<Vec<u8>, String> {
     match interp.load_module(Path::new(path)).await {
         Ok(_) | Err(Control::Propagate(_)) => {}
@@ -215,7 +220,7 @@ async fn run_one_file_inner(
     // it identically to the serial path. A re-parse cannot realistically fail on an
     // already-validated filter; treat any failure as "no filter" rather than panic.
     let filter = filter.and_then(|raw| crate::test_filter::TestFilter::parse(raw).ok());
-    let summary = match interp.run_registered_tests_filtered(filter.as_ref()).await {
+    let summary = match interp.run_registered_tests_det(filter.as_ref(), det).await {
         Ok(summary) => summary,
         Err(Control::Exit(_)) => {
             return Err("exit() called during test run".to_string());

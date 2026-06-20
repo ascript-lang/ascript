@@ -23,6 +23,7 @@ pub const STD_MODULE_FEATURES: &[(&str, Option<&str>)] = &[
     // ── Core / unconditional (always built under --no-default-features) ──────
     ("std/ai",          Some("ai")),
     ("std/assert",      None),
+    ("std/test",        None),
     ("std/bench",       None),
     ("std/cli",         None),
     ("std/color",       None),

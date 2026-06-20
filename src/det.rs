@@ -38,6 +38,39 @@ pub fn deterministic_start_ms(seed: u64) -> f64 {
     BASE_MS + (seed % 1_000_000) as f64
 }
 
+/// BATT C1 (§10.1) — the deterministic test configuration carried by `ascript test
+/// --seed/--frozen-time` from the CLI into the test runner. Two plain `Send` scalars so it
+/// rides the parallel airlock as ordinary fields (no new sendable `Value` kind). When
+/// present, the runner installs a FRESH `DeterminismContext::record(seed, start_ms)` at the
+/// top of EACH test iteration; when absent (`None`), the path is byte-identical to today's
+/// inert default.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct DetTestConfig {
+    /// The RNG seed (also the workflow/clock seed). `--frozen-time` alone defaults this to 0.
+    pub seed: u64,
+    /// The frozen virtual-clock start, ms-epoch. `--seed` alone defaults this to
+    /// `deterministic_start_ms(seed)`.
+    pub start_ms: f64,
+}
+
+impl DetTestConfig {
+    /// Build the per-test config from the (already-parsed) optional CLI inputs, applying
+    /// the §10.1 defaults: `--frozen-time` alone → seed 0; `--seed` alone → frozen at
+    /// `deterministic_start_ms(seed)`; neither → `None` (the inert default — nothing
+    /// changes). Both present → exactly those values.
+    pub fn from_cli(seed: Option<u64>, frozen_ms: Option<f64>) -> Option<DetTestConfig> {
+        match (seed, frozen_ms) {
+            (None, None) => None,
+            (Some(seed), Some(start_ms)) => Some(DetTestConfig { seed, start_ms }),
+            (Some(seed), None) => Some(DetTestConfig {
+                seed,
+                start_ms: deterministic_start_ms(seed),
+            }),
+            (None, Some(start_ms)) => Some(DetTestConfig { seed: 0, start_ms }),
+        }
+    }
+}
+
 /// Whether the context is recording effects (first run) or replaying them from a
 /// previously-recorded stream (resume after a crash).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

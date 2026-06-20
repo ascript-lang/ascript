@@ -1,0 +1,6 @@
+# exit: none
+base64 roundtrip "hello world": true
+base64 roundtrip "" (empty): true
+json roundtrip {a,b,c}: true
+json roundtrip nested: true
+roundtrip laws complete

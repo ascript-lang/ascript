@@ -44,6 +44,43 @@ use clap::Parser;
 ///
 /// Returns `Ok(None)` when nothing is denied (all granted → the byte-identical
 /// default). A bad cap name / deny-mode (CLI or manifest) is a clean `Err`.
+/// BATT C1 (§10.1) — parse the `--frozen-time` value into an epoch-ms `f64`. An EPOCH-MS
+/// integer is accepted in EVERY build (tried first). An RFC3339 timestamp (e.g.
+/// `2026-01-02T03:04:05Z`) is accepted ONLY when the `datetime` feature is on (chrono); a
+/// non-numeric value in a build WITHOUT `datetime` is a clean error naming the limitation.
+/// All failures return a human-readable `Err(String)` — never a panic.
+fn parse_frozen_time(raw: &str) -> Result<f64, String> {
+    let raw = raw.trim();
+    // Epoch-ms first (works in both feature configs). Accept an integer or a plain decimal
+    // ms value; reject non-finite (NaN/inf would poison the virtual clock).
+    if let Ok(ms) = raw.parse::<f64>() {
+        if ms.is_finite() {
+            return Ok(ms);
+        }
+        return Err(format!(
+            "invalid --frozen-time '{raw}': a non-finite epoch-ms value is not allowed"
+        ));
+    }
+    // RFC3339 — only with the `datetime` feature (chrono).
+    #[cfg(feature = "datetime")]
+    {
+        match chrono::DateTime::parse_from_rfc3339(raw) {
+            Ok(dt) => Ok(dt.timestamp_millis() as f64),
+            Err(_) => Err(format!(
+                "invalid --frozen-time '{raw}': expected an RFC3339 timestamp \
+                 (e.g. 2026-01-02T03:04:05Z) or an epoch-ms integer"
+            )),
+        }
+    }
+    #[cfg(not(feature = "datetime"))]
+    {
+        Err(format!(
+            "invalid --frozen-time '{raw}': this build has no RFC3339 support \
+             (the 'datetime' feature is disabled) — pass an epoch-ms integer instead"
+        ))
+    }
+}
+
 #[cfg(not(ascript_rt))]
 fn compose_caps(
     _path: &std::path::Path,
@@ -822,6 +859,8 @@ async fn real_main() -> ExitCode {
             filter,
             watch,
             coverage,
+            seed,
+            frozen_time,
         } => {
             // ELIDE §4.6/§5: resolve the elision decision for the (serial) test path.
             // The PARALLEL path runs each file in a worker isolate, which never elides.
@@ -852,6 +891,48 @@ async fn real_main() -> ExitCode {
                 None => None,
             };
             let filter_raw: Option<&str> = filter.as_deref();
+            // BATT C1 (§10.1): parse `--frozen-time` to an epoch-ms float (clean CLI error
+            // on malformed input — never a panic), then fold it with `--seed` into the
+            // optional `DetTestConfig`. Absent both → `None` (the INERT default).
+            let frozen_ms = match &frozen_time {
+                Some(raw) => match parse_frozen_time(raw) {
+                    Ok(ms) => Some(ms),
+                    Err(e) => {
+                        eprintln!("error: {e}");
+                        return ExitCode::from(1);
+                    }
+                },
+                None => None,
+            };
+            let det = ascript::det::DetTestConfig::from_cli(seed, frozen_ms);
+            // BATT C3 (§10.3): the failure-line suffix `(seed: N[, frozen-time: T])`,
+            // appended to EVERY `FAIL` line when a det context was active (`--seed` and/or
+            // `--frozen-time`). INERT when neither flag was passed (`det == None`) — the
+            // suffix is empty, so a non-seeded plain-test run is byte-identical to pre-C3.
+            // `frozen-time` is shown ONLY when `--frozen-time` was explicitly given (a
+            // bare `--seed` derives a start_ms that is not a user-frozen clock).
+            let det_fail_suffix: String = match det {
+                Some(cfg) => {
+                    let mut suf = format!(" (seed: {}", cfg.seed);
+                    if frozen_ms.is_some() {
+                        suf.push_str(&format!(", frozen-time: {}", cfg.start_ms));
+                    }
+                    suf.push(')');
+                    suf
+                }
+                None => String::new(),
+            };
+            // A `prop()` failure message is a multi-line, self-describing report that
+            // already prints its own `seed:`/`replay:` lines — appending the plain-test
+            // det suffix to it would duplicate that. So the suffix applies ONLY to
+            // single-line (plain `test()`) failure messages (BATT C3 review nit).
+            let suffix_for = |message: &str| -> &str {
+                if message.contains('\n') {
+                    ""
+                } else {
+                    det_fail_suffix.as_str()
+                }
+            };
             // DX D2: `--parallel` (no value) → `num_cpus` isolates; `--parallel=N` → N;
             // absent → `None` (serial). The `default_missing_value = "0"` sentinel maps
             // the bare flag to "auto" (num_cpus); the runner clamps to `$ASCRIPT_WORKERS`.
@@ -928,12 +1009,12 @@ async fn real_main() -> ExitCode {
             // byte-identical to a non-coverage run (the trap re-dispatches the same op).
             if let Some(fmt) = coverage_fmt {
                 let cov_result =
-                    ascript::run_tests_with_coverage(&files, packages, caps, filter_raw, fmt)
+                    ascript::run_tests_with_coverage(&files, packages, caps, filter_raw, fmt, det)
                         .await;
                 return match cov_result {
                     Ok((summary, report)) => {
                         for (name, message) in &summary.failures {
-                            println!("FAIL {}: {}", name, message);
+                            println!("FAIL {}: {}{}", name, message, suffix_for(message));
                         }
                         summary.print_tally();
                         // The report goes to stdout (text/lcov) or is written to
@@ -961,12 +1042,13 @@ async fn real_main() -> ExitCode {
                 update_snapshots,
                 filter_raw,
                 elide,
+                det,
             )
             .await;
             match test_result {
             Ok(summary) => {
                 for (name, message) in &summary.failures {
-                    println!("FAIL {}: {}", name, message);
+                    println!("FAIL {}: {}{}", name, message, suffix_for(message));
                 }
                 summary.print_tally();
                 if summary.failed > 0 {

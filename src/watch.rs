@@ -230,6 +230,9 @@ pub async fn run_watch(
             false,
             filter,
             elide,
+            // BATT C1: `--watch` runs on the real clock (deterministic test runs are a
+            // one-shot `ascript test --seed/--frozen-time` surface, not a watch concern).
+            None,
         )
         .await,
     );
@@ -295,6 +298,7 @@ pub async fn run_watch(
                 false,
                 filter,
                 elide,
+                None,
             )
             .await,
         );
