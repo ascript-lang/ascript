@@ -922,6 +922,17 @@ async fn real_main() -> ExitCode {
                 }
                 None => String::new(),
             };
+            // A `prop()` failure message is a multi-line, self-describing report that
+            // already prints its own `seed:`/`replay:` lines — appending the plain-test
+            // det suffix to it would duplicate that. So the suffix applies ONLY to
+            // single-line (plain `test()`) failure messages (BATT C3 review nit).
+            let suffix_for = |message: &str| -> &str {
+                if message.contains('\n') {
+                    ""
+                } else {
+                    det_fail_suffix.as_str()
+                }
+            };
             // DX D2: `--parallel` (no value) → `num_cpus` isolates; `--parallel=N` → N;
             // absent → `None` (serial). The `default_missing_value = "0"` sentinel maps
             // the bare flag to "auto" (num_cpus); the runner clamps to `$ASCRIPT_WORKERS`.
@@ -1003,7 +1014,7 @@ async fn real_main() -> ExitCode {
                 return match cov_result {
                     Ok((summary, report)) => {
                         for (name, message) in &summary.failures {
-                            println!("FAIL {}: {}{}", name, message, det_fail_suffix);
+                            println!("FAIL {}: {}{}", name, message, suffix_for(message));
                         }
                         summary.print_tally();
                         // The report goes to stdout (text/lcov) or is written to
@@ -1037,7 +1048,7 @@ async fn real_main() -> ExitCode {
             match test_result {
             Ok(summary) => {
                 for (name, message) in &summary.failures {
-                    println!("FAIL {}: {}{}", name, message, det_fail_suffix);
+                    println!("FAIL {}: {}{}", name, message, suffix_for(message));
                 }
                 summary.print_tally();
                 if summary.failed > 0 {
