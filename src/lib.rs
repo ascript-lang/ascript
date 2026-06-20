@@ -37,6 +37,12 @@ pub mod doc;
 // the runtime-only build (it consumes `crate::ast` + the checker's `ElisionSet`).
 #[cfg(not(ascript_rt))]
 pub mod elide_mark;
+/// EMBED — the stable host-embedding facade (`ascript::embed`). A `!Send` `Isolate`
+/// (builder-constructed, default deny-all caps) that evals source, calls script
+/// functions, reads/sets globals, loads `.aso` archives, and hosts `host:` modules.
+/// Default-on `embed` feature; the only semver-contracted Rust surface (see §9).
+#[cfg(feature = "embed")]
+pub mod embed;
 pub mod env;
 pub mod error;
 #[cfg(not(ascript_rt))]

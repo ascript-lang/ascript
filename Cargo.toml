@@ -217,7 +217,16 @@ indexmap = "2"
 ascript = { path = ".", features = ["fuzzgen"] }
 
 [features]
-default = ["data", "datetime", "intl", "sys", "crypto", "compress", "sql", "net", "tui", "lsp", "dap", "doc", "log", "sysinfo", "binary", "postgres", "redis", "workflow", "pkg", "telemetry", "ai", "ffi", "shared", "profile", "bundle-zstd", "rt-fetch", "resilience", "docker", "tls", "auth", "archive", "xml", "email", "blob", "cron", "semver", "markdown", "diff"]
+default = ["data", "datetime", "intl", "sys", "crypto", "compress", "sql", "net", "tui", "lsp", "dap", "doc", "log", "sysinfo", "binary", "postgres", "redis", "workflow", "pkg", "telemetry", "ai", "ffi", "shared", "profile", "bundle-zstd", "rt-fetch", "resilience", "docker", "tls", "auth", "archive", "xml", "email", "blob", "cron", "semver", "markdown", "diff", "embed"]
+# EMBED — the host-embedding facade (`ascript::embed`): a `!Send` `Isolate`
+# (builder-constructed, caps default deny-all) with blocking eval/call/load_archive +
+# `!Send` async variants, an `AsValue` bridge, and `host:` modules. Pure library code
+# (the CLI binary compiles identically with or without it — no `main.rs` change), no
+# new dependencies (tokio/static_assertions/serde_json are already present). Default-on
+# and additive; `--no-default-features` builds without `src/embed/`. Adds NO language
+# surface — no grammar, no opcode, no `ASO_FORMAT_VERSION` bump (pinned by
+# `tests/embed_negative_space.rs`).
+embed = []
 # RT §5.1/§5.2 — the signed-manifest verification + stub fetch half of the
 # runtime-stub distribution path. Pulls `net` (the pooled reqwest client used to fetch
 # the release manifest + stub blobs) and `ed25519-dalek` (verify the detached manifest
