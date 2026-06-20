@@ -339,28 +339,35 @@ await run((ctx, input) => {
         );
     }
 
-    /// AScript has no `fn` *expression* form: `fn`/`fn name` is statement-only on
-    /// both engines, so an inline `fn(ctx, input){…}` argument never parses as a
-    /// workflow body — it is a SYNTAX error. This pins that reality (the rule's
-    /// docstring no longer claims `fn`-expression coverage). The arrow form is the
-    /// only inline function literal, and it IS walked (see
-    /// `flags_direct_time_now_in_inline_workflow`).
+    /// LSPEC added the anonymous `fn(params){…}` EXPRESSION form (it desugars to the
+    /// same closure as a block arrow). So an inline `fn(ctx, input){…}` workflow body
+    /// now PARSES and is walked by this rule exactly like the arrow form — it is NOT a
+    /// silently un-inspected workflow. This pins that the `fn`-form body is inspected
+    /// (the `time.now()` inside fires `workflow-determinism`), the strictly-better
+    /// successor to the old "it's a syntax error" guard.
     #[test]
-    fn fn_form_workflow_body_is_a_syntax_error_not_an_unflagged_workflow() {
+    fn fn_form_workflow_body_is_walked_not_an_unflagged_workflow() {
         let src = r#"
 import { run } from "std/workflow"
-import { now } from "std/time"
+import * as time from "std/time"
 await run(fn(ctx, input) {
   let t = time.now()
   return t
 }, 0, { log: "x" })
 "#;
         let diags = analyze(src).diagnostics;
-        // The fn-expression argument does not parse, so this surfaces as a syntax
-        // error — it can never be a silently un-inspected workflow body.
+        // The fn-expression body parses (LSPEC) and the rule walks it — the
+        // non-deterministic `time.now()` is flagged, so it is never silently
+        // un-inspected. No syntax error.
         assert!(
-            diags.iter().any(|d| d.code == "syntax-error"),
-            "expected a syntax error for the fn-expression form, got {diags:?}"
+            !diags.iter().any(|d| d.code == "syntax-error"),
+            "the fn-expression workflow body must parse (anonymous fn-expressions are \
+             valid since LSPEC), got {diags:?}"
+        );
+        assert!(
+            has(src, "workflow-determinism"),
+            "time.now() inside a fn-form workflow body must be flagged (the fn-form is \
+             walked like the arrow form): {diags:?}"
         );
     }
 }
