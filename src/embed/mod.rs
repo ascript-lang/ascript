@@ -25,14 +25,19 @@
 //! ```
 
 mod error;
+mod value;
 
 pub use error::{EmbedDiagnostic, EmbedError, EmbedPanic};
+pub use value::AsValue;
 
 use std::cell::RefCell;
 use std::rc::Rc;
 
-use crate::interp::Interp;
+use crate::interp::{ambient_root_scope, Control, Interp};
 use crate::stdlib::caps::{Cap, CapSet};
+use crate::vm::chunk::{Chunk, FnProto};
+use crate::vm::fiber::Fiber;
+use crate::vm::value_ext::{Closure, RunOutcome};
 use crate::vm::Vm;
 
 /// Where a script's `print` output goes (spec §3.2).
@@ -192,7 +197,7 @@ impl IsolateBuilder {
 
         Ok(Isolate {
             vm,
-            rt,
+            rt: Some(rt),
             session_src: RefCell::new(String::new()),
             output: self.output,
         })
@@ -206,7 +211,13 @@ impl IsolateBuilder {
 /// blocking entry points drive. `!Send + !Sync` by construction (it holds `Rc<Vm>`).
 pub struct Isolate {
     vm: Rc<Vm>,
-    rt: tokio::runtime::Runtime,
+    // `Option` so `Drop` can `take()` the runtime and `shutdown_background()` it:
+    // dropping a `tokio::runtime::Runtime` directly from inside an async context
+    // panics ("cannot drop a runtime in a context where blocking is not allowed"),
+    // which would happen if a host drops an `Isolate` inside its own `#[tokio::test]`
+    // / async fn. `shutdown_background` never blocks, so it is async-context-safe.
+    // Always `Some` between `build()` and `drop`.
+    rt: Option<tokio::runtime::Runtime>,
     session_src: RefCell<String>,
     output: OutputMode,
 }
@@ -217,19 +228,104 @@ impl Isolate {
         IsolateBuilder::default()
     }
 
+    /// Compile + run `src` on this isolate's persistent `Vm`, **blocking** the calling
+    /// thread until the program (and everything it spawned) is quiescent (spec §3.3).
+    /// Returns the trailing-expression value (`nil` for a statement-terminated input).
+    ///
+    /// Lifts the REPL's `eval_line_vm` substrate. The session persists across calls:
+    /// a binding defined in an earlier `eval` is visible in a later one (the
+    /// `user_globals` table IS the session scope). A compile error returns
+    /// [`EmbedError::Compile`] with NO session mutation; a Tier-2 panic returns
+    /// [`EmbedError::Panic`] and the session survives.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EmbedError::NestedRuntime`] if called from inside an ambient tokio
+    /// runtime (where `block_on` would panic) — use [`eval_async`](Self::eval_async).
+    pub fn eval(&self, src: &str) -> Result<AsValue, EmbedError> {
+        self.guard_no_ambient_runtime()?;
+        // Compile + accumulate session source BEFORE entering the async block: a
+        // compile error must short-circuit with no session mutation (the REPL rule).
+        let fiber = self.prepare_fiber(src)?;
+        // Drive the !Send eval future on the owned current-thread runtime under a fresh
+        // LocalSet (so spawned tasks join — structured concurrency), then DRAIN the
+        // LocalSet (the REPL's two-step `run_until` + `local.await`, here via the owned
+        // runtime). `block_on` on the owned reactor lets timers/IO inside the script
+        // work. `run_until` borrows `&local`, so `local` is still owned afterward and
+        // the second `block_on(local)` joins the spawned tasks.
+        let local = tokio::task::LocalSet::new();
+        let vm = Rc::clone(&self.vm);
+        let rt = self.rt();
+        let result = rt.block_on(local.run_until(async move { local_run(&vm, fiber).await }));
+        rt.block_on(local); // drain spawned tasks (structured join)
+        map_outcome(result)
+    }
+
+    /// The async variant of [`eval`](Self::eval): a `!Send` future the **host** drives
+    /// (spec §4.2). It never touches the owned runtime — the host's ambient reactor +
+    /// `LocalSet` serve I/O and `spawn_local`. Supported host configurations: a
+    /// current-thread runtime (await under `LocalSet::run_until`), or a multi-thread
+    /// runtime driven from a non-worker thread (`LocalSet::block_on`). Awaiting from a
+    /// `tokio::spawn`ed task is a compile error by construction (the future is `!Send`).
+    pub async fn eval_async(&self, src: &str) -> Result<AsValue, EmbedError> {
+        // No ambient-runtime guard: the host IS providing the runtime here.
+        let fiber = self.prepare_fiber(src)?;
+        let outcome = local_run(&self.vm, fiber).await;
+        map_outcome(outcome)
+    }
+
+    /// Compile `src`, accumulate it onto the session source (so a `worker fn` defined
+    /// in an earlier eval stays sliceable), and build the not-started top-level fiber.
+    /// A compile error short-circuits with NO session mutation (the REPL rule).
+    fn prepare_fiber(&self, src: &str) -> Result<Fiber, EmbedError> {
+        let chunk = crate::compile::compile_source(src).map_err(|e| {
+            // A compile error carries a message + span; render it against the input.
+            let src_info = Rc::new(crate::error::SourceInfo {
+                path: "<embed>".to_string(),
+                text: src.to_string(),
+            });
+            let as_err = crate::error::AsError::at(e.message, e.span).with_source(src_info);
+            EmbedError::from_compile(&as_err)
+        })?;
+        // Accumulate session source AFTER compilation succeeds (don't accumulate
+        // syntax-invalid input) but BEFORE running (so a define-then-call-worker-fn in
+        // one eval has its source available) — the REPL `session_src` discipline.
+        {
+            let mut session = self.session_src.borrow_mut();
+            if !session.is_empty() {
+                session.push('\n');
+            }
+            session.push_str(src);
+            self.vm.interp().set_worker_source(&session);
+        }
+        Ok(make_top_fiber(chunk))
+    }
+
+    /// `EmbedError::NestedRuntime` if a tokio runtime is ambient (blocking would
+    /// panic). Cheap: a TLS read.
+    fn guard_no_ambient_runtime(&self) -> Result<(), EmbedError> {
+        if tokio::runtime::Handle::try_current().is_ok() {
+            Err(EmbedError::NestedRuntime)
+        } else {
+            Ok(())
+        }
+    }
+
     /// Drain the capture buffer (under [`OutputMode::Capture`]); an empty string under
     /// [`OutputMode::Inherit`] (where `print` already streamed to stdout).
     pub fn take_output(&self) -> String {
         match self.output {
-            OutputMode::Capture => self.vm.interp().output(),
+            // DRAIN (take + clear) so repeated calls return only NEW output.
+            OutputMode::Capture => self.vm.interp().take_output(),
             OutputMode::Inherit => String::new(),
         }
     }
 
-    /// Crate-internal accessor for the owned runtime (used by `eval`/`call` in Task 1.2).
-    #[allow(dead_code)]
-    pub(crate) fn runtime(&self) -> &tokio::runtime::Runtime {
-        &self.rt
+    /// The owned runtime (always `Some` for a live isolate; `None` only mid-`drop`).
+    fn rt(&self) -> &tokio::runtime::Runtime {
+        self.rt
+            .as_ref()
+            .expect("isolate runtime is present for a live isolate")
     }
 
     /// Crate-internal accessor for the persistent `Vm`.
@@ -249,5 +345,58 @@ impl Drop for Isolate {
     fn drop(&mut self) {
         // End-of-session cycle collection (the sweep every VM entry point performs).
         crate::gc::collect();
+        // Shut the owned runtime down WITHOUT blocking: dropping a `Runtime` directly
+        // from inside an async context (a host dropping the `Isolate` in its own
+        // `#[tokio::test]` / async fn) panics. `shutdown_background` is async-safe.
+        if let Some(rt) = self.rt.take() {
+            rt.shutdown_background();
+        }
+    }
+}
+
+/// Build the top-level `FnProto` for a compiled chunk (the exact shape
+/// `eval_line_vm` uses, `src/repl.rs:229`).
+fn make_top_proto(chunk: Chunk) -> Rc<FnProto> {
+    Rc::new(FnProto {
+        chunk,
+        arity: 0,
+        has_rest: false,
+        is_async: false,
+        is_generator: false,
+        is_worker: false,
+        owning_class: None,
+        params: Vec::new(),
+        ret: None,
+        local_names: Vec::new(),
+        debug_name: None,
+        name_span: None,
+    })
+}
+
+/// Build a not-started top-level fiber for a compiled chunk.
+fn make_top_fiber(chunk: Chunk) -> Fiber {
+    Fiber::new(Closure::new(make_top_proto(chunk)))
+}
+
+/// Run `fiber` on `vm` to quiescence under the CURRENT `LocalSet` (the caller has
+/// already entered one via `run_until`/`block_on`), draining spawned tasks. The
+/// `ambient_root_scope` wrap matches every shipped entry point (it carries the
+/// telemetry/deadline task-locals seam — `None`/inert in the embed default).
+async fn local_run(vm: &Rc<Vm>, mut fiber: Fiber) -> Result<RunOutcome, Control> {
+    ambient_root_scope(vm.run(&mut fiber)).await
+}
+
+/// Map a VM run outcome to the embed result (spec §3.3.4): the trailing-expression
+/// value on `Done`; a typed error for panic/exit; `nil` for a top-level `?`-propagate
+/// (CLI parity). The per-eval fiber is discarded either way — the session survives.
+fn map_outcome(outcome: Result<RunOutcome, Control>) -> Result<AsValue, EmbedError> {
+    match outcome {
+        Ok(RunOutcome::Done(v)) => Ok(AsValue::from_value(v)),
+        // A top-level program cannot yield (no enclosing generator). Defensive: nil.
+        Ok(RunOutcome::Yielded(_)) => Ok(AsValue::nil()),
+        Err(Control::Panic(e)) => Err(EmbedError::from_panic(&e)),
+        // A top-level `?` ends the program with no value (CLI parity, `lib.rs`).
+        Err(Control::Propagate(_)) => Ok(AsValue::nil()),
+        Err(Control::Exit(code)) => Err(EmbedError::Exit(code)),
     }
 }

@@ -2015,6 +2015,16 @@ impl Interp {
             .expect("Interp self-ref not installed")
     }
 
+    /// Drain (take + clear) all captured program output so far. Empty under `Live`
+    /// (where output already streamed to stdout). Used by the EMBED facade's
+    /// `Isolate::take_output` so repeated drains return only NEW output.
+    pub fn take_output(&self) -> String {
+        match &self.output {
+            OutputSink::Capture(buf) => std::mem::take(&mut buf.borrow_mut()),
+            OutputSink::Live => String::new(),
+        }
+    }
+
     /// Snapshot of all captured program output so far. Empty under `Live`.
     pub fn output(&self) -> String {
         match &self.output {
