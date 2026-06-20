@@ -6394,6 +6394,21 @@ impl Vm {
                                 }
                                 Rc::new(RefCell::new(m))
                             }
+                            // EMBED §6.3: a `host:<name>` module — the SAME
+                            // `load_host_module` the tree-walker reaches (via `import_host`),
+                            // materialized into the ordered export map exactly like `Std`.
+                            // A miss is the byte-identical recoverable panic.
+                            crate::interp::SpecifierKind::Host(name) => {
+                                let entry = self.interp.import_host(&name)?;
+                                let mut m = indexmap::IndexMap::new();
+                                for name in entry.exports.borrow().iter() {
+                                    m.insert(
+                                        name.clone(),
+                                        entry.env.get(name).unwrap_or(Value::nil()),
+                                    );
+                                }
+                                Rc::new(RefCell::new(m))
+                            }
                             crate::interp::SpecifierKind::Relative(_) => {
                                 self.load_file_module(&source, fault_ip, fiber).await?
                             }
@@ -9044,6 +9059,15 @@ impl Vm {
             .borrow()
             .get(name)
             .map(|s| s.value.clone())
+    }
+
+    /// EMBED hook: define (or overwrite) a module-scope user-global, defined MUTABLE
+    /// (like a top-level `let`) so a host can `set_global` repeatedly. Delegates to the
+    /// same `define_user_global` the compiler's `DEFINE_GLOBAL` uses — so the struct-gen
+    /// bump + class `def_env` sync that keep the user-global caches coherent happen
+    /// exactly as for an in-script define. Used only by `ascript::embed::Isolate`.
+    pub fn define_user_global_mutable(&self, name: &str, value: Value) {
+        self.define_user_global(Rc::from(name), value, true);
     }
 
     /// Resolve a module-scope user-global by name, returning BOTH its stable

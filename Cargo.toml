@@ -33,6 +33,14 @@ path = "src/main.rs"
 name = "ascript-rt"
 path = "src/bin/ascript-rt.rs"
 
+# EMBED Unit E — the rust-host embedding example (spec §12, Gate 9). A game-loop
+# host driving an embedded isolate (deny-all caps, host:game module, container-handle
+# state, auto-await, host-panic recovery). CI-exercised by tests/embed.rs.
+[[example]]
+name = "embed-rust-host"
+path = "examples/embed/rust-host/main.rs"
+required-features = ["embed"]
+
 [dependencies]
 rust_decimal = { version = "1", features = ["maths"] }
 # FUZZ: the unstructured-bytes source for the grammar-aware generator (`src/fuzzgen/`).
@@ -217,7 +225,16 @@ indexmap = "2"
 ascript = { path = ".", features = ["fuzzgen"] }
 
 [features]
-default = ["data", "datetime", "intl", "sys", "crypto", "compress", "sql", "net", "tui", "lsp", "dap", "doc", "log", "sysinfo", "binary", "postgres", "redis", "workflow", "pkg", "telemetry", "ai", "ffi", "shared", "profile", "bundle-zstd", "rt-fetch", "resilience", "docker", "tls", "auth", "archive", "xml", "email", "blob", "cron", "semver", "markdown", "diff"]
+default = ["data", "datetime", "intl", "sys", "crypto", "compress", "sql", "net", "tui", "lsp", "dap", "doc", "log", "sysinfo", "binary", "postgres", "redis", "workflow", "pkg", "telemetry", "ai", "ffi", "shared", "profile", "bundle-zstd", "rt-fetch", "resilience", "docker", "tls", "auth", "archive", "xml", "email", "blob", "cron", "semver", "markdown", "diff", "embed"]
+# EMBED — the host-embedding facade (`ascript::embed`): a `!Send` `Isolate`
+# (builder-constructed, caps default deny-all) with blocking eval/call/load_archive +
+# `!Send` async variants, an `AsValue` bridge, and `host:` modules. Pure library code
+# (the CLI binary compiles identically with or without it — no `main.rs` change), no
+# new dependencies (tokio/static_assertions/serde_json are already present). Default-on
+# and additive; `--no-default-features` builds without `src/embed/`. Adds NO language
+# surface — no grammar, no opcode, no `ASO_FORMAT_VERSION` bump (pinned by
+# `tests/embed_negative_space.rs`).
+embed = []
 # RT §5.1/§5.2 — the signed-manifest verification + stub fetch half of the
 # runtime-stub distribution path. Pulls `net` (the pooled reqwest client used to fetch
 # the release manifest + stub blobs) and `ed25519-dalek` (verify the detached manifest

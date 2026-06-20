@@ -38,6 +38,15 @@ pub fn check(tree: &ResolvedNode, _resolved: &ResolveResult, _src: &str) -> Vec<
         };
         let path = strip_quotes(str_tok.text());
 
+        // EMBED §6.3: a `host:` specifier is resolved-by-construction at RUNTIME
+        // registration time (the host registers the module on the isolate before the
+        // script runs) — statically unknowable here, so the checker SKIPS it. Never a
+        // false positive on an embed-targeted script. (This arm is explicit even though
+        // the `!std/` guard below would also skip it — the skip is intentional, not
+        // incidental, so it is named.)
+        if path.starts_with("host:") {
+            continue;
+        }
         // V1: only `std/*` specifiers are resolvable here. A relative/file path
         // cannot be checked without the importing file's location (path-less
         // analysis) — see the module doc — so it is left alone.
@@ -128,6 +137,18 @@ mod tests {
     #[test]
     fn nested_std_module_not_flagged() {
         let src = "import { connect } from \"std/net/tcp\"\nprint(1)\n";
+        assert!(
+            !has(src, "unresolved-import"),
+            "{:?}",
+            analyze(src).diagnostics
+        );
+    }
+
+    #[test]
+    fn host_specifier_not_flagged() {
+        // EMBED §6.3: a `host:` import is resolved-by-host at runtime — the checker
+        // skips it (never a false positive on an embed-targeted script).
+        let src = "import * as app from \"host:app\"\nprint(1)\n";
         assert!(
             !has(src, "unresolved-import"),
             "{:?}",

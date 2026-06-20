@@ -142,6 +142,15 @@ pub struct WorkerRequest {
     /// keep `WorkerRequest` compact (the `CapSet`'s `Option<FsScope>`/`Option<NetScope>`
     /// carry heap `Vec`s; `dispatch` returns the request by value in its `Err` path).
     pub caps: Box<crate::stdlib::caps::CapSet>,
+    /// EMBED §6.4 — the dispatching (main) isolate's host-module FACTORIES, carried
+    /// EXACTLY the way `caps` rides: a plain `Send` side-channel field (the `Arc`
+    /// factories are `Send + Sync`; the name is `String` — `Send`, not the `!Send`
+    /// `Rc<str>`), NOT serialized, NO wire tag. The pooled isolate installs these FRESH
+    /// at the top of EACH request (so request B is unaffected by request A — the no-leak
+    /// / caps-floor discipline). Empty for an ordinary program (no embed factories) →
+    /// today's exact path. The factory RUNS on the isolate thread, building the `!Send`
+    /// `HostModuleDef` in-isolate (its host fns never cross the airlock).
+    pub host_factories: Vec<(String, std::sync::Arc<crate::interp::HostModuleFactoryCore>)>,
     /// Where the isolate sends the reply (result bytes or a panic message).
     pub reply: oneshot::Sender<WorkerReply>,
     /// Cancel signal: the caller drops the paired sender on `Value::future` drop;
@@ -356,6 +365,7 @@ async fn isolate_loop(vm: Rc<Vm>, mut rx: mpsc::UnboundedReceiver<WorkerRequest>
             args,
             shared,
             caps,
+            host_factories,
             reply,
             abort,
             chunk,
@@ -371,6 +381,17 @@ async fn isolate_loop(vm: Rc<Vm>, mut rx: mpsc::UnboundedReceiver<WorkerRequest>
         // program isolate and a DEDICATED `run_in_worker({caps})` isolate.
         interp.set_caps(*caps);
         interp.set_caps_drop_allowed(false);
+
+        // EMBED §6.4: install the host-module FACTORIES FRESH at the top of each request
+        // (the caps-floor no-leak discipline — Isolate B sharing this pool thread does NOT
+        // see Isolate A's factory-built modules). CLEAR first so a module from a prior
+        // request's factory cannot leak forward, then install THIS request's set. Each
+        // factory builds a fresh in-isolate `HostModuleDef`. Empty for an ordinary program.
+        interp.clear_host_modules();
+        for (name, factory) in &host_factories {
+            let name_rc: Rc<str> = Rc::from(name.as_str());
+            interp.install_host_factory(&name_rc, factory);
+        }
 
         // Task 1.6: install the bundled program's archive BEFORE the slice loads (the slice
         // re-runs the program's top-level imports). Once per isolate; a decode failure is a

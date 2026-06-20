@@ -310,6 +310,8 @@ mod tests {
             args: Vec::new(),
             shared: Vec::new(),
             caps: Box::new(crate::stdlib::caps::CapSet::all_granted()),
+            // EMBED §6.4: pool test fixture carries no host-module factories.
+            host_factories: Vec::new(),
             reply,
             abort,
             // PAR §3.3.2: pool test fixture carries no chunk job (None = today's exact path).

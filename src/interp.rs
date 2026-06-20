@@ -300,6 +300,74 @@ pub(crate) fn make_error(msg: Value) -> Value {
     Value::object(map)
 }
 
+// ── EMBED §6: host modules (CORE registry types) ────────────────────────────
+//
+// These types are CORE (NOT feature-gated) so the `Interp.host_modules` field and the
+// `host:` dispatch arm compile under `--no-default-features` — the field is simply
+// always empty there (only the `embed`-gated builder surface in `src/embed/host.rs`
+// ever populates it). The closures operate on the engine's `Value` (not the embed
+// `AsValue`), so this layer carries no embed dependency; the embed builder adapts.
+
+/// The error a host function's CORE closure raises (the type-erased form of the embed
+/// `HostError`). `recoverable` distinguishes the FFI two-tier split.
+pub struct HostInvokeError {
+    pub message: String,
+    /// `true` = the recoverable/data-shaped class; `false` = programmer-misuse panic.
+    pub recoverable: bool,
+}
+
+/// The per-call context a host fn's CORE closure receives: the call span + a
+/// `print`-equivalent output sink (a callback, NOT the `Interp` itself — §6.2).
+pub struct HostCallCtx<'a> {
+    pub span: Span,
+    pub out: &'a dyn Fn(&str),
+}
+
+/// The CORE host-function closure signature: `(ctx, args) -> Result<Value, _>`.
+pub type HostFnCore = dyn Fn(&HostCallCtx, &[Value]) -> Result<Value, HostInvokeError>;
+
+/// A registered host function + its tier (plain vs fallible). `Rc` so dispatch clones
+/// the closure OUT of the registry borrow before invoking (never holding the borrow).
+pub struct HostFnEntry {
+    pub f: Rc<HostFnCore>,
+    /// `true` for `fallible_func` (returns the Tier-1 `[value, err]` pair); `false` for
+    /// a plain `func` (a `recoverable` error upgrades to Tier-2).
+    pub fallible: bool,
+}
+
+/// A registered host module: its ordered constant exports + its named functions.
+pub struct HostModuleDef {
+    pub values: Vec<(String, Value)>,
+    pub fns: HashMap<String, HostFnEntry>,
+}
+
+/// EMBED §6.4: a CORE, `Send + Sync` host-module factory — a fn that builds a fresh
+/// `HostModuleDef` INSIDE a worker isolate thread. The embed builder adapts a
+/// `Fn(&mut HostModuleBuilder)` into this. `Send + Sync` because it rides the worker
+/// spawn paths (beside `caps`) and runs on the spawned isolate's thread. The
+/// `HostModuleDef` it returns is built fresh per worker (its host fns are `Rc`/`!Send`,
+/// constructed in-isolate — never shipped across the airlock).
+pub type HostModuleFactoryCore = dyn Fn() -> HostModuleDef + Send + Sync;
+
+/// A named CORE factory carried on the `Interp` (the main isolate) and shipped to
+/// worker isolates: `(full "host:<name>", factory)`.
+pub type HostFactoryEntry = (Rc<str>, std::sync::Arc<HostModuleFactoryCore>);
+
+/// EMBED §6.5: the CORE stdlib AVAILABILITY filter (the type-erased form of the embed
+/// `StdlibFilter`). Checked at the `load_std_module` import chokepoint ONLY — an
+/// availability knob, NOT a security boundary (capabilities are the security boundary;
+/// an allowlisted module's transitively-reachable builtins are not re-walked).
+#[derive(Debug, Clone)]
+pub enum StdlibFilterCore {
+    /// Every compiled-in module is importable (the default; `None` on the Interp means
+    /// this too — the filter is absent → zero-cost).
+    Full,
+    /// Only the no-OS subset: every module whose `required_cap` is empty, minus `std/ffi`.
+    Core,
+    /// Only the listed `std/*` specifiers are importable.
+    Allow(Vec<String>),
+}
+
 /// RESIL §5.4: the canonical `[nil, {message, code:"deadline-exceeded"}]` Tier-1
 /// err pair returned when a deadline budget is exhausted. ONE construction site so
 /// the shape is byte-identical across the deadline race ([`crate::stdlib::resilience`]),
@@ -717,6 +785,11 @@ pub enum SpecifierKind {
     /// A bare package specifier whose first segment is NOT in the resolved set →
     /// a Tier-2 "unknown package" error (identical message on both engines).
     UnknownPackage(String),
+    /// EMBED §6.1: a `host:<name>` specifier — a host module registered on this
+    /// isolate (or a clean miss panic if not). Carries the FULL `host:<name>` key.
+    /// Checked in `classify_specifier` (the `:` can never appear in a package key, so
+    /// the reservation is structural).
+    Host(String),
 }
 
 /// All mutable interpreter state lives behind interior mutability (`RefCell`/
@@ -843,6 +916,23 @@ pub struct Interp {
     /// `.await` (the resolved target is cloned out first — never hold this borrow
     /// across an await; `await_holding_refcell_ref` stays satisfied).
     package_resolver: RefCell<Option<PackageMap>>,
+    /// EMBED §6.3: host modules registered on THIS isolate, keyed by the full
+    /// `host:<name>` specifier. CORE (not feature-gated) so the `host:` dispatch arm +
+    /// import arm compile under `--no-default-features`; always EMPTY there (only the
+    /// `embed`-gated builder populates it). The registry is the SoT both engines reach
+    /// (`load_host_module` import + `call_host_fn` dispatch), so host-module behavior is
+    /// byte-identical across the tree-walker and the VM by construction.
+    host_modules: RefCell<HashMap<Rc<str>, Rc<HostModuleDef>>>,
+    /// EMBED §6.4: the `Send + Sync` host-module FACTORIES this (main) isolate ships to
+    /// every worker isolate it spawns (so a `worker fn` importing `host:app` resolves
+    /// the module per-isolate instead of missing). Carried beside `caps` on the worker
+    /// spawn paths — a plain field, NOT serialized, NO wire tag. CORE (always empty under
+    /// `--no-default-features`).
+    host_factories: RefCell<Vec<HostFactoryEntry>>,
+    /// EMBED §6.5: the stdlib availability filter (embed-set). `None` = no filter (the
+    /// default — every compiled-in module importable, zero-cost). Checked ONLY at the
+    /// `load_std_module` import chokepoint. CORE (always `None` under non-embed runs).
+    stdlib_filter: RefCell<Option<StdlibFilterCore>>,
     /// Workers Spec A: the entry program's full source text, retained so a
     /// `worker fn` dispatch can (re)compile it to a top-level [`crate::vm::chunk::Chunk`]
     /// and build the shippable code slice (entry fn + transitive top-level deps).
@@ -1342,6 +1432,12 @@ impl Interp {
             cli_args: RefCell::new(Vec::new()),
             determinism: RefCell::new(None),
             package_resolver: RefCell::new(None),
+            // EMBED §6.3: no host modules until the embed builder registers them.
+            host_modules: RefCell::new(HashMap::new()),
+            // EMBED §6.4: no host factories until the embed builder installs them.
+            host_factories: RefCell::new(Vec::new()),
+            // EMBED §6.5: no stdlib filter by default (every module importable).
+            stdlib_filter: RefCell::new(None),
             iface_verdict_cache: RefCell::new(HashMap::new()),
             iface_cache_gen: std::cell::Cell::new(0),
             // FFI §4.3: default = ALL granted → byte-identical for every existing
@@ -2013,6 +2109,16 @@ impl Interp {
             .borrow()
             .upgrade()
             .expect("Interp self-ref not installed")
+    }
+
+    /// Drain (take + clear) all captured program output so far. Empty under `Live`
+    /// (where output already streamed to stdout). Used by the EMBED facade's
+    /// `Isolate::take_output` so repeated drains return only NEW output.
+    pub fn take_output(&self) -> String {
+        match &self.output {
+            OutputSink::Capture(buf) => std::mem::take(&mut buf.borrow_mut()),
+            OutputSink::Live => String::new(),
+        }
     }
 
     /// Snapshot of all captured program output so far. Empty under `Live`.
@@ -3534,6 +3640,15 @@ impl Interp {
     /// Resolve a `std/*` built-in module to a cached `ModuleEntry`, building it
     /// from the static export registry. Bypasses the filesystem entirely.
     fn load_std_module(&self, source: &str) -> Result<ModuleEntry, Control> {
+        // EMBED §6.5: the stdlib AVAILABILITY filter chokepoint (the ONE place it is
+        // checked — an availability knob, NOT a security boundary; capabilities are the
+        // security boundary). Zero-cost when no filter is set (the default). A filtered
+        // module reports the §6.5 message.
+        if !self.stdlib_module_available(source) {
+            return Err(Control::Panic(AsError::new(format!(
+                "module '{source}' is not available in this isolate"
+            ))));
+        }
         let key = PathBuf::from(format!("<std>/{}", &source[4..]));
         if let Some(entry) = self.modules.borrow().get(&key) {
             return Ok(entry.clone());
@@ -3551,6 +3666,50 @@ impl Interp {
         for (name, value) in exports_list {
             env.define(&name, value, false).map_err(AsError::new)?;
             exports.borrow_mut().insert(name);
+        }
+        let entry = ModuleEntry { env, exports };
+        self.modules.borrow_mut().insert(key, entry.clone());
+        Ok(entry)
+    }
+
+    /// EMBED §6.3: resolve a `host:<name>` module to a cached `ModuleEntry`, mirroring
+    /// [`Self::load_std_module`]. The module's `values` bind directly; each host fn
+    /// binds as a `Value::Builtin("host:<name>.<fname>")` (so the builtin dispatch's
+    /// `split_once('.')` → `call_stdlib("host:<name>", "<fname>")` → the host fall-through
+    /// arm). A miss (the module was not registered on THIS isolate — the CLI/worker case)
+    /// is a clean recoverable Tier-2 panic. The miss MESSAGE differs in a worker isolate
+    /// (§6.4) to point at `host_module_factory`. Both engines reach THIS one loader.
+    fn load_host_module(&self, source: &str) -> Result<ModuleEntry, Control> {
+        let key = PathBuf::from(format!("<host>/{source}"));
+        if let Some(entry) = self.modules.borrow().get(&key) {
+            return Ok(entry.clone());
+        }
+        let def = self.host_module(source).ok_or_else(|| {
+            // §6.4: a worker isolate that did not receive a factory for this module
+            // gets the worker-specific message pointing at `host_module_factory`.
+            let msg = if crate::worker::pool::in_isolate() {
+                format!(
+                    "host module '{source}' is not available in a worker isolate \
+                     (register it with host_module_factory to install it per-isolate)"
+                )
+            } else {
+                format!("host module '{source}' is not registered in this isolate")
+            };
+            Control::Panic(AsError::new(msg))
+        })?;
+        // Child of the global env so a host export whose name collides with a global
+        // builtin shadows it (the same rule as std modules).
+        let env = global_env().child();
+        let exports = Rc::new(RefCell::new(HashSet::new()));
+        for (name, value) in &def.values {
+            env.define(name, value.clone(), false).map_err(AsError::new)?;
+            exports.borrow_mut().insert(name.clone());
+        }
+        for fname in def.fns.keys() {
+            let qualified = format!("{source}.{fname}");
+            env.define(fname, Value::builtin(qualified.as_str()), false)
+                .map_err(AsError::new)?;
+            exports.borrow_mut().insert(fname.clone());
         }
         let entry = ModuleEntry { env, exports };
         self.modules.borrow_mut().insert(key, entry.clone());
@@ -3581,6 +3740,141 @@ impl Interp {
         *self.package_resolver.borrow_mut() = Some(map);
     }
 
+    /// EMBED §6.3: register a host module under its full `host:<name>` key. The name
+    /// MUST already be validated (the `embed` builder validates at `host_module()`
+    /// time); a duplicate key is an error (the caller maps it to `EmbedError::Config`).
+    /// Returns `Err(message)` on a duplicate registration.
+    pub fn register_host_module(
+        &self,
+        full_name: &str,
+        def: HostModuleDef,
+    ) -> Result<(), String> {
+        let mut mods = self.host_modules.borrow_mut();
+        if mods.contains_key(full_name) {
+            return Err(format!(
+                "host module '{full_name}' is already registered in this isolate"
+            ));
+        }
+        mods.insert(Rc::from(full_name), Rc::new(def));
+        Ok(())
+    }
+
+    /// EMBED §8.2 (capi late registration): register (or REPLACE) a host module
+    /// AFTER construction, e.g. the C API's `as_register_host_fn` accumulating a
+    /// module's fns one call at a time. Unlike [`Self::register_host_module`] a same-name
+    /// re-registration is NOT an error here (the capi caller re-installs the whole module
+    /// each call, accumulating fns host-side).
+    ///
+    /// **The memoization rule** (documented contract): a host module is memoized as a
+    /// `ModuleEntry` the FIRST time a script `import`s it. A module registered AFTER that
+    /// first import would NOT be visible (the cached `ModuleEntry` is not retro-patched),
+    /// so late registration of an ALREADY-IMPORTED module is a hard `Err` — the caller must
+    /// register a module's fns BEFORE the first `import "host:<name>"`. (A module that has
+    /// never been imported re-resolves against the fresh registry, so replacement is sound.)
+    pub fn register_host_module_late(
+        &self,
+        full_name: &str,
+        def: HostModuleDef,
+    ) -> Result<(), String> {
+        // The memoized `ModuleEntry` for a host module is keyed `<host>/<host:name>`.
+        let key = PathBuf::from(format!("<host>/{full_name}"));
+        if self.modules.borrow().contains_key(&key) {
+            return Err(format!(
+                "host module '{full_name}' was already imported by a script — \
+                 register its functions BEFORE the first import of that module"
+            ));
+        }
+        self.host_modules
+            .borrow_mut()
+            .insert(Rc::from(full_name), Rc::new(def));
+        Ok(())
+    }
+
+    /// EMBED §6.3: the registered `HostModuleDef` for a `host:<name>` key (None if the
+    /// isolate did not register it — the worker-miss / CLI-miss case). Consumed by the
+    /// `host:` import + dispatch arms (Task 3.2).
+    #[allow(dead_code)] // wired into the import/dispatch arms in Task 3.2
+    pub(crate) fn host_module(&self, full_name: &str) -> Option<Rc<HostModuleDef>> {
+        self.host_modules.borrow().get(full_name).cloned()
+    }
+
+    /// EMBED §6.4: install the host-module factories this isolate ships to its workers.
+    pub fn set_host_factories(&self, factories: Vec<HostFactoryEntry>) {
+        *self.host_factories.borrow_mut() = factories;
+    }
+
+    /// EMBED §6.4: a clone of the host-module factories (for worker spawn plumbing —
+    /// the `Arc`s ride beside `caps`). Empty when the embed builder installed none.
+    /// Consumed by the worker spawn paths (Task 3.3).
+    #[allow(dead_code)] // wired into the worker spawn paths in Task 3.3
+    pub(crate) fn host_factories(&self) -> Vec<HostFactoryEntry> {
+        self.host_factories.borrow().clone()
+    }
+
+    /// EMBED §6.4: install a host module built from a CORE factory (called INSIDE a
+    /// worker isolate to install a shipped factory before the slice runs). Overwrites
+    /// any existing registration of the same name (a worker installs fresh per request).
+    pub fn install_host_factory(&self, name: &Rc<str>, factory: &std::sync::Arc<HostModuleFactoryCore>) {
+        let def = factory();
+        self.host_modules
+            .borrow_mut()
+            .insert(Rc::clone(name), Rc::new(def));
+    }
+
+    /// EMBED §6.5: install the stdlib availability filter (the embed builder sets it).
+    /// `StdlibFilterCore::Full` clears any filter (the zero-cost default).
+    pub fn set_stdlib_filter(&self, filter: StdlibFilterCore) {
+        *self.stdlib_filter.borrow_mut() = match filter {
+            StdlibFilterCore::Full => None,
+            other => Some(other),
+        };
+    }
+
+    /// EMBED §6.5: whether a `std/<name>` module is AVAILABLE under the current filter
+    /// (an availability knob — NOT the security boundary). `true` when no filter is set
+    /// (the default → zero-cost). For `Core`, a module is available iff its
+    /// `required_cap` is empty AND it is not `std/ffi`. For `Allow`, iff it is listed.
+    /// `source` is the full `std/<name>` specifier.
+    fn stdlib_module_available(&self, source: &str) -> bool {
+        let filter = self.stdlib_filter.borrow();
+        let Some(filter) = filter.as_ref() else {
+            return true; // no filter → everything available (zero-cost default)
+        };
+        match filter {
+            StdlibFilterCore::Full => true,
+            StdlibFilterCore::Core => {
+                // The no-OS subset: `required_cap` is empty AND not `std/ffi`. The gate
+                // key is the `std/`-stripped name with `/` → `_` (the SAME mapping the
+                // cap-completeness test uses: `std/net/tcp` → `net_tcp`), so this is
+                // DRIFT-PROOF against `required_cap` itself — a module that gains a cap
+                // automatically drops out of Core.
+                if source == "std/ffi" {
+                    return false;
+                }
+                let Some(stripped) = source.strip_prefix("std/") else {
+                    return false;
+                };
+                let key = stripped.replace('/', "_");
+                crate::stdlib::required_cap(&key, "__probe__").is_empty()
+            }
+            StdlibFilterCore::Allow(list) => list.iter().any(|m| m == source),
+        }
+    }
+
+    /// EMBED §6.4: clear ALL registered host modules on this isolate. The POOLED worker
+    /// loop calls this at the top of each request (BEFORE installing the request's fresh
+    /// factory set) so a module installed by request A's factory cannot leak forward into
+    /// request B (the caps-floor no-leak discipline — two Isolates sharing one pool thread
+    /// must not see each other's host modules). The cached `ModuleEntry`s under `<host>/…`
+    /// in `modules` are dropped too, so a re-import re-resolves against the fresh registry.
+    pub fn clear_host_modules(&self) {
+        self.host_modules.borrow_mut().clear();
+        // Cached host `ModuleEntry`s are keyed under a `<host>/…` first component.
+        self.modules
+            .borrow_mut()
+            .retain(|k, _| !k.starts_with(std::path::Path::new("<host>")));
+    }
+
     /// Classify an `import` specifier three ways, SHARED byte-identically by both
     /// engines (SP6 §6). The split, in order:
     ///
@@ -3599,6 +3893,14 @@ impl Interp {
     pub(crate) fn classify_specifier(&self, source: &str) -> SpecifierKind {
         if source.starts_with("std/") {
             return SpecifierKind::Std;
+        }
+        // EMBED §6.1: the `host:` scheme. Placed AFTER the `std/` check (the common
+        // hot path stays first; `std/` can never start with `host:`), but BEFORE the
+        // package classification — a package key can never carry a `:`, so checking
+        // `host:` here makes the namespace reservation STRUCTURAL (no installed package
+        // can ever shadow a `host:` specifier).
+        if source.starts_with("host:") {
+            return SpecifierKind::Host(source.to_string());
         }
         if source.starts_with("./")
             || source.starts_with("../")
@@ -3640,6 +3942,13 @@ impl Interp {
     /// never reach here.
     pub(crate) fn import_std(&self, source: &str) -> Result<ModuleEntry, Control> {
         self.load_std_module(source)
+    }
+
+    /// EMBED §6.3: the VM `Op::Import` host-module loader — the SAME `load_host_module`
+    /// the tree-walker's `Stmt::Import` arm uses, so the two engines bind byte-identical
+    /// exports and raise the byte-identical miss panic.
+    pub(crate) fn import_host(&self, source: &str) -> Result<ModuleEntry, Control> {
+        self.load_host_module(source)
     }
 
     #[async_recursion(?Send)]
@@ -4152,6 +4461,9 @@ impl Interp {
                 // borrow is never held across the loader `.await`.
                 let entry = match self.classify_specifier(source) {
                     SpecifierKind::Std => self.load_std_module(source)?,
+                    // EMBED §6.3: a `host:<name>` module registered on this isolate (or a
+                    // clean miss panic). The SAME `load_host_module` the VM reaches.
+                    SpecifierKind::Host(name) => self.load_host_module(&name)?,
                     SpecifierKind::Relative(resolved) => self.load_module(&resolved).await?,
                     SpecifierKind::Package { target, .. } => self.load_module(&target).await?,
                     SpecifierKind::UnknownPackage(key) => {
