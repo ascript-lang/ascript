@@ -38,6 +38,7 @@ const NAV = [
     ['spec/classes', 'Classes, enums & interfaces'],
     ['spec/patterns', 'Pattern matching'],
     ['spec/errors', 'Errors & recover'],
+    ['spec/modules', 'Modules & packages'],
   ]},
   { title: 'Standard library', items: [
     ['stdlib/overview', 'Overview'],
