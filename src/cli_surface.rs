@@ -389,6 +389,12 @@ pub enum Command {
         /// the only transport, so this is a no-op.
         #[arg(long = "stdio")]
         stdio: bool,
+        /// REPLAY §5: replay-debugging. Run the debuggee under the strict Replay context
+        /// (no real I/O — clock/RNG/fs/effects pinned from <FILE>) and enable time travel
+        /// (`stepBack`/`reverseContinue` via deterministic re-execution). The program to
+        /// debug is taken from the trace.
+        #[arg(long = "replay", value_name = "FILE")]
+        replay: Option<String>,
     },
     /// Add a dependency to ascript.toml + lock (git/url/path spec).
     #[cfg(feature = "pkg")]

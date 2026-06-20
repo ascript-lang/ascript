@@ -448,10 +448,26 @@ the editor's `launch` request.
 
 ```text
 ascript dap
+ascript dap --replay <trace>
 ```
 
 `--stdio` is accepted for compatibility with DAP clients that pass it; stdio is the only transport,
 so it is a no-op.
+
+`--replay <trace>` starts a **replay-debugging** session (time travel): the debuggee runs under the
+strict Replay context — **no real I/O**, every clock/RNG/effect value pinned from the trace — and the
+adapter advertises the DAP `supportsStepBack` capability, enabling `stepBack` and `reverseContinue`.
+The program path is taken from the trace, so `launch` needs no `program` argument (`ascript run
+--inspect --replay <trace> <file>` is the equivalent run-path route). A backward step is implemented
+by **deterministic re-execution** (the rr model — no checkpointing): the adapter tears down the
+debuggee and re-runs the program prefix to the previous stop, replaying the recorded navigation log.
+Because replay does no I/O and sleeps are virtual, the prefix re-executes at full VM speed; the
+honest cost is one re-execution per backward step (O(stops × prefix)). `stepBack` lands on the
+previous **stop** (breakpoint/step boundary), not the previous instruction (v1 granularity).
+`evaluate` works for pure-value inspection; an `evaluate` whose expression calls a recorded function
+(e.g. `time.now()` / `fs.read(…)`) is **refused** with a clean message — running it would consume a
+trace event and desync the replay. A non-replay `ascript dap` session is unchanged (the capability is
+absent; the time-travel paths are inert).
 
 `ascript dap` takes no capability sandbox flags — the program path is not known at server start. If
 you need a sandboxed debug session, use `ascript run --inspect --sandbox <file>` instead: that path

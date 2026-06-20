@@ -35,6 +35,7 @@ pub fn spawn_debuggee(
     program: PathBuf,
     script_args: Vec<String>,
     caps: Option<crate::stdlib::caps::CapSet>,
+    replay: Option<PathBuf>,
 ) -> DebuggeeHandle {
     let (hook, cmd_tx, evt_rx) = DebuggerHook::new();
     let join = std::thread::Builder::new()
@@ -46,7 +47,7 @@ pub fn spawn_debuggee(
                 .build()
                 .expect("debuggee tokio runtime");
             let local = tokio::task::LocalSet::new();
-            local.block_on(&rt, run_program(program, script_args, caps, hook));
+            local.block_on(&rt, run_program(program, script_args, caps, replay, hook));
         })
         .expect("spawn debuggee thread");
     DebuggeeHandle {
@@ -62,6 +63,7 @@ async fn run_program(
     program: PathBuf,
     script_args: Vec<String>,
     caps: Option<crate::stdlib::caps::CapSet>,
+    replay: Option<PathBuf>,
     mut hook: DebuggerHook,
 ) {
     use crate::error::SourceInfo;
@@ -150,6 +152,23 @@ async fn run_program(
 
     interp.install_self();
 
+    // REPLAY §5.1 — install the strict Replay context BEFORE `vm.run`, so the whole
+    // debuggee generation performs NO real I/O and every clock/RNG/effect value is pinned
+    // from the trace (the basis for time travel: any number of re-executions reach
+    // byte-identical states). A bad/corrupt trace ships the existing Output+Terminated
+    // error shape (never a panic), exactly like an unreadable `.aso`. The elide pass is
+    // disabled here to mirror `run_test_replay` (the strict context owns determinism).
+    if let Some(trace_path) = &replay {
+        if let Err(msg) = install_replay_context(&interp, trace_path) {
+            let _ = hook.events.send(DebugEvent::Output {
+                text: format!("{msg}\n"),
+                stderr: true,
+            });
+            let _ = hook.events.send(DebugEvent::Terminated { exit_code: 1 });
+            return;
+        }
+    }
+
     let vm = Vm::with_instrument(interp.clone(), Instrumentation::empty());
     if let Some(dir) = program.parent() {
         vm.set_module_dir(dir.to_path_buf());
@@ -230,4 +249,33 @@ async fn run_program(
         // `hook` drops here → its event Sender drops → pump thread sees the channel
         // close and ends.
     }
+}
+
+/// REPLAY §5.1 — read + verify a trace file and install the strict Replay determinism
+/// context on `interp`, mirroring `run_test_replay`'s install (`src/lib.rs`). On any
+/// failure (unreadable file, corrupt/mismatched-version bytes) returns a clean error
+/// message the caller ships as an `Output`+`Terminated` pair — NEVER a panic (untrusted
+/// trace bytes are hostile; `read_trace` itself bounds them).
+///
+/// A DAP replay accepts a `run`-kind trace (the natural surface — record a failing run,
+/// then `dap --replay`); a `test`-kind trace is also accepted (its events replay the
+/// same way, the kind tag is informational here). The source-digest check `run --replay`
+/// performs is intentionally SKIPPED: the editor opens the trace against the same file it
+/// was recorded from, and any seam divergence still surfaces loudly at replay time.
+fn install_replay_context(
+    interp: &crate::interp::Interp,
+    trace_path: &std::path::Path,
+) -> Result<(), String> {
+    let bytes = std::fs::read(trace_path)
+        .map_err(|e| format!("cannot read trace {}: {}", trace_path.display(), e))?;
+    let (header, events) = crate::trace::read_trace(&bytes)
+        .map_err(|e| format!("cannot replay {}: {}", trace_path.display(), e))?;
+    interp.set_cli_args(&header.argv);
+    interp.set_elide_mode(false);
+    interp.set_determinism(Some(crate::det::DeterminismContext::replay_trace(
+        header.seed,
+        header.start_ms,
+        events,
+    )));
+    Ok(())
 }

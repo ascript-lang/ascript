@@ -1988,6 +1988,35 @@ impl Interp {
         self.trace_active.get()
     }
 
+    /// REPLAY §5.2 — a snapshot of the live REPLAY (CliTrace, Replay-mode) determinism
+    /// state for the DAP `evaluate` trace-consumption guard: the current replay cursor
+    /// plus a CLONE of the whole context to restore if an evaluate consumes a trace event.
+    /// Returns `None` when no strict replay context is installed (record mode, no context,
+    /// or a workflow context) — the common path, where `evaluate` is unguarded. The clone
+    /// is cheap relative to a debugger stop (an `evaluate` is interactive, not hot); it
+    /// carries NO `File` appender (`Clone` drops `group`), which a replay context never has.
+    pub(crate) fn det_replay_snapshot(&self) -> Option<(usize, crate::det::DeterminismContext)> {
+        let det = self.determinism.borrow();
+        let ctx = det.as_ref()?;
+        if ctx.origin == crate::det::Origin::CliTrace && ctx.mode == crate::det::Mode::Replay {
+            Some((ctx.cursor, ctx.clone()))
+        } else {
+            None
+        }
+    }
+
+    /// REPLAY §5.2 — the live replay cursor (only meaningful when a strict replay context
+    /// is installed). Read AFTER a DAP `evaluate` to detect whether it consumed a trace
+    /// event (the cursor advanced → a Recorded fn was called → the eval must be refused +
+    /// the context restored from the snapshot). `None` when no replay context is installed.
+    pub(crate) fn det_replay_cursor(&self) -> Option<usize> {
+        self.determinism
+            .borrow()
+            .as_ref()
+            .filter(|c| c.origin == crate::det::Origin::CliTrace && c.mode == crate::det::Mode::Replay)
+            .map(|c| c.cursor)
+    }
+
     /// REPLAY §4.3 — the current length of the installed determinism context's recorded
     /// event stream (0 when no context is installed). Used by `test --record` to mark
     /// the module-load prefix `P` and each per-test segment `S_k` as INDEX RANGES over

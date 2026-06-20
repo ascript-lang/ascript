@@ -395,12 +395,18 @@ async fn real_main() -> ExitCode {
                 _ => ascript::TraceMode::Off,
             };
             let tracing = !matches!(trace_mode, ascript::TraceMode::Off);
-            // REPLAY §4.1 composition rules (clean errors, not silent precedence):
-            // `--inspect --replay` routes to the DAP server (§5) — wired in a later task;
-            // `--inspect --record` / `--profile --record|--replay` are untested matrices (v2).
-            if inspect && tracing {
+            // REPLAY §5/§4.1 composition rules (clean errors, not silent precedence):
+            // `--inspect --replay` IS supported — it routes to the DAP server's replay
+            // path (time-travel debugging). `--inspect --record` is NOT (record-debugging
+            // is untested matrix; record by running normally, then `dap --replay`).
+            // `--profile --record|--replay` is a v2 untested matrix.
+            let inspect_replay_path = match &trace_mode {
+                ascript::TraceMode::Replay { path } if inspect => Some(path.clone()),
+                _ => None,
+            };
+            if inspect && matches!(trace_mode, ascript::TraceMode::Record { .. }) {
                 eprintln!(
-                    "error: --inspect with --record/--replay is not supported yet; for replay debugging use `ascript dap --replay <trace>`"
+                    "error: --inspect with --record is not supported; record by running normally, then debug with `ascript run --inspect --replay <trace> <file>`"
                 );
                 return ExitCode::from(1);
             }
@@ -413,11 +419,18 @@ async fn real_main() -> ExitCode {
             // so the SAME capability set is enforced under the debugger (review F2 /
             // Gate-0 — no privilege escalation vs a normal run). The `dap` feature owns
             // this; without it, report a clean rebuild hint rather than silently running.
+            // REPLAY §5: under `--replay` the same DAP server runs every debuggee
+            // generation in the strict Replay context + enables `stepBack`.
             if inspect {
                 #[cfg(feature = "dap")]
                 {
                     let program = std::path::PathBuf::from(&file);
-                    return match ascript::dap::run_server(Some(program), args, caps) {
+                    return match ascript::dap::run_server(
+                        Some(program),
+                        args,
+                        caps,
+                        inspect_replay_path,
+                    ) {
                         Ok(code) => ExitCode::from(code as u8),
                         Err(e) => {
                             eprintln!("dap error: {e}");
@@ -427,7 +440,7 @@ async fn real_main() -> ExitCode {
                 }
                 #[cfg(not(feature = "dap"))]
                 {
-                    let _ = (&args, &caps);
+                    let _ = (&args, &caps, &inspect_replay_path);
                     eprintln!(
                         "error: `--inspect` requires the `dap` feature; rebuild with it enabled (it is on by default)"
                     );
@@ -1199,13 +1212,16 @@ async fn real_main() -> ExitCode {
             ExitCode::SUCCESS
         }
         #[cfg(feature = "dap")]
-        Command::Dap { .. } => {
+        Command::Dap { replay, .. } => {
             // The DAP server is fully synchronous (it spawns the debuggee on its own
-            // thread + runtime); the program comes from the `launch` request. Caps are
-            // `None` (all-granted) here — `ascript dap` takes no CLI sandbox flags; a
-            // sandboxed debug session uses `ascript run --inspect --sandbox <file>`,
-            // which threads its composed CapSet through (review F2).
-            match ascript::dap::run_server(None, Vec::new(), None) {
+            // thread + runtime); the program comes from the `launch` request (or, for
+            // `--replay`, from the trace itself). Caps are `None` (all-granted) here —
+            // `ascript dap` takes no CLI sandbox flags; a sandboxed debug session uses
+            // `ascript run --inspect --sandbox <file>`, which threads its composed CapSet
+            // through (review F2). REPLAY §5: `--replay <trace>` runs every debuggee
+            // generation under the strict Replay context and advertises `supportsStepBack`.
+            let replay = replay.map(std::path::PathBuf::from);
+            match ascript::dap::run_server(None, Vec::new(), None, replay) {
                 Ok(code) => ExitCode::from(code as u8),
                 Err(e) => {
                     eprintln!("dap error: {e}");
