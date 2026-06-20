@@ -657,6 +657,40 @@ Terse per-feature notes (the non-obvious bits; read the cited file for the rest)
   editor ERROR nodes despite passing four-mode + `check` (tree-sitter is a THIRD parser; add a `template_escape` rule +
   regen `parser.c` when an example uses a novel syntax combo). Examples in `examples/{*_adt,…}` + the per-module intro/
   advanced files; the four security batteries are `tests/{archive_std,smtp,blob,…}.rs`.
+- **EMBED — host embedding API (Rust crate + C API)** (spec `superpowers/specs/2026-06-12-embedding-api-design.md`;
+  `embed` feature, default-on; **NO engine/`.aso`/opcode/`Value` change** — `ASO_FORMAT_VERSION` 29 + the `Op` count 121
+  pinned by `tests/embed_negative_space.rs`, `vm_differential` 445/0 unchanged both configs). A host-side facade
+  `ascript::embed` (`src/embed/`) lets a Rust/C program drive AScript: `Isolate::builder().caps(..).stdlib(..).output(..)
+  .host_module(..).build()` → blocking `eval`/`call`/`global`/`set_global`/`load_archive` (+ `*_async`). **`Isolate` is
+  `!Send + !Sync`** (owns a current-thread `tokio::runtime::Runtime`; parallelism = MORE isolates, never sharing —
+  matches the per-isolate `!Send` model); a blocking call inside an ambient runtime → `EmbedError::NestedRuntime` (not a
+  `block_on` panic). **`eval` lifts the REPL substrate** (`compile_source`→Fiber→`vm.run`, `session_src` accumulation;
+  a compile error leaves the session UNmutated). **`AsValue(Value)`** is a `!Send` wrapper: container handles are LIVE
+  ALIASES (wrap the same `Rc`/`Cc` cell — host writes are visible to script and vice-versa); mutators route through the
+  engine paths (`index_set` / `ObjectCell::insert` + the `frozen_kind` guard) so type/frozen checks aren't bypassed
+  (Map/Set are read-only host-side; the SHAPE slab-safe-`.get()` rule applies); the 25-kind table crosses every `Value`
+  variant; `to_json`/`json_parse` is the explicit deep bridge (cyclic → error, never hangs). **THE security boundary is
+  caps, INVERTED for embedding: the default is DENY-ALL** (the loud inverse of the CLI's all-granted — a host that
+  forgets to grant gets the safe default); `StdlibFilter` is an AVAILABILITY knob, NOT a security boundary. **Host
+  modules — the only core-runtime touches** (both behaviour-invisible): `host:<name>` modules register `value`s +
+  `func`/`fallible_func`s callable from script. `classify_specifier` gained `SpecifierKind::Host` (after the `std/`
+  hot-path check); `load_host_module` mirrors `load_std_module` on BOTH engines; **dispatch rides the
+  previously-error fall-through** in `call_stdlib` (`m if m.starts_with("host:")`) — zero hot-path cost for non-host
+  programs (the engine-parity test + 445/0 prove four-mode byte-identity). FFI-mirrored tiering: `func` Recoverable →
+  Tier-2, `fallible_func` Recoverable → the `[nil,err]` Tier-1 pair, `Panic` → Tier-2. **`HOST FNS BYPASS CAPS`** (they
+  are native Rust the host wrote — LOUDLY documented on `func`/`fallible_func`). The `host_modules` registry is a CORE
+  `Interp` field (always-empty under `--no-default-features`). **Workers:** a `host:` import in a worker consults THAT
+  isolate's registry → a clean miss panic unless the host passes a `host_module_factory` (a `Send` factory riding the
+  SAME side-channel as `caps`, installed FRESH per pooled request → no cross-isolate leak); a `Value::Builtin("host:…")`
+  is non-sendable so it can't cross the airlock. **C API** (`ascript-capi`, the `capi/` crate — own empty `[workspace]`,
+  NEVER in the root build graph, like `tree-sitter-ascript/`): every `unsafe extern "C"` fn does NULL-check →
+  thread-check (`AS_ERR_WRONG_THREAD`, the Isolate is thread-affine) → poison-check → `catch_unwind`; a wrong-thread
+  `as_value_free` LEAKS (documented contract — an off-thread `Rc` decrement is a data race); late host-fn registration
+  errors if the module was already imported; a hand-written `capi/include/ascript.h` + a source-scan drift test + a
+  compiled-C smoke test (`cc::Build` links the cdylib, runs it, exits 0). Examples `examples/embed/{rust-host,c-host}`
+  are CI-executed sentinel-checked hosts (NOT corpus members — the differential discovery is non-recursive over
+  `examples/`). Docs `docs/content/embedding.md` (+ the NAV `embedding` entry); `ascript::embed` is the §9
+  semver-contracted surface (the rest of the crate is `pub` for the bin/tests with no stability promise).
 
 ## Commands
 
