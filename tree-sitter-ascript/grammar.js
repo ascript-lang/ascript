@@ -97,6 +97,11 @@ module.exports = grammar({
     // `_primary_expression` (the `=>` is the arm separator) vs shift into a bare
     // `arrow_function` param.
     [$.arrow_function, $._primary_expression],
+    // NOTE (LSPEC): the anonymous `function_expression` (`fn(…){…}`) and the
+    // `function_declaration` (`fn name(…){…}`) diverge at the token AFTER `fn`
+    // (`(` → expression, `name` → declaration), which tree-sitter resolves with
+    // static LR lookahead — NO declared conflict needed (one was tried; the
+    // generator flagged it "unnecessary").
     // ----- ADT: variant pattern vs call expression -------------------------
     // A positional `Circle(r)` reduces to a `call_expression` (semantic recovery),
     // while a NAMED `Rect(w: ww)` reduces to a `variant_pattern`. Both share the
@@ -448,8 +453,25 @@ module.exports = grammar({
       $.yield_expression,
       $.match_expression,
       $.arrow_function,
+      $.function_expression,
       $._postfix_expression,
     ),
+
+    // Anonymous `fn(params){body}` EXPRESSION (LSPEC) — a value-position closure,
+    // the named-less sibling of `function_declaration`. It desugars (in the hand
+    // parsers) to a block-bodied arrow, but the surface form is `fn` immediately
+    // followed by a parameter list (NO `name` identifier). The `fn` vs `fn name`
+    // split is what distinguishes this from `function_declaration` at a statement
+    // start (the GLR conflict `[$.function_declaration, $.function_expression]`
+    // declared above resolves it by lookahead: `fn (` → expression, `fn ident`
+    // → declaration). `fn*` (a generator) stays declaration-only.
+    function_expression: $ => prec(PREC.assign, seq(
+      optional('async'),
+      'fn',
+      field('parameters', $.parameter_list),
+      optional(seq(':', field('return_type', $._type))),
+      field('body', $.block),
+    )),
 
     assignment_expression: $ => prec.right(PREC.assign, seq(
       field('left', $._postfix_expression),

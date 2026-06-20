@@ -277,8 +277,13 @@ fn stmt(p: &mut Parser) {
         IfKw => if_stmt(p),
         WhileKw => while_stmt(p),
         ReturnKw => return_stmt(p),
+        // `fn name(…)` is a declaration; `fn(…)` (no name) is an anonymous fn
+        // EXPRESSION used as an expression statement (the closure is discarded).
+        FnKw if at_anon_fn(p) => expr_stmt(p),
         FnKw => fn_decl(p),
-        AsyncKw if is_async_fn(p) => fn_decl(p),
+        // `async fn name(…)` is a declaration; `async fn(…)` is an anonymous async
+        // fn expression statement.
+        AsyncKw if is_async_fn(p) && !at_anon_fn(p) => fn_decl(p),
         // `worker fn` / `worker async fn` — contextual; `worker` is an Ident.
         Ident if at_worker_modifier(p) => fn_decl(p),
         // `worker class C { … }` — Spec B actor class declaration.
@@ -313,6 +318,24 @@ fn is_async_fn(p: &Parser) -> bool {
         p.nontrivia.get(p.pos + 1).map(|&ti| p.tokens[ti].kind),
         Some(SyntaxKind::FnKw)
     )
+}
+
+/// True if the cursor is at the start of an ANONYMOUS `fn(…)` expression: a `fn`
+/// (optionally preceded by `async`) immediately followed by `(` — i.e. there is
+/// no function NAME between `fn` and the param-list parens. `fn name(…)` (an
+/// identifier after `fn`) stays a declaration. Used to branch the statement
+/// dispatcher (`fn(…)` → an expression statement) and mirrors the legacy
+/// parser's `Tok::Fn if next == LParen` guard.
+fn at_anon_fn(p: &Parser) -> bool {
+    use SyntaxKind::*;
+    let kind = |off: usize| p.nontrivia.get(p.pos + off).map(|&ti| p.tokens[ti].kind);
+    if p.at(AsyncKw) {
+        // `async fn (`
+        kind(1) == Some(FnKw) && kind(2) == Some(LParen)
+    } else {
+        // `fn (`
+        p.at(FnKw) && kind(1) == Some(LParen)
+    }
 }
 
 /// True if the cursor is at the contextual `worker` modifier: an `Ident` whose
@@ -805,6 +828,42 @@ fn fn_decl(p: &mut Parser) {
     p.complete(m, FnDecl);
 }
 
+/// Parse an anonymous `fn(params){body}` expression (`fn(…){…}` or
+/// `async fn(…){…}`) into an `ArrowExpr` node (LSPEC). The node deliberately
+/// carries the `fn`/`async` tokens so `compile_fn_proto` reads `AsyncKw` and so
+/// the resolver/AST treat it exactly like a block-bodied arrow `(params) =>
+/// {body}` — no new `ExprKind` variant. Reuses `param_list` (the SAME param
+/// parser `fn_decl` and the arrow form use) so typed/defaulted/rest params behave
+/// identically. An optional `: T` return annotation is accepted then ignored
+/// (a block-bodied arrow carries no return type), mirroring `fn_decl`.
+/// Precondition: cursor at `FnKw` or `AsyncKw` (with a following `fn (`).
+fn anon_fn_expr(p: &mut Parser) -> CompletedMarker {
+    use SyntaxKind::*;
+    let m = p.start();
+    if p.at(AsyncKw) {
+        p.bump();
+    }
+    if p.at(FnKw) {
+        p.bump();
+    } else {
+        p.error("expected 'fn'");
+    }
+    if p.at(LParen) {
+        param_list(p);
+    } else {
+        p.error("expected '(' after 'fn' in a function expression");
+    }
+    if p.at(Colon) {
+        ret_type(p);
+    }
+    if p.at(LBrace) {
+        block(p);
+    } else {
+        p.error("expected '{' for function body");
+    }
+    p.complete(m, ArrowExpr)
+}
+
 /// Pop `n` names off the CST parser's `type_param_scope` (TYPE §6).
 fn pop_type_params(p: &mut Parser, n: usize) {
     let new_len = p.type_param_scope.len().saturating_sub(n);
@@ -1200,26 +1259,17 @@ fn primary(p: &mut Parser) -> CompletedMarker {
             p.complete(m, TemplateExpr)
         }
         TemplateStart => template_expr(p),
-        // `fn` (and `async fn` / `fn*`) in EXPRESSION position is not a language
-        // construct — AScript's only anonymous function is the arrow `() => …`.
-        // A statement-level `fn name(…) {…}` is dispatched in `stmt` and never
-        // reaches here, so this arm only fires for an expression-position `fn`
-        // (e.g. `recover(fn() {…})`). Emit a clear, targeted error and consume
-        // the `fn` token so recovery does not re-parse it as a name-less
-        // top-level declaration (which would crash the compiler).
-        FnKw => {
-            let m = p.start();
-            p.error("anonymous `fn` expressions are not supported; use an arrow `() => …`");
-            p.bump(); // consume `fn`
-            p.complete(m, Error)
-        }
-        AsyncKw if is_async_fn(p) => {
-            let m = p.start();
-            p.error("anonymous `async fn` expressions are not supported; use an arrow `async () => …`");
-            p.bump(); // consume `async`
-            p.bump(); // consume `fn`
-            p.complete(m, Error)
-        }
+        // Anonymous `fn(params){body}` EXPRESSION (LSPEC) — and the `async fn(…)`
+        // form. It desugars to the EXISTING block-bodied arrow: we emit an
+        // `ArrowExpr` node carrying the `fn` token (and optional `async`), a
+        // `ParamList`, and a `Block`. `compile_fn_proto` reads the `AsyncKw` token
+        // to set `is_async`; the resolver already treats `ArrowExpr` as a function
+        // frame; the AST `ArrowExpr` accessors locate `param_list()`/`block()` by
+        // child kind regardless of the extra `fn` token — so the compiler/interp/
+        // VM/fmt are entirely unchanged (no new `ExprKind`). A statement-level
+        // `fn name(…){…}` is dispatched in `stmt` and never reaches here.
+        FnKw => anon_fn_expr(p),
+        AsyncKw if is_async_fn(p) => anon_fn_expr(p),
         _ => {
             let m = p.start();
             p.error("expected expression");

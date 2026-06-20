@@ -186,6 +186,22 @@ Terse per-feature notes (the non-obvious bits; read the cited file for the rest)
   `Op::DeferPushMethod` (name const-idx u16 + flags u8 + argc u8; width 4). **`.aso` bumps
   `ASO_FORMAT_VERSION` 27 → 28**. Lints: `defer-in-loop` (Warning — accumulates per iteration),
   `defer-async-call` (Warning — bare defer of a known `async fn`). Both engines byte-identical.
+- **Anonymous `fn(params){body}` EXPRESSIONS (LSPEC).** `fn` followed by `(` (NO name) in value/argument
+  position is an anonymous function expression (`recover(fn(){…})`, `let f = fn(x){…}`, `(fn(){…})()`),
+  alongside `async fn(…){…}`. The owner-approved resolution **desugars it to the EXISTING block-bodied arrow**
+  (`ExprKind::Arrow` with `ArrowBody::Block`) — NO new `ExprKind` variant, so the compiler/interp/VM/fmt are
+  unchanged → PARSERS-ONLY, **no opcode/`.aso` change (`ASO_FORMAT_VERSION` stays 29)**, four-mode
+  byte-identity automatic. Disambiguation is token-based in all three parsers: `fn`+identifier → declaration
+  (`Stmt::Fn`/`FnDecl`, unchanged); `fn`+`(` → expression (the statement dispatcher branches on the token
+  AFTER `fn`, so a bare `fn(){}` is a discarded expression statement). Param parsing REUSES the shared
+  `param_list` (typed/defaulted/rest behave identically to the arrow form). Legacy: `try_fn_expr` at the top
+  of `try_arrow` (`src/parser.rs`). CST: `anon_fn_expr` emits an `ArrowExpr` node carrying the `fn`/`async`
+  tokens — `compile_fn_proto` reads `AsyncKw`, the resolver treats `ArrowExpr` as a function frame, the AST
+  accessors find `param_list()`/`block()` by kind (`src/syntax/parser.rs`). Tree-sitter: a `function_expression`
+  rule in `_expression` (no declared conflict — `fn`/`(` is static LR lookahead). **The formatter
+  canonicalizes `fn(x){…}` → `(x) => {…}`** (the single canonical lambda form — pinned in
+  `tests/cst_format.rs`). FOLLOW-UP (not done here): grammar mirror sync (`./scripts/sync-grammar.sh`) +
+  editor-pin bump (Zed/Nvim) — the in-repo conformance guards pass; the outward publish is a CI/manual step.
 
 ## Larger subsystems (campaign work, condensed)
 
@@ -274,9 +290,10 @@ Terse per-feature notes (the non-obvious bits; read the cited file for the rest)
   bridges a worker generator stream onto a local `std/events` bus (intra- vs inter-isolate layering).
   `.aso` bumped to **`ASO_FORMAT_VERSION = 18`**. All-modes byte-identical (tree-walker == specialized-VM ==
   generic-VM == `.aso`); examples in `examples/workers_*.as` + `examples/advanced/workers_*.as`; docs at
-  `docs/content/language/workers.md`. (Carry-forward bug, OUT of workers scope: `recover(fn(){...})` — an
-  anonymous-fn-expression call arg — fails with "function declaration has no resolver binding"; use the arrow
-  form `recover(() => ...)`.)
+  `docs/content/language/workers.md`. (The former carry-forward bug — `recover(fn(){...})` failing with
+  "function declaration has no resolver binding" — is FIXED by LSPEC: anonymous `fn(params){body}` is now a
+  valid function EXPRESSION usable in value/argument position, desugared in the parsers to the existing
+  block-bodied arrow `(params) => {body}`. See the LSPEC note under "Language features" below.)
 - **FFI + opt-out capabilities** (`src/stdlib/{ffi,caps}.rs`; spec
   `specs/2026-06-08-ffi-capabilities-design.md`). **`std/caps` is CORE** (no feature; works under
   `--no-default-features`); **`std/ffi` is the default-on `ffi` feature** (`libloading`+`libffi`). NO `.aso`

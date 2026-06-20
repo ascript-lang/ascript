@@ -68,6 +68,30 @@ fn cst_keeps_step_as_a_plain_identifier() {
     cst_accepts("step(3)");
 }
 
+/// Anonymous `fn(params){body}` EXPRESSIONS (LSPEC) — a value-position closure
+/// that desugars to the block-bodied arrow `(params) => {body}`. BOTH the legacy
+/// parser and the CST parser must ACCEPT them in every expression position
+/// (`fn` followed by `(` is an expression; `fn name(` stays a declaration). A
+/// bare `fn(){}` expression statement, and a `fn name(){}` declaration alongside,
+/// must both still parse — the statement dispatcher branches on the token after `fn`.
+#[test]
+fn both_frontends_accept_anonymous_fn_expressions() {
+    both_accept("let f = fn() { return 5 }");
+    both_accept("let g = fn(x) { return x + 1 }");
+    both_accept("let r = recover(fn() { return 5 })");
+    both_accept("let xs = array.map([1,2,3], fn(x) { return x * 2 })");
+    both_accept("let v = (fn() { return 7 })()");
+    // typed / defaulted / rest params — same surface arrows already support.
+    both_accept("let a = fn(x: int, y = 2) { return x + y }");
+    both_accept("let b = fn(...xs: array<int>) { return len(xs) }");
+    // bare expression statement (the closure is discarded — useless but valid).
+    both_accept("fn() { return 1 }");
+    // disambiguation: `fn name(` is STILL a declaration, not an expression.
+    both_accept("fn named() { return 1 }\nlet h = fn() { return 2 }");
+    // async anonymous fn expression.
+    both_accept("let p = recover(async fn() { return 1 })");
+}
+
 /// `static` is a member modifier on `fn` / `async fn` / `fn*` inside a class
 /// body — both front-ends must accept it (SP1 Phase C).
 #[test]
