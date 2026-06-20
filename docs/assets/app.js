@@ -30,6 +30,7 @@ const NAV = [
   ]},
   { title: 'Specification', items: [
     ['spec/intro', 'Notation & conformance'],
+    ['spec/lexical', 'Lexical structure'],
   ]},
   { title: 'Standard library', items: [
     ['stdlib/overview', 'Overview'],
