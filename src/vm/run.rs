@@ -6394,6 +6394,21 @@ impl Vm {
                                 }
                                 Rc::new(RefCell::new(m))
                             }
+                            // EMBED §6.3: a `host:<name>` module — the SAME
+                            // `load_host_module` the tree-walker reaches (via `import_host`),
+                            // materialized into the ordered export map exactly like `Std`.
+                            // A miss is the byte-identical recoverable panic.
+                            crate::interp::SpecifierKind::Host(name) => {
+                                let entry = self.interp.import_host(&name)?;
+                                let mut m = indexmap::IndexMap::new();
+                                for name in entry.exports.borrow().iter() {
+                                    m.insert(
+                                        name.clone(),
+                                        entry.env.get(name).unwrap_or(Value::nil()),
+                                    );
+                                }
+                                Rc::new(RefCell::new(m))
+                            }
                             crate::interp::SpecifierKind::Relative(_) => {
                                 self.load_file_module(&source, fault_ip, fiber).await?
                             }

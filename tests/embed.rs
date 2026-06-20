@@ -637,3 +637,73 @@ fn host_module_valid_registration_builds() {
         .expect("build with a host module");
     drop(iso);
 }
+
+// ── Task 3.2: host: imports + dispatch (both tiers) + the miss panic ────────
+
+#[test]
+fn host_module_import_and_call_both_tiers() {
+    let iso = Isolate::builder()
+        .output(ascript::embed::OutputMode::Capture)
+        .host_module("host:app", |m: &mut HMB| {
+            m.value("version", AsValue::from("1.0"));
+            m.func("double", |_c, a| Ok(AsValue::from(a[0].as_int().unwrap_or(0) * 2)));
+            m.func("boom", |_c, _a| Err(HE::Panic("bad call".into())));
+            m.fallible_func("lookup", |_c, a| match a[0].as_str() {
+                Some("k") => Ok(AsValue::from(42i64)),
+                _ => Err(HE::Recoverable("no such key".into())),
+            });
+        })
+        .unwrap()
+        .build()
+        .unwrap();
+    let r = iso.eval(
+        r#"
+        import * as app from "host:app"
+        print(app.version, app.double(21))
+        let [v, e1] = app.lookup("k")
+        let [n, e2] = app.lookup("x")
+        let [r, e3] = recover(() => app.boom())
+        print(v, e1 == nil, n, e2.message, e3.message)
+    "#,
+    );
+    assert!(r.is_ok(), "host program ran: {r:?}");
+    let out = iso.take_output();
+    assert_eq!(out, "1.0 42\n42 true nil no such key bad call\n", "got: {out:?}");
+}
+
+#[test]
+fn unregistered_host_module_is_a_clean_recoverable_panic() {
+    let iso = Isolate::builder()
+        .output(ascript::embed::OutputMode::Capture)
+        .build()
+        .unwrap();
+    // Top-level import of an unregistered host module → Tier-2 panic, EXACT §6.3 message.
+    let e = iso.eval("import * as app from \"host:nope\"\n").unwrap_err();
+    match e {
+        EmbedError::Panic(p) => assert!(
+            p.message
+                .contains("host module 'host:nope' is not registered in this isolate"),
+            "exact §6.3 miss message; got: {}",
+            p.message
+        ),
+        other => panic!("expected Panic, got {other:?}"),
+    }
+    // The miss is a RECOVERABLE Tier-2 panic — the isolate session survives it (the
+    // per-eval fiber is discarded; globals persist), so a later eval still works.
+    assert_eq!(iso.eval("1 + 1").unwrap().as_int(), Some(2), "session survives the miss");
+
+    // A host fn miss INSIDE a registered module surfaces a recoverable panic that
+    // `recover` catches in-script (the dispatch-level miss, distinct from the import miss).
+    let iso2 = Isolate::builder()
+        .output(ascript::embed::OutputMode::Capture)
+        .host_module("host:app", |m: &mut HMB| {
+            m.func("boom", |_c, _a| Err(HE::Panic("kaboom".into())));
+        })
+        .unwrap()
+        .build()
+        .unwrap();
+    iso2.eval("import * as app from \"host:app\"").unwrap();
+    iso2.eval("let [v, err] = recover(() => app.boom())\nprint(err.message)")
+        .unwrap();
+    assert_eq!(iso2.take_output(), "kaboom\n");
+}

@@ -700,3 +700,136 @@ fn map_outcome(outcome: Result<RunOutcome, Control>) -> Result<AsValue, EmbedErr
         Err(Control::Exit(code)) => Err(EmbedError::Exit(code)),
     }
 }
+
+#[cfg(test)]
+mod engine_parity {
+    //! EMBED §6.3 / §11 — the LOAD-BEARING engine-parity test: the SAME host-module
+    //! program runs on the tree-walker (a raw `Interp` + the crate-internal
+    //! `register_host_module` + `exec_program`) AND via the VM (an `Isolate`), asserting
+    //! BYTE-IDENTICAL captured output — including the registry-miss panic message. This
+    //! proves four-mode byte-identity for the `host:` surface (the import + dispatch arms
+    //! live on the shared `Interp`, so both engines reach the same loader + dispatch).
+    use super::*;
+    use crate::embed::host::HostModuleBuilder;
+
+    /// Build the shared `host:app` `HostModuleDef` both engines register.
+    fn app_def() -> crate::interp::HostModuleDef {
+        let mut b = HostModuleBuilder::new();
+        b.value("version", AsValue::from("1.0"));
+        b.func("double", |_c, a| {
+            Ok(AsValue::from(a[0].as_int().unwrap_or(0) * 2))
+        });
+        b.fallible_func("lookup", |_c, a| match a[0].as_str() {
+            Some("k") => Ok(AsValue::from(42i64)),
+            _ => Err(HostError::Recoverable("no such key".into())),
+        });
+        b.finish()
+    }
+
+    const PROG: &str = r#"
+import * as app from "host:app"
+print(app.version, app.double(21))
+let [v, e1] = app.lookup("k")
+let [n, e2] = app.lookup("x")
+print(v, e1 == nil, n, e2.message)
+"#;
+
+    /// Run `src` on the TREE-WALKER against a raw capture-mode `Interp` with `host:app`
+    /// registered. Returns the captured output (or the error message on a panic).
+    async fn tree_walker_run(src: &str) -> String {
+        let interp = Rc::new(Interp::new());
+        interp.install_self();
+        interp.register_host_module("host:app", app_def()).unwrap();
+        interp.set_worker_source(src);
+        let tokens = crate::lexer::lex(src).expect("lex");
+        let program = crate::parser::parse(&tokens).expect("parse");
+        let env = crate::interp::global_env().child();
+        let local = tokio::task::LocalSet::new();
+        let result = local
+            .run_until(ambient_root_scope(interp.exec_program(&program, &env)))
+            .await;
+        match result {
+            Ok(_) | Err(Control::Propagate(_)) => interp.output(),
+            Err(Control::Panic(e)) => e.message,
+            Err(Control::Exit(_)) => interp.output(),
+        }
+    }
+
+    /// Run `src` via the VM through an `Isolate` (capture). Returns captured output,
+    /// or the panic message — mirroring `tree_walker_run`'s shaping.
+    fn vm_run(src: &str) -> String {
+        let iso = Isolate::builder()
+            .output(OutputMode::Capture)
+            .host_module("host:app", |m: &mut HostModuleBuilder| {
+                m.value("version", AsValue::from("1.0"));
+                m.func("double", |_c, a| {
+                    Ok(AsValue::from(a[0].as_int().unwrap_or(0) * 2))
+                });
+                m.fallible_func("lookup", |_c, a| match a[0].as_str() {
+                    Some("k") => Ok(AsValue::from(42i64)),
+                    _ => Err(HostError::Recoverable("no such key".into())),
+                });
+            })
+            .unwrap()
+            .build()
+            .unwrap();
+        match iso.eval(src) {
+            Ok(_) => iso.take_output(),
+            Err(EmbedError::Panic(p)) => p.message,
+            Err(other) => format!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn host_module_program_is_byte_identical_across_engines() {
+        // The VM side blocks on its own owned runtime; the tree-walker side needs a
+        // current-thread runtime to drive its LocalSet. Run the VM side first (it owns
+        // its runtime), then the tree-walker side under a fresh runtime.
+        let vm_out = vm_run(PROG);
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let tw_out = rt.block_on(tree_walker_run(PROG));
+        assert_eq!(vm_out, tw_out, "tree-walker == VM for the host program");
+        assert_eq!(vm_out, "1.0 42\n42 true nil no such key\n");
+    }
+
+    #[test]
+    fn host_miss_panic_message_is_byte_identical_across_engines() {
+        // A NON-registered module on each engine raises the SAME miss message. Use a raw
+        // tree-walker interp with NO registration vs an Isolate with NO host module.
+        const MISS: &str = "import * as a from \"host:nope\"\n";
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        // Tree-walker: no registration → the miss message.
+        let tw = rt.block_on(async {
+            let interp = Rc::new(Interp::new());
+            interp.install_self();
+            interp.set_worker_source(MISS);
+            let tokens = crate::lexer::lex(MISS).unwrap();
+            let program = crate::parser::parse(&tokens).unwrap();
+            let env = crate::interp::global_env().child();
+            let local = tokio::task::LocalSet::new();
+            match local
+                .run_until(ambient_root_scope(interp.exec_program(&program, &env)))
+                .await
+            {
+                Err(Control::Panic(e)) => e.message,
+                other => format!("expected panic, got {other:?}"),
+            }
+        });
+        let iso = Isolate::builder().output(OutputMode::Capture).build().unwrap();
+        let vm = match iso.eval(MISS) {
+            Err(EmbedError::Panic(p)) => p.message,
+            other => format!("expected panic, got {other:?}"),
+        };
+        assert_eq!(tw, vm, "miss panic message identical across engines");
+        assert_eq!(
+            vm,
+            "host module 'host:nope' is not registered in this isolate"
+        );
+    }
+}

@@ -786,7 +786,71 @@ impl Interp {
             },
             #[cfg(feature = "blob")]
             "blob" => self.call_blob(func, args, span).await,
+            // EMBED §6.3: host-fn dispatch rides the PREVIOUSLY-ERROR fall-through arm —
+            // zero hot-path cost (the prefix test only runs when the module is otherwise
+            // unknown). `required_cap` already returns NONE for a `host:` string, so a
+            // host fn is un-capability-gated by design (the host's own trusted code).
+            m if m.starts_with("host:") => self.call_host_fn(m, func, args, span).await,
             _ => Err(AsError::at(format!("unknown stdlib module '{}'", module), span).into()),
+        }
+    }
+
+    /// EMBED §6.3: invoke a registered host function. Clones the `Rc<dyn Fn>` OUT of the
+    /// registry borrow BEFORE invoking (the standing borrow rule; the host fn is sync, no
+    /// await under a borrow). Maps the result per the §6.2 tier table:
+    ///   - `Ok(v)` → `v`.
+    ///   - `func` (non-fallible) + `Err(recoverable)` → upgraded to a Tier-2 recoverable
+    ///     panic (a plain fn has no err channel).
+    ///   - `fallible_func` + `Err(recoverable)` → the Tier-1 `[nil, {message}]` pair.
+    ///   - `Err(panic)` (either form) → a Tier-2 recoverable panic.
+    ///
+    /// A miss (the function name is not on the registered module) is a Tier-2 panic — the
+    /// import would already have failed for an UNregistered module, so this only fires for
+    /// a bad function name on a registered module.
+    pub(crate) async fn call_host_fn(
+        &self,
+        module: &str,
+        func: &str,
+        args: &[Value],
+        span: Span,
+    ) -> Result<Value, Control> {
+        // Clone the fn handle + tier OUT of the registry borrow before invoking.
+        let (f, fallible) = {
+            let Some(def) = self.host_module(module) else {
+                return Err(AsError::at(
+                    format!("host module '{module}' is not registered in this isolate"),
+                    span,
+                )
+                .into());
+            };
+            match def.fns.get(func) {
+                Some(entry) => (entry.f.clone(), entry.fallible),
+                None => {
+                    return Err(AsError::at(
+                        format!("host module '{module}' has no function '{func}'"),
+                        span,
+                    )
+                    .into());
+                }
+            }
+        };
+        // The output sink hook handed to the host fn (the `print`-equivalent).
+        let out = |s: &str| self.push_output(s);
+        let ctx = crate::interp::HostCallCtx { span, out: &out };
+        match f(&ctx, args) {
+            Ok(v) if fallible => Ok(crate::interp::make_pair(v, Value::nil())),
+            Ok(v) => Ok(v),
+            Err(e) if e.recoverable && fallible => {
+                // Tier-1: the `[nil, {message}]` pair.
+                Ok(crate::interp::make_pair(
+                    Value::nil(),
+                    crate::interp::make_error(Value::str(e.message)),
+                ))
+            }
+            // A plain `func` with a recoverable error → upgraded to Tier-2; an explicit
+            // `Panic` (either form) → Tier-2. Both are recoverable panics (catchable by
+            // `recover`).
+            Err(e) => Err(AsError::at(e.message, span).into()),
         }
     }
 

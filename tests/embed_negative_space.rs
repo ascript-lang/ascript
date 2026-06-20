@@ -69,32 +69,32 @@ async fn pin_user_global_read_and_call_value() {
     assert_eq!(v.as_int(), Some(7), "user-global fn reads back and is callable");
 }
 
-/// `classify_specifier("host:app")` TODAY classifies as a bare package
-/// (`SpecifierKind::UnknownPackage`) because nothing yet claims the `host:` prefix —
-/// it is not `std/`, not relative, and no installed package is named `host:app`.
+/// EMBED §6.1 (FLIPPED in Task 3.2): `classify_specifier("host:app")` now classifies
+/// as `SpecifierKind::Host` (checked before package classification — a package key can
+/// never carry a `:`, so the reservation is structural). On a NON-embed CLI run no host
+/// module is registered, so importing `"host:app"` raises the host-specific MISS panic
+/// `host module 'host:app' is not registered in this isolate` (recoverable) — NOT the
+/// old `unknown package 'host:app'` tail.
 ///
-/// `classify_specifier` is `pub(crate)`, so this pin observes the classification
-/// through its OBSERVABLE end-to-end consequence: importing `"host:app"` raises the
-/// `UnknownPackage` runtime error `unknown package 'host:app' — add it with 'ascript
-/// add'` (the exact tail `import` produces for an `UnknownPackage` specifier).
-///
-/// EMBED Task 3.2 (a LATER unit, NOT in scope for Unit A — the facade core) flips
-/// this to a `SpecifierKind::Host` arm checked first, after which a registered
-/// `host:app` imports cleanly and an UNregistered one raises the host-specific
-/// `host module 'host:app' is not registered in this isolate` miss instead. Pinning
-/// today's `UnknownPackage` behavior makes that flip failing-test-first.
+/// This was the Phase-0 `UnknownPackage` pin; Task 3.2 flipped it failing-test-first.
 #[tokio::test]
-async fn pin_host_specifier_is_currently_unknown_package() {
+async fn pin_host_specifier_classifies_as_host() {
     // `vm_run_source` runs the source on the VM and returns captured output; a
-    // top-level import of an unregistered specifier is a Tier-2 panic surfaced as an
-    // `Err(AsError)`.
+    // top-level import of an UNregistered host module is a Tier-2 panic (recoverable)
+    // surfaced as an `Err(AsError)`.
     let err = ascript::vm_run_source("import * as app from \"host:app\"\n")
         .await
-        .expect_err("importing host:app must error today (UnknownPackage)");
+        .expect_err("importing an unregistered host:app must raise the miss panic");
     assert!(
         err.message
-            .contains("unknown package 'host:app'"),
-        "host:app classifies as UnknownPackage today (Task 3.2 flips it to Host); got: {}",
+            .contains("host module 'host:app' is not registered in this isolate"),
+        "host:app must classify as Host and raise the registry-miss panic; got: {}",
+        err.message
+    );
+    // It must NOT be the old UnknownPackage tail.
+    assert!(
+        !err.message.contains("unknown package"),
+        "host: no longer routes through UnknownPackage; got: {}",
         err.message
     );
 }

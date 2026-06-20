@@ -770,6 +770,11 @@ pub enum SpecifierKind {
     /// A bare package specifier whose first segment is NOT in the resolved set →
     /// a Tier-2 "unknown package" error (identical message on both engines).
     UnknownPackage(String),
+    /// EMBED §6.1: a `host:<name>` specifier — a host module registered on this
+    /// isolate (or a clean miss panic if not). Carries the FULL `host:<name>` key.
+    /// Checked in `classify_specifier` (the `:` can never appear in a package key, so
+    /// the reservation is structural).
+    Host(String),
 }
 
 /// All mutable interpreter state lives behind interior mutability (`RefCell`/
@@ -3637,6 +3642,50 @@ impl Interp {
         Ok(entry)
     }
 
+    /// EMBED §6.3: resolve a `host:<name>` module to a cached `ModuleEntry`, mirroring
+    /// [`Self::load_std_module`]. The module's `values` bind directly; each host fn
+    /// binds as a `Value::Builtin("host:<name>.<fname>")` (so the builtin dispatch's
+    /// `split_once('.')` → `call_stdlib("host:<name>", "<fname>")` → the host fall-through
+    /// arm). A miss (the module was not registered on THIS isolate — the CLI/worker case)
+    /// is a clean recoverable Tier-2 panic. The miss MESSAGE differs in a worker isolate
+    /// (§6.4) to point at `host_module_factory`. Both engines reach THIS one loader.
+    fn load_host_module(&self, source: &str) -> Result<ModuleEntry, Control> {
+        let key = PathBuf::from(format!("<host>/{source}"));
+        if let Some(entry) = self.modules.borrow().get(&key) {
+            return Ok(entry.clone());
+        }
+        let def = self.host_module(source).ok_or_else(|| {
+            // §6.4: a worker isolate that did not receive a factory for this module
+            // gets the worker-specific message pointing at `host_module_factory`.
+            let msg = if crate::worker::pool::in_isolate() {
+                format!(
+                    "host module '{source}' is not available in a worker isolate \
+                     (register it with host_module_factory to install it per-isolate)"
+                )
+            } else {
+                format!("host module '{source}' is not registered in this isolate")
+            };
+            Control::Panic(AsError::new(msg))
+        })?;
+        // Child of the global env so a host export whose name collides with a global
+        // builtin shadows it (the same rule as std modules).
+        let env = global_env().child();
+        let exports = Rc::new(RefCell::new(HashSet::new()));
+        for (name, value) in &def.values {
+            env.define(name, value.clone(), false).map_err(AsError::new)?;
+            exports.borrow_mut().insert(name.clone());
+        }
+        for fname in def.fns.keys() {
+            let qualified = format!("{source}.{fname}");
+            env.define(fname, Value::builtin(qualified.as_str()), false)
+                .map_err(AsError::new)?;
+            exports.borrow_mut().insert(fname.clone());
+        }
+        let entry = ModuleEntry { env, exports };
+        self.modules.borrow_mut().insert(key, entry.clone());
+        Ok(entry)
+    }
+
     fn resolve_import(&self, source: &str) -> PathBuf {
         let mut p = self.module_dir.borrow().join(source);
         if p.extension().is_none() {
@@ -3730,6 +3779,14 @@ impl Interp {
         if source.starts_with("std/") {
             return SpecifierKind::Std;
         }
+        // EMBED §6.1: the `host:` scheme. Placed AFTER the `std/` check (the common
+        // hot path stays first; `std/` can never start with `host:`), but BEFORE the
+        // package classification — a package key can never carry a `:`, so checking
+        // `host:` here makes the namespace reservation STRUCTURAL (no installed package
+        // can ever shadow a `host:` specifier).
+        if source.starts_with("host:") {
+            return SpecifierKind::Host(source.to_string());
+        }
         if source.starts_with("./")
             || source.starts_with("../")
             || Path::new(source).is_absolute()
@@ -3770,6 +3827,13 @@ impl Interp {
     /// never reach here.
     pub(crate) fn import_std(&self, source: &str) -> Result<ModuleEntry, Control> {
         self.load_std_module(source)
+    }
+
+    /// EMBED §6.3: the VM `Op::Import` host-module loader — the SAME `load_host_module`
+    /// the tree-walker's `Stmt::Import` arm uses, so the two engines bind byte-identical
+    /// exports and raise the byte-identical miss panic.
+    pub(crate) fn import_host(&self, source: &str) -> Result<ModuleEntry, Control> {
+        self.load_host_module(source)
     }
 
     #[async_recursion(?Send)]
@@ -4282,6 +4346,9 @@ impl Interp {
                 // borrow is never held across the loader `.await`.
                 let entry = match self.classify_specifier(source) {
                     SpecifierKind::Std => self.load_std_module(source)?,
+                    // EMBED §6.3: a `host:<name>` module registered on this isolate (or a
+                    // clean miss panic). The SAME `load_host_module` the VM reaches.
+                    SpecifierKind::Host(name) => self.load_host_module(&name)?,
                     SpecifierKind::Relative(resolved) => self.load_module(&resolved).await?,
                     SpecifierKind::Package { target, .. } => self.load_module(&target).await?,
                     SpecifierKind::UnknownPackage(key) => {

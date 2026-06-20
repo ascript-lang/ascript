@@ -2454,6 +2454,8 @@ pub fn compile_archive_with_shake(
                 crate::interp::SpecifierKind::Std => {
                     // Native stdlib — linked in, never archived (no shake edge).
                 }
+                // EMBED §6.3: a `host:` module is runtime-registered, never archived.
+                crate::interp::SpecifierKind::Host(_) => {}
                 kind @ (crate::interp::SpecifierKind::Relative(_)
                 | crate::interp::SpecifierKind::Package { .. }) => {
                     let target = match &kind {
@@ -2672,6 +2674,8 @@ pub fn compile_path_module_set(
             interp.set_module_dir(this_disk_dir.clone());
             match interp.classify_specifier(source) {
                 SpecifierKind::Std => {}
+                // EMBED §6.3: a `host:` module is runtime-registered, never archived.
+                SpecifierKind::Host(_) => {}
                 kind @ (SpecifierKind::Relative(_) | SpecifierKind::Package { .. }) => {
                     let target = match &kind {
                         SpecifierKind::Relative(t) => t.clone(),
@@ -4405,6 +4409,8 @@ fn rebind_archive_module_paths_to_runtime(
             interp.set_module_dir(item.module_dir.clone());
             match interp.classify_specifier(spec) {
                 SpecifierKind::Std => {}
+                // EMBED §6.3: a `host:` module is runtime-registered, never archived.
+                SpecifierKind::Host(_) => {}
                 kind @ (SpecifierKind::Relative(_) | SpecifierKind::Package { .. }) => {
                     // The loader EMBEDS `module_dir.join(spec).with_extension("as")`.
                     let requested = item.module_dir.join(spec);

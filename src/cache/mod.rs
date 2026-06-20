@@ -119,6 +119,9 @@ pub fn collect_module_graph(entry: &Path) -> Result<Vec<GraphModule>, AsError> {
                 SpecifierKind::Std => {
                     // Native stdlib — linked in, never a file on disk.
                 }
+                // EMBED §6.3: a `host:` module is registered at runtime on the isolate,
+                // never a file on disk — nothing to follow in the module graph (like Std).
+                SpecifierKind::Host(_) => {}
                 kind @ (SpecifierKind::Relative(_) | SpecifierKind::Package { .. }) => {
                     let target = match &kind {
                         SpecifierKind::Relative(t) => t.clone(),
