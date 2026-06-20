@@ -66,8 +66,10 @@ and register the adapter (in an extension or your settings) as
 ### Replay debugging (time travel)
 
 Record a run, then debug the recorded trace with **backward stepping** — the campaign's
-flagship. Capture a trace with `ascript run --record crash.trace app.as` (or let
-`ascript test --record` capture a failing test), then:
+flagship. For the full record/replay model (the deterministic-mode contract, what gets
+recorded vs refused, and the trace format) see [Record & replay](record-replay). Capture a
+trace with `ascript run --record crash.trace app.as` (or let `ascript test --record` capture a
+failing test), then:
 
 ```text
 ascript dap --replay crash.trace          # editor-driven

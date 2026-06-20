@@ -771,6 +771,62 @@ The `pkg::cache::cache_root` duplication was hoisted to the single canonical lib
   requires the maintainer to regenerate it (`rt-manifest-gen --genkey`), recompile the pubkey
   into `PRODUCTION_PUBKEY`, and set the CI secret.
 
+## REPLAY — record/replay as a user-facing flagship ✅ DONE (merge SHA at Task 12)
+
+Spec `superpowers/specs/2026-06-12-record-replay-design.md`, plan
+`superpowers/plans/2026-06-12-record-replay.md`. Both engines; **no grammar/`Value`/opcode change,
+`ASO_FORMAT_VERSION` 29 unchanged, `vm_differential` flag-gated-untouched** (INERT by default). Turns the
+shipped-but-INERT SP9 determinism plumbing (`src/det.rs` Record/Replay, virtual clock, seeded RNG, FFI replay;
+workflow event-sourced replay) into a headline feature: `ascript run --record/--replay/--seed`,
+`ascript test --record/--replay` (failed tests auto-save a trace under `.ascript-traces/`), and DAP time-travel.
+
+- **The chokepoint hook + `Cell` gate.** A trace hook in `Interp::call_stdlib` immediately after the caps gate,
+  guarded by a `trace_active()` `Cell<bool>` snapshot mirroring `all_granted()` — one predictably-not-taken
+  branch, no `RefCell` borrow when off (zero-cost Gate 12/17; `dbg_zero_cost_gate` 0.969×).
+- **The classification table + completeness test.** `replay_class -> ReplayClass{Seamed|Recorded|Refused|
+  Harmless}`, central + complete like `required_cap`, enforced by `classification_is_complete` (a fabricated
+  module fails, sabotage-verified). Finalized in Task 9 (two reclasses: `time.interval`/`debounce`/`throttle`
+  → Refused; `archive.{tarExtractTo,zipExtractTo,tarCreateFromDir}` → Recorded).
+- **Airlock outcomes, NOT JSON.** `DetEvent::StdlibCall`/`NativeCall` carry worker-airlock-encoded
+  `TraceOutcome::{Value|Handle|Panic|Propagate}` — exact `Value` fidelity incl. NUM Int/Float (a JSON `5`/`5.0`
+  collapse would be an observable replay divergence); a non-sendable / `Shared`-carrying recorded result is a
+  loud record-time refusal.
+- **HttpResponse-only handle virtualization (the single v1 handle case).** Record assigns a trace-scoped `vid`
+  + captures the handle `fields` and each `resp.text()`/`json()`/`bytes()` accessor; replay mints a
+  `ResourceState::ReplayVirtual{vid}`. Streaming bodies / SSE / cancelToken / ws refused at the option parse.
+- **Strict CliTrace vs lenient Workflow origins.** `Origin{Workflow|CliTrace}` + `strict` on
+  `DeterminismContext` — Workflow contexts bit-for-bit unchanged (best-effort crash-point semantics); CliTrace
+  replay is strict (loud indexed divergence error, never a silent wrong replay). The stdlib hook fires only for
+  CliTrace, so the workflow module + suite are untouched.
+- **Worker refusal.** Any isolate-creating op under `Origin::CliTrace` (pooled `worker fn`, `spawn()` actor,
+  `worker fn*` stream, `run_in_worker`, `task.pmap`/`preduce`, `test --record --parallel`) is a clean Tier-2
+  refusal — per-`Interp` contexts have no cross-airlock identity.
+- **The `ASTRC` trace format + fuzz target.** New core `src/trace.rs` (no serde, builds under
+  `--no-default-features`): magic `ASTRC`, `TRACE_FORMAT_VERSION = 1`, length-prefixed, crc-framed, hostile-safe
+  reader (clean Tier-1 on bad crc / truncation / unknown kind / newer version, never a panic/OOM);
+  `fuzz/fuzz_targets/trace_roundtrip.rs` mirrors `aso_roundtrip`. Replay verifies version + crc + source-sha256
+  digest; flushed at program end incl. panic/`exit(n)`, atomic temp+rename.
+- **DAP stepBack-by-re-execution (the flagship).** `supportsStepBack` advertised only with `--replay`;
+  `stepBack`/`reverseContinue` by deterministic re-execution (rr model — no checkpointing): navigation log,
+  teardown + respawn + re-run prefix to the target stop. Honest O(stops × prefix); replay does no I/O so the
+  prefix re-executes at full VM speed. `evaluate` of a Recorded fn in a replay session is refused.
+- **The §0.5 bare-sleep fix** (Gate-14, failing-test-first): bare `time.sleep` under Replay now CONSUMES the
+  recorded `TimerSet` at the cursor (mirroring `ctx.sleep`) instead of appending a fresh one.
+- **Bench** (`bench/REPLAY_RESULTS.md`): plain→record `sleep_heavy` **56.0×** (real sleeps become virtual the
+  moment a det context installs); `proc_heavy` replay skips fork/exec; record≈replay parity is the
+  byte-invisibility proof; spec/tw geomean 3.78× ≥ 2×. Examples `examples/{record_replay,advanced/replay_repro}.as`
+  (four-mode in-corpus); docs `docs/content/tooling/record-replay.md` (+ NAV).
+- **Recorded v2 follow-ups (none silent, owner-noted):** (1) **streaming/SSE/WS + general handle
+  virtualization** — `HttpBody`/SSE/ws/sockets/`process.spawn`/server accept loops; the shipped `vid` +
+  `NativeCall` machinery and the `ActorCall`/`GeneratorYield` events are the design seeds. (2) **per-isolate
+  worker traces** — one trace per isolate with spawn-bound child traces (workers refused at record in v1).
+  (3) **replay checkpointing** — periodic snapshots to make DAP backsteps O(1) instead of re-executing the
+  prefix. (4) **task-identity-tagged events** — pinning concurrent interleavings beyond the current
+  loud-divergence detection (the SP9 §3.6 scheduling residual). (5) **a first-class `--deterministic --seed N`
+  alias** (`run --record /dev/null --seed N` already delivers the seam). (6) **the `--inspect --record`,
+  `--profile --record`, and `--watch --record` matrices** — each refused cleanly in v1 (untested compositions),
+  plus REPL recording.
+
 ## SIG — stdlib signature table + LSP enrichment + audit hardening ✅ MERGED
 
 Spec `superpowers/specs/2026-06-12-lsp-stdlib-signatures-design.md`, plan
