@@ -88,6 +88,22 @@ pub enum Command {
         /// never cached regardless of this flag.
         #[arg(long = "no-cache")]
         no_cache: bool,
+        /// REPLAY §4.1: record this run's non-deterministic effects (clock/RNG/uuid/fs/
+        /// env/process.run/DNS/buffered-http/workflow.run) to <FILE> as a replayable
+        /// trace. The run executes in deterministic mode (virtual clock, instant sleeps,
+        /// seeded RNG); the trace is written even if the program panics or exits non-zero.
+        /// Bypasses the compile cache. Composes with `--tree-walker` and `.aso`.
+        #[arg(long = "record", value_name = "FILE", conflicts_with = "replay")]
+        record: Option<String>,
+        /// REPLAY §4.1: replay a previously recorded <FILE>, reproducing the run's exact
+        /// effects with NO real I/O (strict divergence detection). Pass the same program
+        /// file; a source change since recording is a clean error. Bypasses the cache.
+        #[arg(long = "replay", value_name = "FILE")]
+        replay: Option<String>,
+        /// REPLAY §4.1: pin the RNG seed for `--record` (default: OS entropy). The same
+        /// program + seed records an identical event stream.
+        #[arg(long = "seed", value_name = "N", requires = "record")]
+        seed: Option<u64>,
         file: String,
         /// Trailing arguments forwarded to the script as `env.args()`.
         /// Hyphen-prefixed values (e.g. `--flag`) are also captured.

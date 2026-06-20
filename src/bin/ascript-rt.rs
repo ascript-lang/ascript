@@ -57,7 +57,7 @@ async fn rt_main() -> ExitCode {
         // at launch (the same as a bundled launch — applied inside `run_verified_*`).
         [path] if !path.starts_with("--") => {
             let p = std::path::Path::new(path);
-            match ascript::run_aso_file(p, &[], None).await {
+            match ascript::run_aso_file(p, &[], None, ascript::TraceMode::Off).await {
                 Ok(code) => ExitCode::from(code as u8),
                 Err(e) => {
                     ascript::diagnostics::report(&e);

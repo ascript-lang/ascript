@@ -61,6 +61,16 @@ missing lock, or integrity mismatch. For CI and air-gapped environments. See [Pa
 | `--no-elide` | Force contract elision **off** (the permanent kill switch; wins over `--elide`). Equivalent to `ASCRIPT_NO_ELIDE=1`. |
 | `--no-cache` | Bypass the **compile cache** for this run — always parse/resolve/compile from source. Equivalent to `ASCRIPT_NO_COMPILE_CACHE=1`. The cache only ever applies to the plain `.as`-on-the-VM path: `.aso`, `--tree-walker`, `--inspect`, `--profile`, and explicit `--elide` runs are never cached regardless of this flag. See [`ascript cache`](#ascript-cache). |
 
+### Record & replay flags
+
+Record a run's non-deterministic effects to a portable trace, then replay it deterministically — the same program reproduces byte-for-byte with **no real I/O** (the file fixture can be deleted, the network can be down).
+
+| Flag | Effect |
+|---|---|
+| `--record <FILE>` | Run in **deterministic mode** (virtual clock, instant sleeps, seeded RNG) and write a replayable trace to `<FILE>` — clock/RNG/UUID plus effectful results (`fs`, `env`, `process.run`, DNS, buffered `http`, `workflow.run`). The trace is written even if the program panics or exits non-zero (a failed run is the one worth replaying). Bypasses the compile cache; composes with `--tree-walker` and `.aso`. Sockets/servers/streams/workers are refused under a trace (v2). |
+| `--replay <FILE>` | Replay a previously recorded `<FILE>`, reproducing every effect from the trace with **no real I/O** (strict divergence detection). Pass the same program file; a source change since recording is a clean error (a `.as` is verified by source digest; a `.aso` runs without the digest check). A recorded trace replays byte-identically across engines (`--tree-walker`, the VM, `--no-specialize`, and `.aso`). |
+| `--seed <N>` | Pin the RNG seed for `--record` (default: OS entropy). The same program plus the same seed records an identical event stream. Requires `--record`. |
+
 ## `ascript build`
 
 Compile a `.as` program to a `.aso` bytecode file, then run the artifact with no compile step.

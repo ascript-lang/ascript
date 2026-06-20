@@ -362,6 +362,9 @@ async fn real_main() -> ExitCode {
             profile_hz,
             profile_format,
             no_cache,
+            record,
+            replay,
+            seed,
             file,
             args,
         } => {
@@ -379,6 +382,32 @@ async fn real_main() -> ExitCode {
                     return ExitCode::from(1);
                 }
             };
+            // REPLAY §4.1: resolve the record/replay mode (clap enforces
+            // `--record`/`--replay` mutual exclusion + `--seed` requires `--record`).
+            let trace_mode = match (record, replay) {
+                (Some(p), None) => ascript::TraceMode::Record {
+                    path: std::path::PathBuf::from(p),
+                    seed,
+                },
+                (None, Some(p)) => ascript::TraceMode::Replay {
+                    path: std::path::PathBuf::from(p),
+                },
+                _ => ascript::TraceMode::Off,
+            };
+            let tracing = !matches!(trace_mode, ascript::TraceMode::Off);
+            // REPLAY §4.1 composition rules (clean errors, not silent precedence):
+            // `--inspect --replay` routes to the DAP server (§5) — wired in a later task;
+            // `--inspect --record` / `--profile --record|--replay` are untested matrices (v2).
+            if inspect && tracing {
+                eprintln!(
+                    "error: --inspect with --record/--replay is not supported yet; for replay debugging use `ascript dap --replay <trace>`"
+                );
+                return ExitCode::from(1);
+            }
+            if profile.is_some() && tracing {
+                eprintln!("error: --profile cannot be combined with --record/--replay (v2)");
+                return ExitCode::from(1);
+            }
             // DBG: `--inspect` routes the program to the DAP server (break-on-entry,
             // editor-driven) instead of running it normally. Computed AFTER `compose_caps`
             // so the SAME capability set is enforced under the debugger (review F2 /
@@ -525,15 +554,19 @@ async fn real_main() -> ExitCode {
             // would compile DIFFERENT bytes, but `elide` is a v1-constant cache flag, so
             // routing an elided run through the cache would either stale-hit a non-elided
             // artifact or never hit. Cleanest: an explicit-elide run is uncached.
+            // REPLAY §4.1: record/replay never use the compile cache (the trace context is
+            // installed on a freshly-compiled run, like `--inspect`/`--profile`/`--elide`).
             let no_compile_cache = no_cache
                 || std::env::var("ASCRIPT_NO_COMPILE_CACHE").as_deref() == Ok("1")
-                || elide;
+                || elide
+                || tracing;
             let result = if is_aso {
-                ascript::run_aso_file(path, &args, caps).await
+                ascript::run_aso_file(path, &args, caps, trace_mode).await
             } else if use_tree_walker {
-                ascript::run_file_with_packages(path, &args, packages, caps, elide).await
+                ascript::run_file_with_packages(path, &args, packages, caps, elide, trace_mode).await
             } else if no_compile_cache {
-                ascript::run_file_on_vm_with_packages(path, &args, packages, caps, elide).await
+                ascript::run_file_on_vm_with_packages(path, &args, packages, caps, elide, trace_mode)
+                    .await
             } else {
                 ascript::run_file_on_vm_cached(path, &args, packages, caps, false).await
             };

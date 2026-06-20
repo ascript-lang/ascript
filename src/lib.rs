@@ -258,7 +258,181 @@ pub fn paranoid_enabled() -> bool {
 /// (only the script's own args — NOT the binary name or the file path).
 /// Pass `&[]` if the caller provides no trailing args.
 pub async fn run_file(path: &Path, script_args: &[String]) -> Result<i32, AsError> {
-    run_file_with_packages(path, script_args, None, None, ELIDE_DEFAULT_ON).await
+    run_file_with_packages(path, script_args, None, None, ELIDE_DEFAULT_ON, TraceMode::Off).await
+}
+
+// ===========================================================================
+// REPLAY §4.1 — `ascript run --record/--replay/--seed`
+// ===========================================================================
+
+/// REPLAY §4.1 — how a `run` invocation participates in record/replay. `Off` is the
+/// default and is byte-identical to a pre-REPLAY run (no determinism context is
+/// installed, no trace file is touched). `Record`/`Replay` install a `CliTrace`
+/// determinism context on the run's `Interp` before execution.
+#[derive(Debug, Clone, Default)]
+pub enum TraceMode {
+    /// No record/replay — today's plain run (byte-identical default).
+    #[default]
+    Off,
+    /// `--record <path> [--seed N]`: run in deterministic mode (virtual clock, instant
+    /// sleeps, seeded RNG), recording every seamed/effectful result, and write the trace
+    /// to `path` on completion, panic, OR exit (the always-flush rule).
+    Record {
+        path: std::path::PathBuf,
+        seed: Option<u64>,
+    },
+    /// `--replay <path>`: read + verify the trace, then reproduce the run with NO real
+    /// I/O — every effect returns its recorded value (strict divergence detection).
+    Replay { path: std::path::PathBuf },
+}
+
+/// REPLAY §4.1 — the bookkeeping a `Record` run needs to flush its trace after the run
+/// finishes: where to write it and the header identity fields fixed at install time.
+struct RecordCtl {
+    path: std::path::PathBuf,
+    seed: u64,
+    start_ms: f64,
+    source_sha256: [u8; 32],
+    program_path: String,
+    argv: Vec<String>,
+}
+
+/// sha256 of `bytes` — the REPLAY source-identity digest (header `source_sha256`).
+/// Uses the CORE `sha2` dep (non-optional; builds under `--no-default-features`).
+fn trace_sha256(bytes: &[u8]) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(bytes);
+    h.finalize().into()
+}
+
+/// A non-cryptographic OS-entropy `u64` for the default `--record` seed (when `--seed`
+/// is absent). It only needs to vary per run; the seed is stored in the trace header,
+/// so replay is fully reproducible regardless of how it was chosen.
+fn trace_entropy_seed() -> u64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0);
+    let stack = &nanos as *const u64 as u64;
+    nanos ^ stack.rotate_left(17) ^ 0x9E37_79B9_7F4A_7C15
+}
+
+/// REPLAY §4.1 — install the record/replay determinism context on `interp` BEFORE the
+/// run. `digest_bytes` is what the source-identity digest is taken over (the `.as`
+/// source text, or the `.aso`/archive bytes); `is_aso` skips the replay-side digest
+/// check (a compiled artifact has no source to rehash). Returns `Some(RecordCtl)` only
+/// for `Record` (so the caller flushes after the run); `Replay`/`Off` return `None`.
+/// All-synchronous — no borrow is held across an await (the caller installs before the
+/// run starts).
+fn trace_install(
+    interp: &crate::interp::Interp,
+    trace: &TraceMode,
+    digest_bytes: &[u8],
+    script_args: &[String],
+    program_path: &str,
+    is_aso: bool,
+) -> Result<Option<RecordCtl>, AsError> {
+    match trace {
+        TraceMode::Off => Ok(None),
+        TraceMode::Record { path, seed } => {
+            let seed = seed.unwrap_or_else(trace_entropy_seed);
+            // Seed-derived start so two `--record --seed N` runs produce IDENTICAL
+            // event streams (the `seed_pins_record` gate); the real wall clock is
+            // recorded separately as the header's informational `created_ms`.
+            let start_ms = crate::det::deterministic_start_ms(seed);
+            interp.set_determinism(Some(crate::det::DeterminismContext::record_trace(
+                seed, start_ms,
+            )));
+            Ok(Some(RecordCtl {
+                path: path.clone(),
+                seed,
+                start_ms,
+                source_sha256: trace_sha256(digest_bytes),
+                program_path: program_path.to_string(),
+                argv: script_args.to_vec(),
+            }))
+        }
+        TraceMode::Replay { path } => {
+            let bytes = std::fs::read(path).map_err(|e| {
+                AsError::new(format!("cannot read trace {}: {}", path.display(), e))
+            })?;
+            let (header, events) = crate::trace::read_trace(&bytes)
+                .map_err(|e| AsError::new(format!("cannot replay {}: {}", path.display(), e)))?;
+            // Source-identity check (§3): a `.as` whose source changed since recording
+            // would consume a shifted stream → confusing mid-run divergence. A `.aso`
+            // has no source to rehash, so the digest check is skipped there (v1).
+            if !is_aso && trace_sha256(digest_bytes) != header.source_sha256 {
+                return Err(AsError::new(
+                    "trace was recorded for a different program (source changed); re-record"
+                        .to_string(),
+                ));
+            }
+            // argv is taken FROM the trace; explicitly-passed args that differ are a
+            // clean error (not a silent override).
+            if !script_args.is_empty() && script_args != header.argv.as_slice() {
+                return Err(AsError::new(
+                    "replay args differ from the recorded argv (omit them — the trace carries the args)"
+                        .to_string(),
+                ));
+            }
+            interp.set_cli_args(&header.argv);
+            interp.set_determinism(Some(crate::det::DeterminismContext::replay_trace(
+                header.seed,
+                header.start_ms,
+                events,
+            )));
+            Ok(None)
+        }
+    }
+}
+
+/// REPLAY §4.1 — flush a `Record` run's trace AFTER the run finishes. Takes the
+/// determinism context out of `interp` (so its recorded `events` can be written) and
+/// writes the `ASCRIPTA`-sibling `ASTRC` trace atomically. Called on EVERY exit path
+/// (normal / panic / exit) so a failed run — precisely the one worth replaying — still
+/// yields a trace. All-synchronous (no borrow across await).
+fn trace_flush(interp: &crate::interp::Interp, ctl: RecordCtl) -> Result<(), AsError> {
+    let events = interp
+        .set_determinism(None)
+        .map(|ctx| ctx.events)
+        .unwrap_or_default();
+    let header = crate::trace::TraceHeader {
+        seed: ctl.seed,
+        start_ms: ctl.start_ms,
+        kind: crate::trace::TraceKind::Run,
+        program_path: ctl.program_path,
+        source_sha256: ctl.source_sha256,
+        argv: ctl.argv,
+        test_name: None,
+        filter: None,
+        created_ms: crate::interp::real_now_ms(),
+        engine: 0,
+    };
+    crate::trace::write_trace(&ctl.path, &header, &events)
+}
+
+/// REPLAY §4.1 — fold a `Record` flush into a finished run's result with always-flush
+/// semantics: the trace is written whether the run succeeded, panicked, or exited. On a
+/// successful run a flush error surfaces; on a failed run the original error wins and
+/// the flush is best-effort (its events were already recorded).
+fn trace_finish(
+    interp: &crate::interp::Interp,
+    ctl: Option<RecordCtl>,
+    result: Result<i32, AsError>,
+) -> Result<i32, AsError> {
+    match (result, ctl) {
+        (r, None) => r,
+        (Ok(code), Some(ctl)) => {
+            trace_flush(interp, ctl)?;
+            Ok(code)
+        }
+        (Err(e), Some(ctl)) => {
+            let _ = trace_flush(interp, ctl);
+            Err(e)
+        }
+    }
 }
 
 #[cfg(not(ascript_rt))]
@@ -272,6 +446,7 @@ pub async fn run_file_with_packages(
     packages: Option<crate::interp::PackageMap>,
     caps: Option<crate::stdlib::caps::CapSet>,
     elide: bool,
+    trace: TraceMode,
 ) -> Result<i32, AsError> {
     // CLI `run` streams `print` output live to stdout (so it appears immediately
     // and survives a later panic). Under `Live` there is no captured string, so
@@ -303,6 +478,16 @@ pub async fn run_file_with_packages(
         }
     }
     interp.install_self();
+    // REPLAY §4.1: install the record/replay determinism context before the run. The
+    // digest is taken over the `.as` source text (read only when tracing — Off skips it,
+    // byte-identical). `is_aso = false` (this is the source tree-walker path).
+    let trace_ctl = {
+        let digest = match &trace {
+            TraceMode::Off => Vec::new(),
+            _ => std::fs::read(path).unwrap_or_default(),
+        };
+        trace_install(&interp, &trace, &digest, script_args, &path.display().to_string(), false)?
+    };
     let local = tokio::task::LocalSet::new();
     // RESIL §5.1: establish the root TASK_LOCALS scope (+ telemetry root scope when that
     // feature is on) so `resilience.deadline`/`withTrace`'s `TASK_LOCALS.try_with` finds
@@ -320,12 +505,14 @@ pub async fn run_file_with_packages(
                  // the same `Cc` value model, so a final sweep here reclaims any
                  // leftover cycles on clean shutdown. Output already streamed (Live).
     crate::gc::collect();
-    match result {
+    let run_result = match result {
         Ok(_) => Ok(0),
         Err(crate::interp::Control::Panic(e)) => Err(e),
         Err(crate::interp::Control::Propagate(_)) => Ok(0),
         Err(crate::interp::Control::Exit(code)) => Ok(code),
-    }
+    };
+    // REPLAY §4.1: always-flush — write the trace on success, panic, AND exit.
+    trace_finish(&interp, trace_ctl, run_result)
 }
 
 /// Load each file as a module (running its `test(...)` registrations) on a
@@ -3714,11 +3901,12 @@ pub async fn run_aso_file(
     path: &Path,
     script_args: &[String],
     caps: Option<crate::stdlib::caps::CapSet>,
+    trace: TraceMode,
 ) -> Result<i32, AsError> {
     let bytes = std::fs::read(path)
         .map_err(|e| AsError::new(format!("cannot read {}: {}", path.display(), e)))?;
     let module_dir = path.parent().map(|d| d.to_path_buf());
-    run_verified_aso(&bytes, script_args, caps, module_dir, &path.display().to_string()).await
+    run_verified_aso(&bytes, script_args, caps, module_dir, &path.display().to_string(), trace).await
 }
 
 /// BIN §2.4 — run an embedded (bundled) `.aso` payload. The startup shim
@@ -3731,7 +3919,7 @@ pub async fn run_embedded_aso(payload: &[u8], args: &[String]) -> Result<i32, As
     let module_dir = std::env::current_exe()
         .ok()
         .and_then(|p| p.parent().map(|d| d.to_path_buf()));
-    run_verified_aso(payload, args, None, module_dir, "the embedded program").await
+    run_verified_aso(payload, args, None, module_dir, "the embedded program", TraceMode::Off).await
 }
 
 /// BIN §2.3 / RT §2.4 — the pre-clap startup shim, factored out of `src/main.rs` so
@@ -3856,6 +4044,7 @@ async fn run_verified_aso(
     caps: Option<crate::stdlib::caps::CapSet>,
     module_dir: Option<std::path::PathBuf>,
     what: &str,
+    trace: TraceMode,
 ) -> Result<i32, AsError> {
     use crate::vm::Vm;
 
@@ -3870,7 +4059,8 @@ async fn run_verified_aso(
         // the module table. Scan it from the archive end. A corrupt/absent section ⇒ `None`
         // ⇒ the program warms normally (the seeder is a no-op on `None`).
         let section = decode_trailing_pgo(payload, &archive);
-        return run_verified_archive(archive, script_args, caps, module_dir, what, section).await;
+        return run_verified_archive(archive, script_args, caps, module_dir, what, section, trace)
+            .await;
     }
 
     let chunk = crate::vm::chunk::Chunk::from_bytes_verified(payload)
@@ -3890,6 +4080,10 @@ async fn run_verified_aso(
     // re-parse them into the top-level chunk and build a worker code slice without source.
     interp.set_worker_aso_bytes(Rc::from(payload));
     interp.install_self();
+    // REPLAY §4.1: install the record/replay context. The source-identity digest is over
+    // the `.aso` payload bytes; `is_aso = true` skips the replay digest check (a compiled
+    // artifact has no source to rehash). Off → no-op (byte-identical).
+    let trace_ctl = trace_install(&interp, &trace, payload, script_args, what, true)?;
     let vm = Vm::new(interp.clone());
     // Resolve relative imports against the .aso's (or the executable's) directory.
     if let Some(dir) = module_dir {
@@ -3898,7 +4092,9 @@ async fn run_verified_aso(
 
     // A bare `ASO\0` chunk has no trailing-section mechanism (the only PGO carrier is the
     // archive container — spec §3.4), so there is never a section to seed here.
-    run_entry_proto_to_exit(&interp, &vm, chunk, None).await
+    let run_result = run_entry_proto_to_exit(&interp, &vm, chunk, None).await;
+    // REPLAY §4.1: always-flush the trace (success / panic / exit).
+    trace_finish(&interp, trace_ctl, run_result)
 }
 
 /// WARM B §3.3 — decode the optional PGO trailing section from an archive's raw bytes.
@@ -3944,6 +4140,7 @@ async fn run_verified_archive(
     module_dir: Option<std::path::PathBuf>,
     what: &str,
     pgo_section: Option<crate::vm::pgo::PgoSection>,
+    trace: TraceMode,
 ) -> Result<i32, AsError> {
     use crate::vm::Vm;
 
@@ -3997,6 +4194,9 @@ async fn run_verified_archive(
     // isolate). Encode BEFORE `archive` is moved into `Rc::new` at `set_module_archive` below.
     interp.set_worker_archive_bytes(Rc::from(archive.encode().as_slice()));
     interp.install_self();
+    // REPLAY §4.1: install the record/replay context. The source-identity digest is over
+    // the entry chunk bytes; `is_aso = true` skips the replay digest check. Off → no-op.
+    let trace_ctl = trace_install(&interp, &trace, &entry_bytes, script_args, what, true)?;
     let vm = Vm::new(interp.clone());
     // Seed the on-disk fallback dir BEFORE installing the archive: `set_module_archive`
     // overrides the entry's LOGICAL dir to the archive root, but an archive-miss still
@@ -4012,7 +4212,9 @@ async fn run_verified_archive(
         entry_sha256: &entry_sha256,
         enabled: pgo_seeding_enabled(),
     });
-    run_entry_proto_to_exit(&interp, &vm, chunk, pgo_seed).await
+    let run_result = run_entry_proto_to_exit(&interp, &vm, chunk, pgo_seed).await;
+    // REPLAY §4.1: always-flush the trace (success / panic / exit).
+    trace_finish(&interp, trace_ctl, run_result)
 }
 
 /// WARM B §3.3 — the seeding inputs threaded into [`run_entry_proto_to_exit`]: the decoded
@@ -4110,7 +4312,8 @@ async fn run_entry_proto_to_exit(
 /// build source), the source is attached to a Tier-2 panic here so its diagnostic
 /// renders against the file the user just ran.
 pub async fn run_file_on_vm(path: &Path, script_args: &[String]) -> Result<i32, AsError> {
-    run_file_on_vm_with_packages(path, script_args, None, None, ELIDE_DEFAULT_ON).await
+    run_file_on_vm_with_packages(path, script_args, None, None, ELIDE_DEFAULT_ON, TraceMode::Off)
+        .await
 }
 
 #[cfg(not(ascript_rt))]
@@ -4205,6 +4408,7 @@ pub async fn run_file_on_vm_with_packages(
     packages: Option<crate::interp::PackageMap>,
     caps: Option<crate::stdlib::caps::CapSet>,
     elide: bool,
+    trace: TraceMode,
 ) -> Result<i32, AsError> {
     use crate::vm::chunk::FnProto;
     use crate::vm::value_ext::{Closure, RunOutcome};
@@ -4246,6 +4450,17 @@ pub async fn run_file_on_vm_with_packages(
         interp.set_package_resolver(map);
     }
     interp.install_self();
+    // REPLAY §4.1: install the record/replay determinism context before the run. The
+    // source-identity digest is over the `.as` source text (already in `src`); Off skips
+    // it (byte-identical). `is_aso = false` — this is the source VM path.
+    let trace_ctl = trace_install(
+        &interp,
+        &trace,
+        src.as_bytes(),
+        script_args,
+        &path.display().to_string(),
+        false,
+    )?;
     // ELIDE §6.3 paranoid mode (default VM CLI path): when active, build the entry
     // module's ElisionSet and install it for contract-failure-path lookup. Paranoid
     // runs elide-OFF (the entry/import compiles above keep all checks because the
@@ -4306,14 +4521,16 @@ pub async fn run_file_on_vm_with_packages(
     local.await; // drain spawned tasks (structured join)
                  // End-of-program cycle collection (V13-T3): see `run_aso_file`.
     crate::gc::collect();
-    match result {
+    let run_result = match result {
         Ok(RunOutcome::Done(_)) => Ok(0),
         Ok(RunOutcome::Yielded(_)) => unreachable!("top-level program cannot yield"),
         // Attach the source so the panic's diagnostic points at this file.
         Err(crate::interp::Control::Panic(e)) => Err(e.with_source(src_info)),
         Err(crate::interp::Control::Propagate(_)) => Ok(0),
         Err(crate::interp::Control::Exit(code)) => Ok(code),
-    }
+    };
+    // REPLAY §4.1: always-flush — write the trace on success, panic, AND exit.
+    trace_finish(&interp, trace_ctl, run_result)
 }
 
 #[cfg(not(ascript_rt))]
@@ -4358,9 +4575,18 @@ pub async fn run_file_on_vm_cached(
     no_cache: bool,
 ) -> Result<i32, AsError> {
     // Kill switch: `--no-cache` / `ASCRIPT_NO_COMPILE_CACHE=1` → today's uncached path.
+    // The cache is never consulted under --record/--replay (the CLI routes those through
+    // the uncached path, so this fn receives a plain run); pass `TraceMode::Off`.
     if no_cache {
-        return run_file_on_vm_with_packages(path, script_args, packages, caps, ELIDE_DEFAULT_ON)
-            .await;
+        return run_file_on_vm_with_packages(
+            path,
+            script_args,
+            packages,
+            caps,
+            ELIDE_DEFAULT_ON,
+            TraceMode::Off,
+        )
+        .await;
     }
 
     // Attempt the cache layer. ANY failure returns `None` so we fall open below.
@@ -4378,13 +4604,22 @@ pub async fn run_file_on_vm_cached(
                 caps,
                 module_dir,
                 &path.display().to_string(),
+                TraceMode::Off,
             )
             .await
         }
         // FAIL-OPEN: the cache could not produce a runnable artifact (disabled, IO
         // error, exotic graph, publish failure, verifier rejection) → run uncached.
         None => {
-            run_file_on_vm_with_packages(path, script_args, packages, caps, ELIDE_DEFAULT_ON).await
+            run_file_on_vm_with_packages(
+                path,
+                script_args,
+                packages,
+                caps,
+                ELIDE_DEFAULT_ON,
+                TraceMode::Off,
+            )
+            .await
         }
     }
 }

@@ -1278,3 +1278,454 @@ fn default_path_untouched() {
         assert_eq!(r, Value::int(4));
     })
 }
+
+// ===========================================================================
+// REPLAY Task 6 — `ascript run --record/--replay/--seed` end-to-end (spawn the
+// real binary, the `tests/cli.rs` precedent). These prove the flagship guarantee:
+// a trace recorded on ANY engine replays byte-identically on ANY engine, with NO
+// real I/O at replay (delete the fixture / change the env between record & replay).
+// ===========================================================================
+mod cli_run {
+    use std::path::PathBuf;
+    use std::process::Command;
+
+    fn bin() -> &'static str {
+        env!("CARGO_BIN_EXE_ascript")
+    }
+
+    /// A fresh unique temp dir for one test (process id + tag + nanos).
+    fn unique_dir(tag: &str) -> PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let mut d = std::env::temp_dir();
+        d.push(format!("rr_cli_{}_{}_{}", std::process::id(), tag, nanos));
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    /// A deterministic program touching a SEAM (math.random → RandomRead events) and a
+    /// RECORDED effect (fs.readFile → StdlibCall event). On replay both reproduce with no
+    /// real RNG draw and no fs access — so deleting `data.txt` after record still replays.
+    const SEAM_PROG: &str = r#"import * as math from "std/math"
+import * as fs from "std/fs"
+let r1 = math.random()
+let r2 = math.random()
+let [content, err] = fs.read("data.txt")
+print(r1)
+print(r2)
+print(content)
+"#;
+
+    fn write_seam_program(dir: &std::path::Path) -> PathBuf {
+        let prog = dir.join("prog.as");
+        std::fs::write(&prog, SEAM_PROG).unwrap();
+        std::fs::write(dir.join("data.txt"), "RECORDED-FILE-BODY").unwrap();
+        prog
+    }
+
+    /// `run --record <trace> <prog>` then `run --replay <trace> <prog>` produce
+    /// byte-identical stdout + exit (clock/RNG seamed, fs recorded).
+    #[test]
+    fn record_then_replay_byte_identical() {
+        let dir = unique_dir("rt");
+        let prog = write_seam_program(&dir);
+        let trace = dir.join("t.astrc");
+
+        let rec = Command::new(bin())
+            .current_dir(&dir)
+            .args(["run", "--record"])
+            .arg(&trace)
+            .arg(&prog)
+            .output()
+            .unwrap();
+        assert!(rec.status.success(), "record failed: {rec:?}");
+        assert!(trace.exists(), "trace not written");
+        let out1 = String::from_utf8_lossy(&rec.stdout).to_string();
+        assert!(out1.contains("RECORDED-FILE-BODY"), "record stdout: {out1}");
+
+        let rep = Command::new(bin())
+            .current_dir(&dir)
+            .args(["run", "--replay"])
+            .arg(&trace)
+            .arg(&prog)
+            .output()
+            .unwrap();
+        assert!(rep.status.success(), "replay failed: {rep:?}");
+        let out2 = String::from_utf8_lossy(&rep.stdout).to_string();
+        assert_eq!(out1, out2, "replay stdout must equal record stdout");
+        assert_eq!(rec.status.code(), rep.status.code());
+    }
+
+    /// Replay reproduces the recorded fs read WITH NO real I/O — the fixture is deleted
+    /// between record and replay, yet the recorded body still appears (the flagship demo).
+    #[test]
+    fn replay_offline_after_fixture_deleted() {
+        let dir = unique_dir("offline");
+        let prog = write_seam_program(&dir);
+        let trace = dir.join("t.astrc");
+
+        let rec = Command::new(bin())
+            .current_dir(&dir)
+            .args(["run", "--record"])
+            .arg(&trace)
+            .arg(&prog)
+            .output()
+            .unwrap();
+        assert!(rec.status.success(), "record failed: {rec:?}");
+        let out1 = String::from_utf8_lossy(&rec.stdout).to_string();
+
+        // Delete the fixture — a real fs.readFile would now fail.
+        std::fs::remove_file(dir.join("data.txt")).unwrap();
+
+        let rep = Command::new(bin())
+            .current_dir(&dir)
+            .args(["run", "--replay"])
+            .arg(&trace)
+            .arg(&prog)
+            .output()
+            .unwrap();
+        assert!(rep.status.success(), "offline replay failed: {rep:?}");
+        let out2 = String::from_utf8_lossy(&rep.stdout).to_string();
+        assert_eq!(out1, out2, "offline replay must reproduce recorded output");
+        assert!(out2.contains("RECORDED-FILE-BODY"));
+    }
+
+    /// THE Gate-1 extension (§10.2): a trace recorded on one engine replays
+    /// byte-identically on the others — tree-walker ⇄ VM (default) ⇄ generic VM, plus
+    /// build→.aso. The seam math + the recorded fs value are engine-independent.
+    #[test]
+    fn cross_engine_matrix() {
+        let dir = unique_dir("xeng");
+        let prog = write_seam_program(&dir);
+
+        // Record on the tree-walker.
+        let trace_tw = dir.join("tw.astrc");
+        let rec = Command::new(bin())
+            .current_dir(&dir)
+            .args(["run", "--tree-walker", "--record"])
+            .arg(&trace_tw)
+            .arg(&prog)
+            .output()
+            .unwrap();
+        assert!(rec.status.success(), "tw record failed: {rec:?}");
+        let baseline = String::from_utf8_lossy(&rec.stdout).to_string();
+        assert!(baseline.contains("RECORDED-FILE-BODY"));
+
+        // Replay on the default VM.
+        let rep_vm = Command::new(bin())
+            .current_dir(&dir)
+            .args(["run", "--replay"])
+            .arg(&trace_tw)
+            .arg(&prog)
+            .output()
+            .unwrap();
+        assert!(rep_vm.status.success(), "vm replay failed: {rep_vm:?}");
+        assert_eq!(baseline, String::from_utf8_lossy(&rep_vm.stdout));
+
+        // Replay on the GENERIC VM (every fast path off).
+        let rep_gen = Command::new(bin())
+            .current_dir(&dir)
+            .env("ASCRIPT_NO_SPECIALIZE", "1")
+            .args(["run", "--replay"])
+            .arg(&trace_tw)
+            .arg(&prog)
+            .output()
+            .unwrap();
+        assert!(rep_gen.status.success(), "generic replay failed: {rep_gen:?}");
+        assert_eq!(baseline, String::from_utf8_lossy(&rep_gen.stdout));
+
+        // Record on the VM, replay on the tree-walker.
+        let trace_vm = dir.join("vm.astrc");
+        let rec_vm = Command::new(bin())
+            .current_dir(&dir)
+            .args(["run", "--record"])
+            .arg(&trace_vm)
+            .arg(&prog)
+            .output()
+            .unwrap();
+        assert!(rec_vm.status.success(), "vm record failed: {rec_vm:?}");
+        // This is an INDEPENDENT recording (its own OS-entropy seed), so its random draws
+        // differ from `baseline` — its own output is the reference its replays must match.
+        let vm_baseline = String::from_utf8_lossy(&rec_vm.stdout).to_string();
+        assert!(vm_baseline.contains("RECORDED-FILE-BODY"));
+        let rep_tw = Command::new(bin())
+            .current_dir(&dir)
+            .args(["run", "--tree-walker", "--replay"])
+            .arg(&trace_vm)
+            .arg(&prog)
+            .output()
+            .unwrap();
+        assert!(rep_tw.status.success(), "tw replay failed: {rep_tw:?}");
+        assert_eq!(vm_baseline, String::from_utf8_lossy(&rep_tw.stdout));
+
+        // Build → .aso, record the .as, replay against the .aso (digest skipped for .aso).
+        let aso = dir.join("prog.aso");
+        let built = Command::new(bin())
+            .current_dir(&dir)
+            .args(["build"])
+            .arg(&prog)
+            .arg("-o")
+            .arg(&aso)
+            .output()
+            .unwrap();
+        assert!(built.status.success(), "build failed: {built:?}");
+        let rep_aso = Command::new(bin())
+            .current_dir(&dir)
+            .args(["run", "--replay"])
+            .arg(&trace_vm)
+            .arg(&aso)
+            .output()
+            .unwrap();
+        assert!(rep_aso.status.success(), "aso replay failed: {rep_aso:?}");
+        assert_eq!(vm_baseline, String::from_utf8_lossy(&rep_aso.stdout));
+    }
+
+    /// `--record --seed N` twice yields IDENTICAL event streams (compared as the trace
+    /// bytes minus the informational `created_ms` header field) and identical output.
+    #[test]
+    fn seed_pins_record() {
+        let dir = unique_dir("seed");
+        let prog = write_seam_program(&dir);
+        let run = |name: &str| -> (String, Vec<ascript::det::DetEvent>) {
+            let trace = dir.join(name);
+            let out = Command::new(bin())
+                .current_dir(&dir)
+                .args(["run", "--record"])
+                .arg(&trace)
+                .args(["--seed", "7"])
+                .arg(&prog)
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "seeded record failed: {out:?}");
+            let bytes = std::fs::read(&trace).unwrap();
+            let (_h, events) = ascript::trace::read_trace(&bytes).unwrap();
+            (String::from_utf8_lossy(&out.stdout).to_string(), events)
+        };
+        let (o1, e1) = run("s1.astrc");
+        let (o2, e2) = run("s2.astrc");
+        assert_eq!(o1, o2, "same seed → same output");
+        assert_eq!(e1, e2, "same seed → identical event stream");
+    }
+
+    /// Editing the program after recording makes `--replay` a clean error (the source
+    /// digest changed), with a non-zero exit and no panic/backtrace.
+    #[test]
+    fn digest_mismatch_is_clean() {
+        let dir = unique_dir("digest");
+        let prog = write_seam_program(&dir);
+        let trace = dir.join("t.astrc");
+        let rec = Command::new(bin())
+            .current_dir(&dir)
+            .args(["run", "--record"])
+            .arg(&trace)
+            .arg(&prog)
+            .output()
+            .unwrap();
+        assert!(rec.status.success());
+
+        // Change the program (append a comment → different sha256).
+        std::fs::write(&prog, format!("{SEAM_PROG}// changed\n")).unwrap();
+        let rep = Command::new(bin())
+            .current_dir(&dir)
+            .args(["run", "--replay"])
+            .arg(&trace)
+            .arg(&prog)
+            .output()
+            .unwrap();
+        assert!(!rep.status.success(), "replay of a changed program must fail");
+        let err = String::from_utf8_lossy(&rep.stderr);
+        assert!(
+            err.contains("different program"),
+            "expected a source-changed error, got: {err}"
+        );
+    }
+
+    /// `--record` and `--replay` together is a clean clap conflict error.
+    #[test]
+    fn record_plus_replay_flag_conflict() {
+        let dir = unique_dir("conflict");
+        let prog = write_seam_program(&dir);
+        let out = Command::new(bin())
+            .current_dir(&dir)
+            .args(["run", "--record", "a.astrc", "--replay", "b.astrc"])
+            .arg(&prog)
+            .output()
+            .unwrap();
+        assert!(!out.status.success(), "conflicting flags must error");
+    }
+
+    /// A corrupt/truncated trace yields a clean error (no panic/backtrace).
+    #[test]
+    fn replay_corrupt_trace_clean_error() {
+        let dir = unique_dir("corrupt");
+        let prog = write_seam_program(&dir);
+        let trace = dir.join("t.astrc");
+        let rec = Command::new(bin())
+            .current_dir(&dir)
+            .args(["run", "--record"])
+            .arg(&trace)
+            .arg(&prog)
+            .output()
+            .unwrap();
+        assert!(rec.status.success());
+        // Truncate the trace to a hostile prefix.
+        let bytes = std::fs::read(&trace).unwrap();
+        std::fs::write(&trace, &bytes[..bytes.len() / 2]).unwrap();
+        let rep = Command::new(bin())
+            .current_dir(&dir)
+            .args(["run", "--replay"])
+            .arg(&trace)
+            .arg(&prog)
+            .output()
+            .unwrap();
+        assert!(!rep.status.success(), "corrupt trace must error");
+        let err = String::from_utf8_lossy(&rep.stderr);
+        assert!(
+            !err.contains("panicked") && !err.contains("RUST_BACKTRACE"),
+            "corrupt trace must be a clean error, not a panic: {err}"
+        );
+    }
+
+    /// A program that performs an effect then PANICS still writes its trace (always-flush),
+    /// and replay reproduces the panic byte-identically.
+    #[test]
+    fn panicking_run_still_writes_trace() {
+        let dir = unique_dir("panic");
+        let prog = dir.join("prog.as");
+        std::fs::write(
+            &prog,
+            "import * as math from \"std/math\"\nlet r = math.random()\nprint(r)\nlet bad = 1 + nil\nprint(bad)\n",
+        )
+        .unwrap();
+        let trace = dir.join("t.astrc");
+        let rec = Command::new(bin())
+            .current_dir(&dir)
+            .args(["run", "--record"])
+            .arg(&trace)
+            .arg(&prog)
+            .output()
+            .unwrap();
+        assert!(!rec.status.success(), "the program panics → non-zero exit");
+        assert!(trace.exists(), "trace must be written even on panic");
+        let out1 = String::from_utf8_lossy(&rec.stdout).to_string();
+
+        let rep = Command::new(bin())
+            .current_dir(&dir)
+            .args(["run", "--replay"])
+            .arg(&trace)
+            .arg(&prog)
+            .output()
+            .unwrap();
+        assert_eq!(
+            rec.status.code(),
+            rep.status.code(),
+            "replay reproduces the panic exit"
+        );
+        assert_eq!(out1, String::from_utf8_lossy(&rep.stdout));
+    }
+
+    /// `exit(n)` after an effect: the trace is written and replay reproduces the exit code.
+    #[test]
+    fn exit_n_run_writes_trace() {
+        let dir = unique_dir("exit");
+        let prog = dir.join("prog.as");
+        std::fs::write(
+            &prog,
+            "import * as math from \"std/math\"\nlet r = math.random()\nprint(r)\nexit(3)\n",
+        )
+        .unwrap();
+        let trace = dir.join("t.astrc");
+        let rec = Command::new(bin())
+            .current_dir(&dir)
+            .args(["run", "--record"])
+            .arg(&trace)
+            .arg(&prog)
+            .output()
+            .unwrap();
+        assert_eq!(rec.status.code(), Some(3), "exit(3) propagates");
+        assert!(trace.exists(), "trace written on exit()");
+        let out1 = String::from_utf8_lossy(&rec.stdout).to_string();
+        let rep = Command::new(bin())
+            .current_dir(&dir)
+            .args(["run", "--replay"])
+            .arg(&trace)
+            .arg(&prog)
+            .output()
+            .unwrap();
+        assert_eq!(rep.status.code(), Some(3), "replay reproduces exit(3)");
+        assert_eq!(out1, String::from_utf8_lossy(&rep.stdout));
+    }
+
+    /// REPLAY §2.7 + the Task-3 carry-forward: a program running a `workflow.run` under
+    /// `--record` records ONE `StdlibCall(workflow.run)` at the boundary (the workflow's
+    /// own log is written during record); on `--replay` the workflow result is returned
+    /// from the trace WITHOUT re-executing — the workflow log is NOT recreated.
+    #[test]
+    #[cfg(feature = "workflow")]
+    fn workflow_run_records_and_replays_without_reexecuting() {
+        let dir = unique_dir("wf");
+        let prog = dir.join("prog.as");
+        std::fs::write(
+            &prog,
+            r#"import { run, activity } from "std/workflow"
+let act = activity("double", (n) => { return n * 2 })
+fn flow(ctx, input) {
+  let v = ctx.call(act, input)
+  return v + 1
+}
+let [r, err] = recover(() => run(flow, 5, { log: "wf.log" }))
+if (err != nil) { print("ERR: " + err.message) } else { print(r) }
+"#,
+        )
+        .unwrap();
+        let trace = dir.join("t.astrc");
+
+        let rec = Command::new(bin())
+            .current_dir(&dir)
+            .args(["run", "--record"])
+            .arg(&trace)
+            .arg(&prog)
+            .output()
+            .unwrap();
+        assert!(rec.status.success(), "wf record failed: {rec:?}");
+        let out1 = String::from_utf8_lossy(&rec.stdout).to_string();
+        assert_eq!(out1.trim(), "11", "5*2+1 = 11");
+
+        // The CLI trace records exactly ONE StdlibCall for workflow.run at the boundary.
+        let bytes = std::fs::read(&trace).unwrap();
+        let (_h, events) = ascript::trace::read_trace(&bytes).unwrap();
+        let workflow_calls = events
+            .iter()
+            .filter(|e| {
+                matches!(
+                    e,
+                    ascript::det::DetEvent::StdlibCall { module, func, .. }
+                        if module == "workflow" && func == "run"
+                )
+            })
+            .count();
+        assert_eq!(workflow_calls, 1, "exactly one StdlibCall(workflow.run): {events:?}");
+
+        // Delete the workflow's own log; replay must NOT recreate it (workflow.run is
+        // consumed from the trace, never re-executed).
+        let wf_log = dir.join("wf.log");
+        assert!(wf_log.exists(), "workflow log written during record");
+        std::fs::remove_file(&wf_log).unwrap();
+
+        let rep = Command::new(bin())
+            .current_dir(&dir)
+            .args(["run", "--replay"])
+            .arg(&trace)
+            .arg(&prog)
+            .output()
+            .unwrap();
+        assert!(rep.status.success(), "wf replay failed: {rep:?}");
+        assert_eq!(out1, String::from_utf8_lossy(&rep.stdout));
+        assert!(
+            !wf_log.exists(),
+            "replay must NOT re-execute the workflow (no log recreated)"
+        );
+    }
+}
