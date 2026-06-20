@@ -5,6 +5,8 @@
 - **File extension:** `.as`
 - **Runtime:** Rust (single binary `ascript`)
 
+> **Normative spec:** docs/content/spec/ (LSPEC, 2026-06-12). This document is the historical design record; where they differ, the spec governs.
+
 ---
 
 ## 1. Vision & Design Priorities

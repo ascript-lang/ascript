@@ -176,11 +176,36 @@ link signing — it only VERIFIES against the compiled-in pubkey — so the gene
 (`--features rt-release`, which the release CI enables) and absent from every normal build
 and every stub tier.
 
+## Language changes & stability
+
+AScript's normative specification is the 16-chapter set under
+[`docs/content/spec/`](docs/content/spec/). It defines three stability tiers (see
+[`spec/stability`](docs/content/spec/stability.md)):
+
+- **STABLE** — everything spec chapters 2–13 state normatively, plus the documented
+  `std/*` module APIs. Breaking a STABLE behaviour requires an RFC, a version bump, and
+  migration notes (the corpus is migrated in the same change). The language version *is*
+  the crate version (`Cargo.toml`), currently pre-1.0.
+- **EXPERIMENTAL** — explicitly listed surfaces (e.g. `http3`, the advisory lint-code
+  inventory, `std/ai`/telemetry wire formats) that may change without an RFC.
+- **INTERNAL** — `.aso`/bytecode, opcodes, shape/IC machinery, diagnostic env knobs, and
+  the `ascript` crate API *except* the semver-contracted `ascript::embed` host surface.
+
+A change is **RFC-bearing** iff it changes STABLE spec'd behaviour, adds language surface
+(grammar/AST/value kinds), or moves a stability tier. **Bug fixes toward spec'd behaviour
+never need an RFC** — they are conformance repairs. RFCs are one-pagers under
+[`superpowers/rfcs/`](superpowers/rfcs/) (template + process there). Any grammar/semantics
+change updates the matching `docs/content/spec/` chapter in the same PR;
+`tests/spec_drift.rs` fails on a grammar rule missing from `spec/grammar.md`.
+
 ## Conventions
 
 - Commit trailer: `Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>` for AI-assisted work.
 - The internal design specs and milestone plans live under [`superpowers/`](superpowers/) (not
-  web-hosted). The authoritative language spec is `superpowers/specs/2026-05-29-ascript-design.md`.
+  web-hosted). The **normative** language specification is
+  [`docs/content/spec/`](docs/content/spec/);
+  `superpowers/specs/2026-05-29-ascript-design.md` is the historical design record (where they
+  differ, the spec governs).
 - Behavior changes must keep the two engines (tree-walking interpreter and bytecode VM)
   byte-identical — the `vm_differential` test enforces this.
 
