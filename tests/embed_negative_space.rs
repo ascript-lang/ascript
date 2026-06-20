@@ -27,6 +27,42 @@ fn aso_format_version_pinned() {
     );
 }
 
+/// No new opcode (spec §11 "no language surface"). EMBED is a host-side facade — its
+/// only two engine touches (the `SpecifierKind::Host` arm in `classify_specifier`; the
+/// host-registry lookup on `call_stdlib`'s already-error fall-through arm) ride EXISTING
+/// dispatch and add NO `Op`. The count is derived from `Op::from_u8` (the round-trip
+/// decode door — every valid discriminant decodes; nothing else does), mirroring the
+/// established `tests/par_negative_space.rs` / `shape_negative_space.rs` technique, with
+/// the complementary "`CallElided` is still the last variant" check.
+///
+/// 121 is the merge-base value: DEFER added `DeferPush`+`DeferPushMethod` (→ 120), ELIDE
+/// added `CallElided` (→ 121). Update this ONLY if a NON-EMBED feature adds an opcode —
+/// for EMBED it must never move.
+#[test]
+fn no_new_opcode_for_embed() {
+    const EXPECTED_OP_COUNT: usize = 121;
+
+    let op_count = (0u16..=255)
+        .filter(|&b| ascript::vm::opcode::Op::from_u8(b as u8).is_some())
+        .count();
+
+    assert_eq!(
+        op_count, EXPECTED_OP_COUNT,
+        "Op variant count changed — EMBED must add NO opcode (host modules dispatch \
+         through the existing builtin/import rails); update EXPECTED_OP_COUNT only if a \
+         non-EMBED feature added it."
+    );
+
+    // Complementary: `CallElided` (discriminant 120) is still the last variant, so the
+    // count above isn't masking an added-then-removed pair.
+    assert_eq!(
+        ascript::vm::opcode::Op::CallElided as u16 + 1,
+        EXPECTED_OP_COUNT as u16,
+        "CallElided is no longer the last Op variant — a new opcode was appended after \
+         it; EMBED appends none."
+    );
+}
+
 /// The REPL substrate behaviors `Isolate::eval` lifts (spec §3.3): the trailing
 /// expression's value is the program result, and an earlier binding is visible to a
 /// later expression in the same session scope.
