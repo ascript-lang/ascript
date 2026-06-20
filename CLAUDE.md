@@ -27,7 +27,9 @@ durable workflows, plus **shared-nothing workers** for multi-core parallelism �
   `docs/reader.html` (reader app), `docs/assets/{styles.css,app.js}`, and content as Markdown under
   `docs/content/` (language guide + per-domain stdlib reference). `app.js` `fetch`es the Markdown, so the
   site must be **served**, not opened from `file://` (`cd docs && python3 -m http.server`). The Markdown
-  is also readable straight from the repo.
+  is also readable straight from the repo. The **NORMATIVE specification** is the 16-chapter set under
+  `docs/content/spec/` (the "Specification" NAV section; `tests/spec_drift.rs` guards it) — the
+  `docs/content/language/` guide stays tutorial and cross-links the spec, never duplicating its authority.
 - The stdlib reference pages are **domain-grouped** (22 pages covering 57 modules — e.g.
   `collections.md` owns `std/string`, `std/array`, `std/object`, `std/map`, `std/set`, `std/math`,
   `std/convert`, and `std/bytes`). The authoritative module→page mapping is `MODULE_PAGES` in
@@ -77,6 +79,11 @@ Several rules recur for ANY change to the grammar/AST. Do all that apply:
   `CONTRIBUTING.md`. **After a sync, verify BOTH editor pins were bumped to the new mirror SHA** — pin
   currency against the mirror is a manual check (network/another repo; not CI-testable in-repo); pin
   mutual consistency (Zed == Nvim) IS enforced by `tests/docs_drift.rs` (tripwire 6).
+- **The spec is normative — update it.** Any grammar/AST/semantics change updates the matching
+  `docs/content/spec/` chapter: a `grammar.js` change MUST update `spec/grammar.md`'s EBNF
+  (`tests/spec_drift.rs` fails on an unmentioned rule), and a behavior change MUST update the
+  owning semantics chapter + its `## Conformance` pins. The spec set is versioned with the
+  language (`docs/content/spec/stability.md`); spec staleness is a campaign-blocking defect.
 
 ## Language features — gotchas & where they live
 
