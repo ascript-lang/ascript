@@ -43,6 +43,7 @@ const NAV = [
     ['spec/capabilities', 'Capability model'],
     ['spec/types', 'Gradual typing & soundness'],
     ['spec/stdlib', 'Standard library'],
+    ['spec/conformance', 'Conformance suite'],
   ]},
   { title: 'Standard library', items: [
     ['stdlib/overview', 'Overview'],
