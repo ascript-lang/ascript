@@ -93,6 +93,9 @@ pub const STD_MODULE_FEATURES: &[(&str, Option<&str>)] = &[
     // (markdown = ["xml", "dep:pulldown-cmark"]); a markdown bundle pulls the xml
     // tier (the sanitizer) and transitively the data tier — see FEATURE_DEPS.
     ("std/markdown",    Some("markdown")),
+    // BATT T2-4 §14 — std/diff is gated on the `diff` feature (diff = [], no deps):
+    // a pure Myers line/char diff + unified renderer, no FEATURE_DEPS edge.
+    ("std/diff",        Some("diff")),
     // BATT Phase A — std/jwt + std/oauth are gated on the `auth` feature
     // (auth = crypto + data + net + rsa/p256). An auth-using bundle therefore
     // needs the net tier (jwks fetch + oauth token calls) — see FEATURE_DEPS.

@@ -200,17 +200,21 @@ pub(crate) fn snapshot_impl(
                 }
                 _ => None,
             };
+            // The "text" diff section. WITH `feature = "diff"` this is a `@@` unified
+            // hunk of stored→new (truncated past 200 lines, spec §14.3); WITHOUT it, the
+            // old raw `--- stored --- / --- new ---` dump persists byte-identically (no
+            // silent behavioral dependency of a core path on an optional feature).
+            let text_section = snapshot_text_diff(&stored, serialized);
             return Err(match structural {
                 Some(d) => format!(
-                    "assert.snapshot '{}' mismatch:\ndiff (stored → new):\n{}\n--- stored ---\n{}\n--- new ---\n{}",
+                    "assert.snapshot '{}' mismatch:\ndiff (stored → new):\n{}\n{}",
                     name,
                     d.trim_end(),
-                    stored,
-                    serialized
+                    text_section
                 ),
                 None => format!(
-                    "assert.snapshot '{}' mismatch:\n--- stored ---\n{}\n--- new ---\n{}",
-                    name, stored, serialized
+                    "assert.snapshot '{}' mismatch:\n{}",
+                    name, text_section
                 ),
             });
         }
@@ -223,6 +227,47 @@ pub(crate) fn snapshot_impl(
             .map_err(|e| format!("assert.snapshot: could not write snapshot file: {}", e))?;
         Ok(SnapshotPass { file: snap_file })
     }
+}
+
+/// Build the snapshot-mismatch TEXT diff section (BATT §14.3).
+///
+/// WITH `feature = "diff"`: a `@@` unified hunk of `stored`→`new` (labels
+/// `stored`/`new`), truncated past 200 rendered lines with a `… N more lines` tail.
+/// WITHOUT the feature: the old raw `--- stored --- / --- new ---` dump, byte-identical
+/// to the pre-BATT message (no silent behavioral dependency of a core path on an
+/// optional feature).
+#[cfg(all(feature = "sys", feature = "data", feature = "diff"))]
+fn snapshot_text_diff(stored: &str, new: &str) -> String {
+    // The two payloads always end with a newline (serde_json::to_string_pretty does not
+    // add one, but the snapshot file write/read preserves bytes; either way the unified
+    // renderer handles the no-trailing-newline case correctly).
+    let unified = match crate::stdlib::diff::unified_lines(stored, new, 3, "stored", "new") {
+        Ok(u) if !u.is_empty() => u,
+        // Budget breach or (impossible here) no-change: fall back to the raw dump so the
+        // message is never empty/misleading.
+        _ => {
+            return format!("--- stored ---\n{}\n--- new ---\n{}", stored, new);
+        }
+    };
+    const MAX_LINES: usize = 200;
+    let line_count = unified.lines().count();
+    if line_count <= MAX_LINES {
+        unified.trim_end_matches('\n').to_string()
+    } else {
+        let head: String = unified
+            .lines()
+            .take(MAX_LINES)
+            .collect::<Vec<_>>()
+            .join("\n");
+        format!("{}\n… {} more lines", head, line_count - MAX_LINES)
+    }
+}
+
+/// The old raw stored/new dump (no `diff` feature). Byte-identical to the pre-BATT
+/// message section.
+#[cfg(all(feature = "sys", feature = "data", not(feature = "diff")))]
+fn snapshot_text_diff(stored: &str, new: &str) -> String {
+    format!("--- stored ---\n{}\n--- new ---\n{}", stored, new)
 }
 
 /// DX D2 Task 8 — orphan-snapshot detection (spec §6.2).
@@ -1599,6 +1644,9 @@ print(e.message)
             let r = snapshot_impl(&dir, "my_snap", "different_value", false);
             assert!(r.is_err(), "mismatch should fail");
             let msg = r.unwrap_err();
+            // Both the stored and new payloads appear in the message regardless of which
+            // text-diff format is active (as `-`/`+` lines under `diff`, or inside the
+            // raw dump without it).
             assert!(
                 msg.contains("stored_value"),
                 "error should show stored: {msg}"
@@ -1607,20 +1655,68 @@ print(e.message)
                 msg.contains("different_value"),
                 "error should show new: {msg}"
             );
+            // BATT §14.3: WITH the `diff` feature the text section is a `@@` unified hunk
+            // (labelled stored→new); WITHOUT it the old raw dump persists byte-identically.
+            #[cfg(feature = "diff")]
+            {
+                assert!(msg.contains("@@"), "unified hunk header present: {msg}");
+                assert!(msg.contains("--- stored"), "unified --- header: {msg}");
+                assert!(msg.contains("+++ new"), "unified +++ header: {msg}");
+                assert!(msg.contains("-stored_value"), "unified delete line: {msg}");
+                assert!(
+                    msg.contains("+different_value"),
+                    "unified insert line: {msg}"
+                );
+                assert!(
+                    !msg.contains("--- stored ---"),
+                    "old raw dump must NOT appear under `diff`: {msg}"
+                );
+            }
+            #[cfg(not(feature = "diff"))]
+            {
+                assert!(!msg.contains("@@"), "no unified hunk without `diff`: {msg}");
+                assert!(
+                    msg.contains("--- stored ---"),
+                    "old raw dump header present: {msg}"
+                );
+                assert!(
+                    msg.contains("--- new ---"),
+                    "old raw dump new header present: {msg}"
+                );
+            }
         }
 
         #[test]
         fn mismatch_shows_structural_diff_for_json() {
             // When both stored + new parse as JSON objects, the mismatch message
-            // carries a structural diff (per-key change), in addition to the raw
-            // dump fallback.
+            // carries a structural diff (per-key change) FIRST, followed by the text
+            // diff section (unified hunk with `diff`, raw dump without).
             let dir = tmp_dir("structural_diff");
             snapshot_impl(&dir, "obj", "{\n  \"a\": 1,\n  \"b\": 2\n}", false).unwrap();
             let r = snapshot_impl(&dir, "obj", "{\n  \"a\": 1,\n  \"b\": 3\n}", false);
             assert!(r.is_err());
             let msg = r.unwrap_err();
+            // The structural diff stays first regardless of the text-diff format.
             assert!(msg.contains("diff (stored → new)"), "has diff header: {msg}");
             assert!(msg.contains(".b: 2 → 3"), "structural change line: {msg}");
+            #[cfg(feature = "diff")]
+            {
+                // The text section under it is a `@@` unified hunk of the JSON text.
+                assert!(msg.contains("@@"), "unified hunk header present: {msg}");
+                assert!(msg.contains("--- stored"), "unified --- header: {msg}");
+                assert!(msg.contains("+++ new"), "unified +++ header: {msg}");
+                // The changed JSON line shows as a -/+ pair.
+                assert!(msg.contains("-  \"b\": 2"), "unified delete line: {msg}");
+                assert!(msg.contains("+  \"b\": 3"), "unified insert line: {msg}");
+            }
+            #[cfg(not(feature = "diff"))]
+            {
+                assert!(!msg.contains("@@"), "no unified hunk without `diff`: {msg}");
+                assert!(
+                    msg.contains("--- stored ---"),
+                    "old raw dump header present: {msg}"
+                );
+            }
         }
 
         #[test]

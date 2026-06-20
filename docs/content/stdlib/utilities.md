@@ -155,3 +155,54 @@ A malformed range is Tier-1; a malformed candidate version is Tier-2.
 ### `semver.minSatisfying(versions, range)`
 
 Return the lowest version in `versions` that satisfies `range` → `[string|nil, err]`.
+
+## std/diff
+
+`std/diff` is a hand-rolled **Myers O(ND)** line/char diff plus a unified-diff
+renderer whose output byte-matches GNU `diff -u`. No dependency.
+
+```ascript
+import * as diff from "std/diff"
+
+let patch = diff.unified("a\nb\nc\n", "a\nB\nc\n", { fromFile: "old", toFile: "new" })
+// --- old
+// +++ new
+// @@ -1,3 +1,3 @@
+//  a
+// -b
+// +B
+//  c
+
+let hunks = diff.lines("x\ny\n", "x\nNEW\ny\n")
+// [ {tag:"equal", ...}, {tag:"insert", lines:["NEW"], ...}, {tag:"equal", ...} ]
+```
+
+**Line splitting.** Lines split on `\n` only; a `\r\n` ending is NOT special-cased
+(the `\r` stays as the line's last char), so a CRLF file differs from an otherwise
+identical LF file (matching GNU `diff` without `--strip-trailing-cr`). An empty string
+is **zero** lines; a single `"\n"` is **one** blank line — the two are distinct. A
+missing trailing newline is rendered as the `\ No newline at end of file` marker.
+
+**Budget.** Inputs above an internal size budget return a Tier-1 `[nil, err]`
+("inputs too large") rather than hang or OOM. Wrong-type arguments (a non-string
+input, a non-object `opts`) are Tier-2 misuse.
+
+### `diff.lines(a, b)`
+
+Myers line diff of `a` → `b` as an `array` of hunk objects
+`{tag: "equal"|"delete"|"insert", aStart, aEnd, bStart, bEnd, lines}`. `aStart`/`aEnd`
+and `bStart`/`bEnd` are 0-based half-open ranges into the respective input's lines.
+
+### `diff.unified(a, b, opts?)`
+
+Render a unified diff (`diff -u` format) of `a` → `b` → `string`. `opts` is an optional
+object `{ context? = 3, fromFile? = "a", toFile? = "b" }`: `context` is the number of
+equal context lines kept around each change run (change runs whose context windows
+overlap are merged into one hunk); `fromFile`/`toFile` label the `---`/`+++` headers.
+Identical inputs render the empty string.
+
+### `diff.chars(a, b)`
+
+Myers char-level diff of `a` → `b` as an `array` of hunks (the same shape as
+`diff.lines`, with each `lines` entry a single character) — intended for small,
+intra-line comparisons.

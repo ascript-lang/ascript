@@ -2546,6 +2546,30 @@ static MARKDOWN_MEMBERS: &[(&str, MemberKind)] = &[
     ("escape", MemberKind::Fn),
 ];
 
+// ── std/diff ────────────────────────────────────────────────────────────────
+
+static DIFF_AB_PARAMS: &[StdParam] = &[
+    StdParam::req("a", "string"),
+    StdParam::req("b", "string"),
+];
+static DIFF_UNIFIED_PARAMS: &[StdParam] = &[
+    StdParam::req("a", "string"),
+    StdParam::req("b", "string"),
+    StdParam::opt("opts", "object"),
+];
+
+static DIFF_SIGS: &[(&str, StdSig)] = &[
+    ("lines", StdSig { params: DIFF_AB_PARAMS, ret: Some("array"), doc: "Myers line diff of a→b as an array of {tag, aStart, aEnd, bStart, bEnd, lines} hunks." }),
+    ("unified", StdSig { params: DIFF_UNIFIED_PARAMS, ret: Some("string"), doc: "Render a unified diff (diff -u format) of a→b; opts {context? 3, fromFile?, toFile?}." }),
+    ("chars", StdSig { params: DIFF_AB_PARAMS, ret: Some("array"), doc: "Myers char-level diff of a→b as an array of hunks (intra-line, small inputs)." }),
+];
+
+static DIFF_MEMBERS: &[(&str, MemberKind)] = &[
+    ("lines", MemberKind::Fn),
+    ("unified", MemberKind::Fn),
+    ("chars", MemberKind::Fn),
+];
+
 static TIME_MEMBERS: &[(&str, MemberKind)] = &[
     ("now", MemberKind::Fn),
     ("monotonic", MemberKind::Fn),
@@ -3169,6 +3193,7 @@ static ALL_MODULES: &[(&str, &[(&str, MemberKind)])] = &[
     ("std/cron", CRON_MEMBERS),
     ("std/semver", SEMVER_MEMBERS),
     ("std/markdown", MARKDOWN_MEMBERS),
+    ("std/diff", DIFF_MEMBERS),
     // batch 3 — ai + assert + bench + cli + color + schema + shared + lru + events + template +
     //           caps + task + time + sync + stream + date + intl + log + workflow + telemetry +
     //           tui + ffi + resilience
@@ -3254,6 +3279,7 @@ pub fn std_sig(module: &str, name: &str) -> Option<&'static StdSig> {
         "std/cron" => CRON_SIGS,
         "std/semver" => SEMVER_SIGS,
         "std/markdown" => MARKDOWN_SIGS,
+        "std/diff" => DIFF_SIGS,
         // batch 3
         "std/ai" => AI_SIGS,
         "std/assert" => ASSERT_SIGS,
@@ -3438,6 +3464,7 @@ mod tests {
             ("std/cron", CRON_SIGS),
             ("std/semver", SEMVER_SIGS),
             ("std/markdown", MARKDOWN_SIGS),
+            ("std/diff", DIFF_SIGS),
             // batch 3
             ("std/ai", AI_SIGS),
             ("std/assert", ASSERT_SIGS),

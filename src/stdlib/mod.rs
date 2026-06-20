@@ -40,6 +40,8 @@ pub mod cron;
 pub mod semver;
 #[cfg(feature = "markdown")]
 pub mod markdown;
+#[cfg(feature = "diff")]
+pub mod diff;
 #[cfg(feature = "docker")]
 pub mod docker;
 pub mod events;
@@ -262,6 +264,8 @@ pub fn std_module_exports(path: &str) -> Option<Vec<(String, Value)>> {
         "std/semver" => semver::exports(),
         #[cfg(feature = "markdown")]
         "std/markdown" => markdown::exports(),
+        #[cfg(feature = "diff")]
+        "std/diff" => diff::exports(),
         #[cfg(feature = "auth")]
         "std/jwt" => jwt::exports(),
         #[cfg(feature = "auth")]
@@ -359,6 +363,7 @@ pub const STD_MODULES: &[&str] = &[
     "std/xml",
     "std/html",
     "std/markdown",
+    "std/diff",
     "std/email",
     "std/blob",
 ];
@@ -770,6 +775,8 @@ impl Interp {
             "html" => html::call(func, args, span),
             #[cfg(feature = "markdown")]
             "markdown" => markdown::call(func, args, span),
+            #[cfg(feature = "diff")]
+            "diff" => self.call_diff(func, args, span),
             #[cfg(feature = "email")]
             "email" => match func {
                 // The SMTP client funcs need `&self` (resource registration + async
@@ -1391,6 +1398,9 @@ mod cap_gate_tests {
             // (render pipes through the html sanitizer; escape is a string op) —
             // no OS resource, so it acquires no cap.
             "markdown",
+            // BATT T2-4 §14: std/diff is a pure Myers line/char diff + unified
+            // renderer — no OS resource, so it acquires no cap.
+            "diff",
         ];
         for full in STD_MODULES {
             let key = full.strip_prefix("std/").unwrap().replace('/', "_");

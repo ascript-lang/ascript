@@ -176,6 +176,7 @@ const MODULE_PAGES: &[(&str, &str)] = &[
     ("std/events", "utilities.md"),
     ("std/template", "utilities.md"),
     ("std/semver", "utilities.md"),
+    ("std/diff", "utilities.md"),
     ("std/bytes", "collections.md"),
     ("std/caps", "caps.md"),
     ("std/convert", "collections.md"),
