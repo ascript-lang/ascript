@@ -2528,6 +2528,24 @@ static SEMVER_MEMBERS: &[(&str, MemberKind)] = &[
     ("minSatisfying", MemberKind::Fn),
 ];
 
+// ── std/markdown ──────────────────────────────────────────────────────────────
+
+static MARKDOWN_RENDER_PARAMS: &[StdParam] = &[
+    StdParam::req("text", "string"),
+    StdParam::opt("opts", "object"),
+];
+static MARKDOWN_ESCAPE_PARAMS: &[StdParam] = &[StdParam::req("s", "string")];
+
+static MARKDOWN_SIGS: &[(&str, StdSig)] = &[
+    ("render", StdSig { params: MARKDOWN_RENDER_PARAMS, ret: Some("string"), doc: "Render CommonMark to HTML, sanitized by default (opts.sanitize=false disables — trusted input only)." }),
+    ("escape", StdSig { params: MARKDOWN_ESCAPE_PARAMS, ret: Some("string"), doc: "Backslash-escape CommonMark metacharacters in the string." }),
+];
+
+static MARKDOWN_MEMBERS: &[(&str, MemberKind)] = &[
+    ("render", MemberKind::Fn),
+    ("escape", MemberKind::Fn),
+];
+
 static TIME_MEMBERS: &[(&str, MemberKind)] = &[
     ("now", MemberKind::Fn),
     ("monotonic", MemberKind::Fn),
@@ -3150,6 +3168,7 @@ static ALL_MODULES: &[(&str, &[(&str, MemberKind)])] = &[
     ("std/docker", DOCKER_MEMBERS),
     ("std/cron", CRON_MEMBERS),
     ("std/semver", SEMVER_MEMBERS),
+    ("std/markdown", MARKDOWN_MEMBERS),
     // batch 3 — ai + assert + bench + cli + color + schema + shared + lru + events + template +
     //           caps + task + time + sync + stream + date + intl + log + workflow + telemetry +
     //           tui + ffi + resilience
@@ -3234,6 +3253,7 @@ pub fn std_sig(module: &str, name: &str) -> Option<&'static StdSig> {
         "std/docker" => DOCKER_SIGS,
         "std/cron" => CRON_SIGS,
         "std/semver" => SEMVER_SIGS,
+        "std/markdown" => MARKDOWN_SIGS,
         // batch 3
         "std/ai" => AI_SIGS,
         "std/assert" => ASSERT_SIGS,
@@ -3417,6 +3437,7 @@ mod tests {
             ("std/docker", DOCKER_SIGS),
             ("std/cron", CRON_SIGS),
             ("std/semver", SEMVER_SIGS),
+            ("std/markdown", MARKDOWN_SIGS),
             // batch 3
             ("std/ai", AI_SIGS),
             ("std/assert", ASSERT_SIGS),

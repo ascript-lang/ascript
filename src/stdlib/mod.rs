@@ -38,6 +38,8 @@ pub mod crypto;
 pub mod cron;
 #[cfg(feature = "semver")]
 pub mod semver;
+#[cfg(feature = "markdown")]
+pub mod markdown;
 #[cfg(feature = "docker")]
 pub mod docker;
 pub mod events;
@@ -258,6 +260,8 @@ pub fn std_module_exports(path: &str) -> Option<Vec<(String, Value)>> {
         "std/cron" => cron::exports(),
         #[cfg(feature = "semver")]
         "std/semver" => semver::exports(),
+        #[cfg(feature = "markdown")]
+        "std/markdown" => markdown::exports(),
         #[cfg(feature = "auth")]
         "std/jwt" => jwt::exports(),
         #[cfg(feature = "auth")]
@@ -354,6 +358,7 @@ pub const STD_MODULES: &[&str] = &[
     "std/archive",
     "std/xml",
     "std/html",
+    "std/markdown",
     "std/email",
     "std/blob",
 ];
@@ -763,6 +768,8 @@ impl Interp {
             "xml" => xml::call(func, args, span),
             #[cfg(feature = "xml")]
             "html" => html::call(func, args, span),
+            #[cfg(feature = "markdown")]
+            "markdown" => markdown::call(func, args, span),
             #[cfg(feature = "email")]
             "email" => match func {
                 // The SMTP client funcs need `&self` (resource registration + async
@@ -1380,6 +1387,10 @@ mod cap_gate_tests {
             // BATT B4 §7.3: std/html is a pure string transform (escape/unescape/
             // sanitize) — no OS resource, so it acquires no cap.
             "html",
+            // BATT T2-3 §13: std/markdown is a pure CommonMark→HTML transform
+            // (render pipes through the html sanitizer; escape is a string op) —
+            // no OS resource, so it acquires no cap.
+            "markdown",
         ];
         for full in STD_MODULES {
             let key = full.strip_prefix("std/").unwrap().replace('/', "_");

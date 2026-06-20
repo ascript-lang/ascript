@@ -89,6 +89,10 @@ pub const STD_MODULE_FEATURES: &[(&str, Option<&str>)] = &[
     // BATT T2-2 §12 — std/semver is gated on the `semver` feature (semver = [],
     // no deps): pure SemVer parsing/comparison/range math, no FEATURE_DEPS edge.
     ("std/semver",      Some("semver")),
+    // BATT T2-3 §13 — std/markdown is gated on the `markdown` feature
+    // (markdown = ["xml", "dep:pulldown-cmark"]); a markdown bundle pulls the xml
+    // tier (the sanitizer) and transitively the data tier — see FEATURE_DEPS.
+    ("std/markdown",    Some("markdown")),
     // BATT Phase A — std/jwt + std/oauth are gated on the `auth` feature
     // (auth = crypto + data + net + rsa/p256). An auth-using bundle therefore
     // needs the net tier (jwks fetch + oauth token calls) — see FEATURE_DEPS.
@@ -160,6 +164,11 @@ pub const FEATURE_DEPS: &[(&str, &str)] = &[
     // BATT Phase B §7.2 — xml = ["data", "dep:quick-xml"]. A std/xml bundle pulls
     // the data tier.
     ("xml", "data"),
+    // BATT T2-3 §13 — markdown = ["xml", "dep:pulldown-cmark"]. A std/markdown
+    // bundle pulls the xml tier (the sanitizer), and following `markdown → xml`
+    // makes `xml` closure-relevant, so its own `xml → data` edge (above) carries
+    // the markdown bundle to the data tier too.
+    ("markdown", "xml"),
     // BATT Phase B §8 — email = ["net", "tls", "data"]. A std/email bundle pulls
     // the net + data tiers (the SMTP client fetches over the network; the builder
     // reuses base64/sha2 from the data tier) PLUS the tls tier (STARTTLS/implicit
