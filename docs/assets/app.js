@@ -34,6 +34,7 @@ const NAV = [
     ['spec/grammar', 'Grammar (EBNF)'],
     ['spec/values', 'Values & types'],
     ['spec/expressions', 'Expressions & operators'],
+    ['spec/statements', 'Statements & declarations'],
   ]},
   { title: 'Standard library', items: [
     ['stdlib/overview', 'Overview'],
