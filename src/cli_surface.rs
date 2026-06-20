@@ -358,6 +358,19 @@ pub enum Command {
         /// on the real clock (§10.2).
         #[arg(long = "frozen-time", value_name = "RFC3339|EPOCH_MS")]
         frozen_time: Option<String>,
+        /// REPLAY §4.2-4.3: record per-test traces for this run. Each test FILE runs
+        /// under one deterministic Record context; a trace is auto-saved ONLY for a
+        /// FAILED test under `.ascript-traces/<file_stem>__<test-name-slug>.trace`
+        /// (a green run writes nothing). Replay one with `--replay`. Conflicts with
+        /// `--parallel`/`--watch`/`--replay` (v1).
+        #[arg(long = "record", conflicts_with = "replay")]
+        record: bool,
+        /// REPLAY §4.2-4.3: replay a previously recorded per-test trace, re-running
+        /// module load + exactly that one test under strict Replay (every effect
+        /// returns its recorded value — no real I/O). A changed test file proceeds
+        /// with a printed warning (the point is editing the test between replays).
+        #[arg(long = "replay", value_name = "FILE")]
+        replay: Option<String>,
     },
     /// Run the language server (LSP over stdio)
     #[cfg(feature = "lsp")]

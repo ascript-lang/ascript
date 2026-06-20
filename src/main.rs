@@ -894,7 +894,35 @@ async fn real_main() -> ExitCode {
             coverage,
             seed,
             frozen_time,
+            record,
+            replay,
         } => {
+            // REPLAY §4.3: resolve + validate the record/replay composition rules up
+            // front (clean CLI errors, never a panic). `--record`/`--replay` are clap-
+            // exclusive; `--record` additionally refuses `--parallel`/`--watch` (v1).
+            let test_trace = match (record, replay.as_ref()) {
+                (true, _) => {
+                    if parallel.is_some() {
+                        eprintln!(
+                            "error: --record cannot be combined with --parallel \
+                             (per-isolate trace contexts are not supported in v1)"
+                        );
+                        return ExitCode::from(1);
+                    }
+                    if watch {
+                        eprintln!(
+                            "error: --record cannot be combined with --watch \
+                             (unbounded trace accumulation; not supported in v1)"
+                        );
+                        return ExitCode::from(1);
+                    }
+                    ascript::TestTraceMode::Record { seed }
+                }
+                (false, Some(p)) => ascript::TestTraceMode::Replay {
+                    path: std::path::PathBuf::from(p),
+                },
+                (false, None) => ascript::TestTraceMode::Off,
+            };
             // ELIDE §4.6/§5: resolve the elision decision for the (serial) test path.
             // The PARALLEL path runs each file in a worker isolate, which never elides.
             let elide = ascript::elide_enabled(elide_flag, no_elide);
@@ -1004,6 +1032,75 @@ async fn real_main() -> ExitCode {
                 let _ = locked;
                 None
             };
+
+            // REPLAY §4.3: the `--replay <trace>` path — re-run module load + the one
+            // recorded test under strict Replay, then print the normal pass/fail output.
+            // The trace carries the program path + test name (the CLI `files` are ignored
+            // for replay; a changed test file is a printed warning, not an error).
+            if let ascript::TestTraceMode::Replay { path } = &test_trace {
+                let rep = ascript::run_test_replay(path, packages, caps).await;
+                return match rep {
+                    Ok(summary) => {
+                        for (name, message) in &summary.failures {
+                            println!("FAIL {}: {}{}", name, message, suffix_for(message));
+                        }
+                        summary.print_tally();
+                        if summary.failed > 0 {
+                            ExitCode::from(1)
+                        } else {
+                            ExitCode::SUCCESS
+                        }
+                    }
+                    Err(e) => {
+                        ascript::diagnostics::report(&e);
+                        ExitCode::from(1)
+                    }
+                };
+            }
+            // REPLAY §4.3: the `--record` path — run each FILE under one CliTrace Record
+            // context, slice per-test, auto-save a `P ⧺ S_k` trace for each FAILED test
+            // under `.ascript-traces/`. `--coverage` is ALLOWED (the record path runs on
+            // the tree-walker; coverage is observation-only — recorded effects are the
+            // same), `--parallel`/`--watch` were refused above.
+            if let ascript::TestTraceMode::Record { seed } = test_trace {
+                let rec = ascript::run_tests_record(
+                    &files,
+                    packages,
+                    caps,
+                    update_snapshots,
+                    filter_raw,
+                    seed,
+                )
+                .await;
+                return match rec {
+                    Ok((summary, saved)) => {
+                        for (name, message) in &summary.failures {
+                            println!("FAIL {}: {}{}", name, message, suffix_for(message));
+                        }
+                        summary.print_tally();
+                        for trace in &saved {
+                            println!(
+                                "  trace saved: {} (replay: ascript test --replay {})",
+                                trace.display(),
+                                trace.display()
+                            );
+                        }
+                        if summary.failed > 0 {
+                            ExitCode::from(1)
+                        } else {
+                            ExitCode::SUCCESS
+                        }
+                    }
+                    Err(e) => {
+                        // A module-load failure still wrote its file-level trace inside
+                        // the runner (printed below is the load error). Surface a hint if
+                        // any trace was saved before the error — but the runner returns
+                        // the error without the saved list, so report the error cleanly.
+                        ascript::diagnostics::report(&e);
+                        ExitCode::from(1)
+                    }
+                };
+            }
 
             // DX D2 Task 10: `--watch` re-runs the affected tests on file change (sys-gated,
             // import-graph-scoped). The loop never terminates, so it owns its own printing +

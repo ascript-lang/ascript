@@ -1729,3 +1729,431 @@ if (err != nil) { print("ERR: " + err.message) } else { print(r) }
         );
     }
 }
+
+// ===========================================================================
+// REPLAY §4.2-4.3 — `ascript test --record` / `--replay`
+// ===========================================================================
+
+/// Per-test traces, failure-only save (Task 7). Each test FILE runs under ONE
+/// `CliTrace` Record context; per-test traces are SLICED from the file's event
+/// stream; a trace is written ONLY for a FAILED test under
+/// `.ascript-traces/<stem>__<slug>.trace`.
+mod cli_test {
+    use std::path::{Path, PathBuf};
+    use std::process::Command;
+
+    fn bin() -> &'static str {
+        env!("CARGO_BIN_EXE_ascript")
+    }
+
+    fn unique_dir(tag: &str) -> PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let mut d = std::env::temp_dir();
+        d.push(format!("rr_clitest_{}_{}_{}", std::process::id(), tag, nanos));
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    /// List the `.trace` files written under `<dir>/.ascript-traces/`, or `vec![]`
+    /// if the directory does not exist.
+    fn trace_files(dir: &Path) -> Vec<PathBuf> {
+        let td = dir.join(".ascript-traces");
+        if !td.exists() {
+            return Vec::new();
+        }
+        let mut v: Vec<PathBuf> = std::fs::read_dir(&td)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .filter(|p| p.extension().map(|x| x == "trace").unwrap_or(false))
+            .collect();
+        v.sort();
+        v
+    }
+
+    /// A 3-test file: pass, fail-with-fs+rng-effects, pass. The middle test draws a
+    /// random number AND reads a fixture file, then asserts something false — so its
+    /// trace captures both the RandomRead seam and the recorded fs read.
+    const THREE_TESTS: &str = r#"import * as math from "std/math"
+import * as fs from "std/fs"
+test("alpha passes", () => { assert(1 + 1 == 2, "math works") })
+test("beta fails with effects", () => {
+  let r = math.random()
+  let [content, err] = fs.read("fixture.txt")
+  assert(content == "NEVER", "intentional failure")
+})
+test("gamma passes", () => { assert(2 * 2 == 4, "more math") })
+"#;
+
+    fn write_three_tests(dir: &Path) -> PathBuf {
+        let prog = dir.join("orders.as");
+        std::fs::write(&prog, THREE_TESTS).unwrap();
+        std::fs::write(dir.join("fixture.txt"), "RECORDED-FIXTURE").unwrap();
+        prog
+    }
+
+    /// A 3-test file under `ascript test --record` → exactly ONE
+    /// `.ascript-traces/<stem>__<slug>.trace`; the "trace saved:" hint is printed.
+    /// A fully-green file saves nothing and `.ascript-traces/` is NOT created.
+    #[test]
+    fn failed_test_saves_trace_passing_saves_nothing() {
+        let dir = unique_dir("save");
+        let prog = write_three_tests(&dir);
+
+        let out = Command::new(bin())
+            .current_dir(&dir)
+            .args(["test", "--record"])
+            .arg(&prog)
+            .output()
+            .unwrap();
+        // One test fails → non-zero exit.
+        assert!(!out.status.success(), "a failing test must exit non-zero");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            stdout.contains("trace saved:"),
+            "expected a 'trace saved:' hint, got: {stdout}"
+        );
+        let traces = trace_files(&dir);
+        assert_eq!(
+            traces.len(),
+            1,
+            "exactly one trace for one failed test, got: {traces:?}"
+        );
+        let name = traces[0].file_name().unwrap().to_string_lossy().to_string();
+        assert!(
+            name.starts_with("orders__"),
+            "trace name must start with the file stem, got: {name}"
+        );
+
+        // A fully-green file saves nothing and never creates .ascript-traces/.
+        let green = unique_dir("green");
+        let gprog = green.join("ok.as");
+        std::fs::write(
+            &gprog,
+            "test(\"a\", () => { assert(true, \"ok\") })\ntest(\"b\", () => { assert(1 == 1, \"ok\") })\n",
+        )
+        .unwrap();
+        let gout = Command::new(bin())
+            .current_dir(&green)
+            .args(["test", "--record"])
+            .arg(&gprog)
+            .output()
+            .unwrap();
+        assert!(gout.status.success(), "green run should pass");
+        assert!(
+            !green.join(".ascript-traces").exists(),
+            ".ascript-traces/ must NOT be created on a fully-green run"
+        );
+    }
+
+    /// `ascript test --replay <trace>` → the same failure message, tally
+    /// `0 passed; 1 failed`, exit 1; works after deleting the fs fixture.
+    #[test]
+    fn test_replay_reruns_one_test_deterministically() {
+        let dir = unique_dir("replay");
+        let prog = write_three_tests(&dir);
+
+        let rec = Command::new(bin())
+            .current_dir(&dir)
+            .args(["test", "--record"])
+            .arg(&prog)
+            .output()
+            .unwrap();
+        assert!(!rec.status.success());
+        let rec_out = String::from_utf8_lossy(&rec.stdout).to_string();
+        let traces = trace_files(&dir);
+        assert_eq!(traces.len(), 1, "one trace, got: {traces:?}");
+        let trace = &traces[0];
+
+        // Delete the fixture — a real fs.read would now fail / read differently.
+        std::fs::remove_file(dir.join("fixture.txt")).unwrap();
+
+        let rep = Command::new(bin())
+            .current_dir(&dir)
+            .args(["test", "--replay"])
+            .arg(trace)
+            .output()
+            .unwrap();
+        assert_eq!(
+            rep.status.code(),
+            Some(1),
+            "replay of a failing test exits 1: {rep:?}"
+        );
+        let rep_out = String::from_utf8_lossy(&rep.stdout);
+        assert!(
+            rep_out.contains("0 passed; 1 failed"),
+            "replay tally must be one failure, got: {rep_out}"
+        );
+        // The exact failure line from the record run reappears on replay.
+        let fail_line = rec_out
+            .lines()
+            .find(|l| l.starts_with("FAIL "))
+            .expect("a FAIL line in the record output");
+        assert!(
+            rep_out.contains(fail_line),
+            "replay failure line must match record byte-for-byte\n record: {fail_line}\n replay: {rep_out}"
+        );
+    }
+
+    /// Fixing the assertion (the trace pins INPUTS, not the assertion) → replay
+    /// passes; a changed test file under `--replay` proceeds with a printed WARNING
+    /// (not the hard `run` error).
+    #[test]
+    fn replayed_fixed_test_passes() {
+        let dir = unique_dir("fixed");
+        let prog = write_three_tests(&dir);
+
+        let rec = Command::new(bin())
+            .current_dir(&dir)
+            .args(["test", "--record"])
+            .arg(&prog)
+            .output()
+            .unwrap();
+        assert!(!rec.status.success());
+        let traces = trace_files(&dir);
+        assert_eq!(traces.len(), 1);
+        let trace = traces[0].clone();
+
+        // Fix the failing assertion: the recorded random()/fs.read INPUTS are still
+        // valid, only the assertion changed → the replayed test now PASSES. (The
+        // assertion checks `err != nil` — true regardless of the recorded content.)
+        let fixed = THREE_TESTS.replace(
+            "assert(content == \"NEVER\", \"intentional failure\")",
+            "assert(true, \"now passes\")",
+        );
+        std::fs::write(&prog, fixed).unwrap();
+
+        let rep = Command::new(bin())
+            .current_dir(&dir)
+            .args(["test", "--replay"])
+            .arg(&trace)
+            .output()
+            .unwrap();
+        // A changed test file is a WARNING (not the hard error `run` uses), and the
+        // fixed assertion passes.
+        assert!(
+            rep.status.success(),
+            "fixed test should pass on replay (warn, not error): {rep:?}"
+        );
+        let combined = format!(
+            "{}{}",
+            String::from_utf8_lossy(&rep.stdout),
+            String::from_utf8_lossy(&rep.stderr)
+        );
+        assert!(
+            combined.to_lowercase().contains("warn"),
+            "a changed test file under --replay must print a warning, got: {combined}"
+        );
+        assert!(
+            String::from_utf8_lossy(&rep.stdout).contains("1 passed; 0 failed"),
+            "fixed test tally must be one pass: {combined}"
+        );
+    }
+
+    /// `--record` with `--parallel` is a clean CLI error (v1).
+    #[test]
+    fn record_parallel_refused() {
+        let dir = unique_dir("par");
+        let prog = write_three_tests(&dir);
+        let out = Command::new(bin())
+            .current_dir(&dir)
+            .args(["test", "--record", "--parallel=2"])
+            .arg(&prog)
+            .output()
+            .unwrap();
+        assert!(!out.status.success(), "record + parallel must error");
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            err.to_lowercase().contains("parallel"),
+            "error should name --parallel, got: {err}"
+        );
+    }
+
+    /// `--watch --record` is a clean CLI error (unbounded trace accumulation; v2).
+    #[test]
+    fn record_watch_refused() {
+        let dir = unique_dir("watch");
+        let prog = write_three_tests(&dir);
+        let out = Command::new(bin())
+            .current_dir(&dir)
+            .args(["test", "--record", "--watch"])
+            .arg(&prog)
+            .output()
+            .unwrap();
+        assert!(!out.status.success(), "record + watch must error");
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            err.to_lowercase().contains("watch"),
+            "error should name --watch, got: {err}"
+        );
+    }
+
+    /// `--record` + `--replay` together is a clean CLI error.
+    #[test]
+    fn record_plus_replay_refused() {
+        let dir = unique_dir("conflict");
+        let prog = write_three_tests(&dir);
+        let out = Command::new(bin())
+            .current_dir(&dir)
+            .args(["test", "--record", "--replay", "x.trace"])
+            .arg(&prog)
+            .output()
+            .unwrap();
+        assert!(!out.status.success(), "record + replay must error");
+    }
+
+    /// `--record` with `--coverage` is ALLOWED (coverage is observation-only, VM-side;
+    /// the seams are engine-shared) — record a failing test under `--coverage` → the
+    /// trace replays.
+    #[test]
+    fn record_with_coverage_allowed() {
+        let dir = unique_dir("cov");
+        let prog = write_three_tests(&dir);
+        let out = Command::new(bin())
+            .current_dir(&dir)
+            .args(["test", "--record", "--coverage"])
+            .arg(&prog)
+            .output()
+            .unwrap();
+        assert!(
+            !out.status.success(),
+            "the failing test still exits non-zero"
+        );
+        let traces = trace_files(&dir);
+        assert_eq!(
+            traces.len(),
+            1,
+            "coverage record still writes one trace, got: {traces:?}"
+        );
+        // Delete the fixture and replay — the engine-shared seam proof.
+        std::fs::remove_file(dir.join("fixture.txt")).unwrap();
+        let rep = Command::new(bin())
+            .current_dir(&dir)
+            .args(["test", "--replay"])
+            .arg(&traces[0])
+            .output()
+            .unwrap();
+        assert_eq!(rep.status.code(), Some(1), "replay reruns the failure: {rep:?}");
+        assert!(String::from_utf8_lossy(&rep.stdout).contains("0 passed; 1 failed"));
+    }
+
+    /// Two same-named failing tests across files with the same STEM → the second
+    /// trace gets a `~2` suffix (no overwrite).
+    #[test]
+    fn trace_name_collision_suffixes() {
+        let dir = unique_dir("collide");
+        // Two DIFFERENT directories with the same file stem "svc.as", each with a
+        // failing test named the same → same `<stem>__<slug>` base.
+        let sub_a = dir.join("a");
+        let sub_b = dir.join("b");
+        std::fs::create_dir_all(&sub_a).unwrap();
+        std::fs::create_dir_all(&sub_b).unwrap();
+        let body = "test(\"same name\", () => { assert(false, \"boom\") })\n";
+        let pa = sub_a.join("svc.as");
+        let pb = sub_b.join("svc.as");
+        std::fs::write(&pa, body).unwrap();
+        std::fs::write(&pb, body).unwrap();
+
+        // Run BOTH files in one invocation from `dir` so they share one
+        // `.ascript-traces/` and collide on `svc__same_name.trace`.
+        let out = Command::new(bin())
+            .current_dir(&dir)
+            .args(["test", "--record"])
+            .arg(&pa)
+            .arg(&pb)
+            .output()
+            .unwrap();
+        assert!(!out.status.success());
+        let traces = trace_files(&dir);
+        let names: Vec<String> = traces
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().to_string())
+            .collect();
+        assert_eq!(traces.len(), 2, "two traces, got: {names:?}");
+        assert!(
+            names.iter().any(|n| n.contains("~2")),
+            "a collision must be suffixed ~2, got: {names:?}"
+        );
+    }
+
+    /// 50 failed tests → 50 traces, with no quadratic slicing cost (slices are index
+    /// ranges over one Vec; only the `P ⧺ S_k` write is per-failure).
+    #[test]
+    fn fifty_failures_save_fifty_traces() {
+        let dir = unique_dir("fifty");
+        let prog = dir.join("many.as");
+        let mut body = String::from("import * as math from \"std/math\"\n");
+        for i in 0..50 {
+            body.push_str(&format!(
+                "test(\"fails {i}\", () => {{ let r = math.random(); assert(false, \"boom {i}\") }})\n"
+            ));
+        }
+        std::fs::write(&prog, body).unwrap();
+        let start = std::time::Instant::now();
+        let out = Command::new(bin())
+            .current_dir(&dir)
+            .args(["test", "--record"])
+            .arg(&prog)
+            .output()
+            .unwrap();
+        let elapsed = start.elapsed();
+        assert!(!out.status.success());
+        let traces = trace_files(&dir);
+        assert_eq!(traces.len(), 50, "one trace per failure, got: {}", traces.len());
+        // A generous wall-clock ceiling — quadratic slicing would blow far past this.
+        assert!(
+            elapsed.as_secs() < 30,
+            "50 failures took too long ({elapsed:?}) — possible quadratic slicing"
+        );
+    }
+
+    /// A test that fails during MODULE LOAD (a panic before any test runs) yields a
+    /// file-level trace with a sensible name, and replay reproduces the load failure.
+    #[test]
+    fn module_load_failure_saves_file_level_trace() {
+        let dir = unique_dir("loadfail");
+        let prog = dir.join("broken.as");
+        // A module-level panic (undefined variable) before any test registers.
+        std::fs::write(&prog, "import * as math from \"std/math\"\nlet x = math.random()\nundefined_thing_xyz()\ntest(\"never\", () => {})\n").unwrap();
+        let out = Command::new(bin())
+            .current_dir(&dir)
+            .args(["test", "--record"])
+            .arg(&prog)
+            .output()
+            .unwrap();
+        assert!(!out.status.success(), "module-load failure exits non-zero");
+        let traces = trace_files(&dir);
+        assert_eq!(
+            traces.len(),
+            1,
+            "a module-load failure writes one file-level trace, got: {traces:?}"
+        );
+        assert!(traces[0]
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .starts_with("broken__"));
+
+        // The file-level trace must REPLAY (not be a dead artifact): `test --replay`
+        // re-runs module load under the recorded context and reproduces the load
+        // failure (exit non-zero, the same undefined-name diagnostic).
+        let rep = Command::new(bin())
+            .current_dir(&dir)
+            .args(["test", "--replay"])
+            .arg(&traces[0])
+            .output()
+            .unwrap();
+        assert!(
+            !rep.status.success(),
+            "replaying a module-load-failure trace reproduces the failure (non-zero exit): {rep:?}"
+        );
+        let err = String::from_utf8_lossy(&rep.stderr);
+        assert!(
+            err.contains("undefined_thing_xyz") || err.contains("undefined"),
+            "replay reproduces the load diagnostic, got: {err}"
+        );
+    }
+}

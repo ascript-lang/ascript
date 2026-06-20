@@ -1318,6 +1318,10 @@ impl Drop for InflightGuard {
     }
 }
 
+/// REPLAY §4.3 — the sink `test --record` passes into the per-test runner to collect
+/// each test's `(name, event-index range)` segment over the file-level event Vec.
+pub type TestSliceSink = RefCell<Vec<(String, std::ops::Range<usize>)>>;
+
 /// Outcome of running the tests registered on an `Interp`.
 #[derive(Debug, Default)]
 pub struct TestSummary {
@@ -1982,6 +1986,19 @@ impl Interp {
     /// context (origin `Workflow`), so both are byte-identical to pre-REPLAY.
     pub(crate) fn trace_active(&self) -> bool {
         self.trace_active.get()
+    }
+
+    /// REPLAY §4.3 — the current length of the installed determinism context's recorded
+    /// event stream (0 when no context is installed). Used by `test --record` to mark
+    /// the module-load prefix `P` and each per-test segment `S_k` as INDEX RANGES over
+    /// the single file-level event Vec (so 50 failing tests slice in O(1) each — no
+    /// quadratic clone). All-synchronous; no borrow is held across an await.
+    pub(crate) fn det_event_count(&self) -> usize {
+        self.determinism
+            .borrow()
+            .as_ref()
+            .map(|ctx| ctx.events.len())
+            .unwrap_or(0)
     }
 
     /// REPLAY §6 — refuse creating a worker isolate under a `CliTrace` (record OR
@@ -4046,6 +4063,27 @@ impl Interp {
         filter: Option<&crate::test_filter::TestFilter>,
         det: Option<crate::det::DetTestConfig>,
     ) -> Result<TestSummary, Control> {
+        self.run_registered_tests_det_sliced(filter, det, None).await
+    }
+
+    /// REPLAY §4.3 — the per-test runner with an optional `record_slices` sink. When
+    /// `Some`, the runner marks `(name, start..end)` over the file-level determinism
+    /// context's event Vec for EACH test it runs (skipped/filtered tests record no
+    /// slice), pushing into the shared `Vec`. This is the `test --record` slicing seam:
+    /// the caller installs ONE file-level `CliTrace` Record context, this fn marks each
+    /// test's segment, and the caller writes `P ⧺ S_k` for the failures.
+    ///
+    /// **BATT reconciliation:** the per-test BATT install (a fresh `record` context per
+    /// test when `det` is `Some`) and REPLAY recording (one file-level context, sliced)
+    /// are MUTUALLY EXCLUSIVE — `test --record` passes `det: None` so the per-test
+    /// install below never fires, and the file-level context the caller installed stays
+    /// the single source. The two paths cannot both be active.
+    pub async fn run_registered_tests_det_sliced(
+        &self,
+        filter: Option<&crate::test_filter::TestFilter>,
+        det: Option<crate::det::DetTestConfig>,
+        record_slices: Option<&TestSliceSink>,
+    ) -> Result<TestSummary, Control> {
         let mut summary = TestSummary::default();
         // Clone out the registrations first so the table borrow is not held across
         // each `call_value` await.
@@ -4067,6 +4105,10 @@ impl Interp {
                     cfg.start_ms,
                 )))
             });
+            // REPLAY §4.3 — mark this test's segment START over the file-level event Vec
+            // (the index BEFORE the body runs). Read in a sync scope; no borrow held
+            // across the await below.
+            let slice_start = record_slices.map(|_| self.det_event_count());
             // BATT C3 (§10.3): a `prop()` registration is a `{__prop}`-tagged Object,
             // not a callable — drive the property runner (draw + shrink + report)
             // instead of the plain `call_value` path. The per-test det context is
@@ -4083,6 +4125,14 @@ impl Interp {
             // and the next test starts from a clean cell.
             if let Some(prev) = prev {
                 self.set_determinism(prev);
+            }
+            // REPLAY §4.3 — mark this test's segment END (the index AFTER the body) and
+            // record `(name, start..end)` over the file-level event Vec. An `Exit`
+            // unwinds below before reaching this, so an exiting test contributes no
+            // slice (it never produces a saved failure trace anyway).
+            if let (Some(sink), Some(start)) = (record_slices, slice_start) {
+                let end = self.det_event_count();
+                sink.borrow_mut().push((name.clone(), start..end));
             }
             match outcome {
                 Ok(_) | Err(Control::Propagate(_)) => summary.passed += 1,

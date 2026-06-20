@@ -867,6 +867,385 @@ async fn run_tests_serial(
     result
 }
 
+// ===========================================================================
+// REPLAY §4.2-4.3 — `ascript test --record` / `--replay`
+// ===========================================================================
+
+/// REPLAY §4.2-4.3 — how a `test` invocation participates in record/replay. `Off` is
+/// the default (byte-identical to today's `ascript test`). `Record` runs each FILE
+/// under one `CliTrace` Record context and auto-saves a per-test failure trace;
+/// `Replay` re-runs module load + exactly one recorded test under strict Replay.
+#[derive(Debug, Clone, Default)]
+pub enum TestTraceMode {
+    /// No record/replay — today's plain `ascript test` (byte-identical default).
+    #[default]
+    Off,
+    /// `--record [--seed N]`: per-test failure traces auto-saved under
+    /// `.ascript-traces/`. `seed` pins the file-level deterministic context.
+    Record { seed: Option<u64> },
+    /// `--replay <FILE>`: re-run module load + the one recorded test under strict
+    /// Replay (no real I/O).
+    Replay { path: std::path::PathBuf },
+}
+
+/// REPLAY §4.2 — the project-local directory auto-saved per-test traces go under
+/// (relative to the CWD, like `__snapshots__/`). NOT `$ASCRIPT_CACHE`.
+const TRACES_DIR: &str = ".ascript-traces";
+
+/// REPLAY §4.2 — slugify a test name into the filename-safe `[A-Za-z0-9_-]` charset
+/// (every other char → `_`, runs collapsed, trimmed). An empty result → `"test"`.
+fn slugify_test_name(name: &str) -> String {
+    let mut out = String::with_capacity(name.len());
+    let mut last_us = false;
+    for ch in name.chars() {
+        if ch.is_ascii_alphanumeric() || ch == '-' {
+            out.push(ch);
+            last_us = false;
+        } else if !last_us {
+            out.push('_');
+            last_us = true;
+        }
+    }
+    let trimmed = out.trim_matches('_').to_string();
+    if trimmed.is_empty() {
+        "test".to_string()
+    } else {
+        trimmed
+    }
+}
+
+/// REPLAY §4.2 — the file stem of a test path (`tests/orders.as` → `orders`),
+/// slugified so the on-disk name is filename-safe even from an exotic source path.
+fn file_stem_slug(path: &Path) -> String {
+    let stem = path
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "file".to_string());
+    slugify_test_name(&stem)
+}
+
+/// REPLAY §4.2 — choose a non-colliding trace path under `<cwd>/.ascript-traces/` for
+/// `<stem>__<slug>.trace`; a collision is suffixed `~2`, `~3`, … (so two same-named
+/// tests across files with the same stem never overwrite). `taken` tracks the names
+/// already chosen THIS run (the file may not yet exist on disk).
+fn unique_trace_path(
+    dir: &Path,
+    stem: &str,
+    slug: &str,
+    taken: &mut std::collections::HashSet<String>,
+) -> std::path::PathBuf {
+    let base = format!("{stem}__{slug}");
+    let mut candidate = base.clone();
+    let mut n = 2u32;
+    while taken.contains(&candidate) || dir.join(format!("{candidate}.trace")).exists() {
+        candidate = format!("{base}~{n}");
+        n += 1;
+    }
+    taken.insert(candidate.clone());
+    dir.join(format!("{candidate}.trace"))
+}
+
+#[cfg(not(ascript_rt))]
+/// REPLAY §4.3 — the `ascript test --record` path. Each FILE runs on the tree-walker
+/// (the standing `ascript test` engine) under ONE `CliTrace` Record context; the
+/// module-load prefix `P` and each test's segment `S_k` are marked as INDEX RANGES
+/// over the file's single event Vec. After each file, a `P ⧺ S_k` trace is written
+/// under `.ascript-traces/` for EACH FAILED test (a green file writes nothing). A
+/// module-load failure writes ONE file-level trace (the whole prefix). Returns the
+/// aggregated summary plus the list of saved trace paths (for the post-tally hints).
+pub async fn run_tests_record(
+    files: &[String],
+    packages: Option<crate::interp::PackageMap>,
+    caps: Option<crate::stdlib::caps::CapSet>,
+    update_snapshots: bool,
+    filter: Option<&str>,
+    seed: Option<u64>,
+) -> Result<(TestSummary, Vec<std::path::PathBuf>), AsError> {
+    use std::cell::RefCell;
+    let filter_raw = filter;
+    let filter = match filter {
+        Some(raw) => Some(crate::test_filter::TestFilter::parse(raw).map_err(AsError::new)?),
+        None => None,
+    };
+    let filter = filter.as_ref();
+
+    let mut summary = TestSummary::default();
+    let mut saved: Vec<std::path::PathBuf> = Vec::new();
+    // Names chosen this run (collision suffixing spans files sharing a stem).
+    let mut taken: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let traces_dir = std::path::PathBuf::from(TRACES_DIR);
+
+    for file in files {
+        let path = Path::new(file);
+        let stem = file_stem_slug(path);
+        // A fresh Interp + file-level CliTrace Record context per FILE (each file's
+        // events + slice ranges are independent; a fresh seed-derived start so a
+        // `--seed N` run is reproducible).
+        let interp = Rc::new(Interp::new());
+        if let Some(caps) = caps.clone() {
+            interp.set_caps(caps);
+        }
+        if let Some(map) = packages.clone() {
+            interp.set_package_resolver(map);
+        }
+        interp.set_snapshot_update(update_snapshots);
+        interp.install_self();
+        // Record mode does NOT elide (full checks under record — the recorded stream
+        // must match a plain replay) and does NOT install a per-test BATT context
+        // (`det: None` below) — the file-level context is the single source (§4.3).
+        interp.set_elide_mode(false);
+
+        let seed = seed.unwrap_or_else(trace_entropy_seed);
+        let start_ms = crate::det::deterministic_start_ms(seed);
+        let source = std::fs::read(path).unwrap_or_default();
+        let source_sha256 = trace_sha256(&source);
+
+        interp.set_determinism(Some(crate::det::DeterminismContext::record_trace(
+            seed, start_ms,
+        )));
+
+        let slices: RefCell<Vec<(String, std::ops::Range<usize>)>> = RefCell::new(Vec::new());
+        let local = tokio::task::LocalSet::new();
+
+        // Run module load (marks the prefix end on success) + the registered tests
+        // (marking each segment). On a module-load failure we still want the recorded
+        // prefix, so we capture it before bailing.
+        enum FileRun {
+            Loaded {
+                prefix_end: usize,
+                summary: TestSummary,
+            },
+            LoadFailed {
+                error: AsError,
+            },
+        }
+
+        let run: FileRun = local
+            .run_until(crate::interp::ambient_root_scope(async {
+                match interp.load_module(path).await {
+                    Ok(_) | Err(crate::interp::Control::Propagate(_)) => {}
+                    Err(crate::interp::Control::Panic(e)) => {
+                        return FileRun::LoadFailed { error: e }
+                    }
+                    Err(crate::interp::Control::Exit(_)) => {
+                        return FileRun::LoadFailed {
+                            error: AsError::new("exit() called during test run"),
+                        }
+                    }
+                }
+                let prefix_end = interp.det_event_count();
+                match interp
+                    .run_registered_tests_det_sliced(filter, None, Some(&slices))
+                    .await
+                {
+                    Ok(s) => FileRun::Loaded {
+                        prefix_end,
+                        summary: s,
+                    },
+                    Err(crate::interp::Control::Exit(_)) => FileRun::LoadFailed {
+                        error: AsError::new("exit() called during test run"),
+                    },
+                    Err(crate::interp::Control::Panic(e)) => FileRun::LoadFailed { error: e },
+                    Err(crate::interp::Control::Propagate(_)) => FileRun::Loaded {
+                        prefix_end,
+                        summary: TestSummary::default(),
+                    },
+                }
+            }))
+            .await;
+        local.await;
+
+        // Take the full file-level event stream out of the context.
+        let events = interp
+            .set_determinism(None)
+            .map(|ctx| ctx.events)
+            .unwrap_or_default();
+        crate::gc::collect();
+
+        let make_header = |test_name: Option<String>| crate::trace::TraceHeader {
+            seed,
+            start_ms,
+            kind: crate::trace::TraceKind::Test,
+            program_path: path.display().to_string(),
+            source_sha256,
+            argv: Vec::new(),
+            test_name,
+            filter: filter_raw.map(|s| s.to_string()),
+            created_ms: crate::interp::real_now_ms(),
+            engine: 0,
+        };
+
+        match run {
+            FileRun::LoadFailed { error } => {
+                // A module-load failure: write ONE file-level trace (the whole recorded
+                // prefix) named for the file, then surface the error like the serial
+                // runner does (non-zero exit). The trace lets the user replay the load.
+                std::fs::create_dir_all(&traces_dir).map_err(|e| {
+                    AsError::new(format!("cannot create {TRACES_DIR}: {e}"))
+                })?;
+                let trace_path =
+                    unique_trace_path(&traces_dir, &stem, "module_load", &mut taken);
+                let header = make_header(None);
+                crate::trace::write_trace(&trace_path, &header, &events)?;
+                saved.push(trace_path);
+                return Err(error);
+            }
+            FileRun::Loaded {
+                prefix_end,
+                summary: file_summary,
+            } => {
+                let slices = slices.into_inner();
+                // For each FAILED test, slice `P ⧺ S_k` and write its trace.
+                let failed_names: std::collections::HashSet<&str> = file_summary
+                    .failures
+                    .iter()
+                    .map(|(name, _)| name.as_str())
+                    .collect();
+                if !failed_names.is_empty() {
+                    std::fs::create_dir_all(&traces_dir).map_err(|e| {
+                        AsError::new(format!("cannot create {TRACES_DIR}: {e}"))
+                    })?;
+                }
+                let prefix = &events[..prefix_end.min(events.len())];
+                for (name, range) in &slices {
+                    if !failed_names.contains(name.as_str()) {
+                        continue;
+                    }
+                    let start = range.start.min(events.len());
+                    let end = range.end.min(events.len());
+                    let seg = if start <= end { &events[start..end] } else { &[] };
+                    let mut sliced: Vec<crate::det::DetEvent> =
+                        Vec::with_capacity(prefix.len() + seg.len());
+                    sliced.extend_from_slice(prefix);
+                    sliced.extend_from_slice(seg);
+                    let slug = slugify_test_name(name);
+                    let trace_path = unique_trace_path(&traces_dir, &stem, &slug, &mut taken);
+                    let header = make_header(Some(name.clone()));
+                    crate::trace::write_trace(&trace_path, &header, &sliced)?;
+                    saved.push(trace_path);
+                }
+
+                summary.passed += file_summary.passed;
+                summary.failed += file_summary.failed;
+                summary.filtered += file_summary.filtered;
+                summary.failures.extend(file_summary.failures);
+            }
+        }
+    }
+
+    Ok((summary, saved))
+}
+
+#[cfg(not(ascript_rt))]
+/// REPLAY §4.3 — the `ascript test --replay <trace>` path. Reads the header, then
+/// re-runs module load + exactly the ONE recorded test (an internal exact-name filter
+/// on `header.test_name`) under a strict Replay context. Returns the per-test summary;
+/// the caller prints the normal pass/fail output. A CHANGED test file proceeds with a
+/// printed WARNING (not the hard error `run` uses — the whole point is editing the
+/// test/code between replays; divergence detection at the seams remains the guard).
+pub async fn run_test_replay(
+    trace_path: &Path,
+    packages: Option<crate::interp::PackageMap>,
+    caps: Option<crate::stdlib::caps::CapSet>,
+) -> Result<TestSummary, AsError> {
+    let bytes = std::fs::read(trace_path).map_err(|e| {
+        AsError::new(format!("cannot read trace {}: {}", trace_path.display(), e))
+    })?;
+    let (header, events) = crate::trace::read_trace(&bytes).map_err(|e| {
+        AsError::new(format!("cannot replay {}: {}", trace_path.display(), e))
+    })?;
+    if header.kind != crate::trace::TraceKind::Test {
+        return Err(AsError::new(
+            "this is a `run` trace, not a test trace — replay it with `ascript run --replay`"
+                .to_string(),
+        ));
+    }
+    // A `test --record` trace is either a per-test slice (`test_name = Some`) or a
+    // FILE-LEVEL module-load-failure trace (`test_name = None`, §4.3 — written when the
+    // file panics before any test runs). The former replays exactly that one test; the
+    // latter replays just module load, reproducing the recorded load failure.
+    let prog = std::path::PathBuf::from(&header.program_path);
+
+    // Source-identity check, SHARPENED for kind=test (§4.3): a changed test file is a
+    // printed WARNING, not the hard error `run` uses (you EDIT the test between
+    // replays). Divergence detection at the seams remains the guard.
+    match std::fs::read(&prog) {
+        Ok(src) => {
+            if trace_sha256(&src) != header.source_sha256 {
+                eprintln!(
+                    "warning: test file '{}' changed since this trace was recorded — \
+                     replaying anyway (divergence at a seam will still be reported)",
+                    prog.display()
+                );
+            }
+        }
+        Err(e) => {
+            eprintln!(
+                "warning: cannot read test file '{}' ({}) — replaying from the trace's \
+                 recorded effects only",
+                prog.display(),
+                e
+            );
+        }
+    }
+
+    let interp = Rc::new(Interp::new());
+    if let Some(caps) = caps {
+        interp.set_caps(caps);
+    }
+    if let Some(map) = packages {
+        interp.set_package_resolver(map);
+    }
+    interp.install_self();
+    interp.set_elide_mode(false);
+    // Install the strict Replay context (consumes `P` during load, `S_k` during the
+    // one test).
+    interp.set_determinism(Some(crate::det::DeterminismContext::replay_trace(
+        header.seed,
+        header.start_ms,
+        events,
+    )));
+
+    // An exact-name filter on the recorded test (regex-free, so this path works under
+    // `--no-default-features`). `None` for a module-load-failure trace → no specific
+    // test is run; the module load itself reproduces the recorded failure.
+    let filter = header
+        .test_name
+        .as_ref()
+        .map(|n| crate::test_filter::TestFilter::exact(n));
+
+    let local = tokio::task::LocalSet::new();
+    let result: Result<TestSummary, AsError> = local
+        .run_until(crate::interp::ambient_root_scope(async {
+            match interp.load_module(&prog).await {
+                Ok(_) | Err(crate::interp::Control::Propagate(_)) => {}
+                Err(crate::interp::Control::Panic(e)) => return Err(e),
+                Err(crate::interp::Control::Exit(_)) => {
+                    return Err(AsError::new("exit() called during test replay"))
+                }
+            }
+            // A module-load-failure trace (`filter` None): the load above already
+            // reproduced the recorded failure (returned via the Panic arm) or — if the
+            // file was since fixed — succeeded with no specific test to run.
+            let Some(filter) = &filter else {
+                return Ok(TestSummary::default());
+            };
+            match interp.run_registered_tests_det(Some(filter), None).await {
+                Ok(summary) => Ok(summary),
+                Err(crate::interp::Control::Exit(_)) => {
+                    Err(AsError::new("exit() called during test replay"))
+                }
+                Err(crate::interp::Control::Panic(e)) => Err(e),
+                Err(crate::interp::Control::Propagate(_)) => Ok(TestSummary::default()),
+            }
+        }))
+        .await;
+    local.await;
+    interp.set_determinism(None);
+    crate::gc::collect();
+    result
+}
+
 /// DX D2 Task 8 — report (and, under `--update-snapshots`, REMOVE) orphan snapshot
 /// files after a full serial run. Deterministic (sorted) output; never panics on an
 /// unreadable/permission-denied path (the scan + removal both degrade cleanly).

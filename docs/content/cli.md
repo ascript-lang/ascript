@@ -311,6 +311,8 @@ and they can coexist (import under a different alias if needed: `import * as A f
 | `--sandbox` | Deny all five dangerous capabilities for the test run. |
 | `--elide` | Enable contract elision for the (serial) test run (default-off; behavior byte-identical). Equivalent to `ASCRIPT_ELIDE=1`. The `--parallel` path runs each file in a worker isolate, which never elides. |
 | `--no-elide` | Force contract elision off (kill switch). Equivalent to `ASCRIPT_NO_ELIDE=1`. |
+| `--record` | Record per-test traces for this run. Each test file runs under one deterministic Record context (virtual clock, instant sleeps, seeded RNG — pin it with `--seed N`); a replayable trace is auto-saved **only for a failed test** under `.ascript-traces/<file_stem>__<test-name-slug>.trace` (a fully-green file writes nothing). After the tally, each saved trace prints a `trace saved:` hint. Conflicts with `--parallel`/`--watch`/`--replay` (v1). Add `.ascript-traces/` to your `.gitignore`. |
+| `--replay <FILE>` | Replay a previously recorded per-test trace: re-run module load + exactly that one test under strict Replay — every effect (clock/RNG/`fs`/buffered `http`/…) returns its recorded value with **no real I/O**, so you can replay a failed test after the fixture/network is gone. The program path and test name come from the trace (the `files` args are ignored). A changed test file proceeds with a printed **warning** (not an error — the point is editing the test/code between replays); a divergence at a seam is still reported. A sliced per-test replay re-runs module load + one test, so a test depending on a sibling test's seam effects diverges loudly (itself a finding: the test is order-dependent). |
 
 ## `ascript lsp`
 
