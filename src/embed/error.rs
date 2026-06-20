@@ -63,10 +63,8 @@ pub enum EmbedError {
 
 impl EmbedError {
     /// Build a `Compile` error from a single `AsError` (the shape `compile_source`
-    /// failures take): one diagnostic with its span + rendered report.
-    ///
-    /// Wired into `eval`'s compile step in Task 1.2; `#[allow(dead_code)]` until then.
-    #[allow(dead_code)]
+    /// failures take): one diagnostic with its span + rendered report. Wired into
+    /// `eval`'s compile step.
     pub(crate) fn from_compile(err: &AsError) -> Self {
         let (start, end) = err.span.map(|s| (s.start, s.end)).unwrap_or((0, 0));
         EmbedError::Compile(vec![EmbedDiagnostic {
