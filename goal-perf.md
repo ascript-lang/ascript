@@ -345,7 +345,8 @@ stated, results are measured.
   subset (clock/RNG/FFI) as v1. Zero-cost-when-off inherited from det's INERT default.
   - Spec: `superpowers/specs/2026-06-12-record-replay-design.md` · Plan: `superpowers/plans/2026-06-12-record-replay.md`
 
-- 🔒 **BATT — backend batteries (T1+T2).** One multi-unit stdlib spec, phased like the
+- ✅ **BATT — backend batteries (T1+T2). MERGED to `main` in 4 phases (`--no-ff`): A auth `fc21c1f`,
+  B data `bf13fb3`, C testing `a1c92cf`, D toolbelt `72d5977`. See EXECUTION LOG.** One multi-unit stdlib spec, phased like the
   batteries campaign: **T1** — TLS for `std/server`/`std/tcp` (rustls); `std/jwt` + auth
   (JWKS, OAuth2/OIDC client, signed cookies/sessions); `std/archive` (tar+zip, streaming —
   also RT's `--oci` tar substrate); `std/xml` (+ HTML sanitizer); `std/email` (SMTP + message
@@ -396,6 +397,44 @@ stated, results are measured.
   revisit inline short strings ONLY behind its measured-win gate.
 
 ## EXECUTION LOG (live)
+
+- **BATT** — ✅ MERGED to `main` in **4 phases** (`--no-ff`): **A auth `fc21c1f`** (std/jwt typed-keys +
+  std/oauth PKCE), **B data `bf13fb3`** (std/{archive,xml,html,email,blob}), **C testing `a1c92cf`**
+  (det-test seam + std/test + prop()), **D toolbelt `72d5977`** (std/{cron,semver,markdown,diff}). One
+  multi-unit stdlib spec, subagent-driven (fresh implementer + independent opus reviewer per task; per-phase
+  + whole-effort holistic; the four security-sensitive units each got a dedicated adversarial security
+  review). **Pure stdlib + cap-gate generalizations — NO engine/`.aso`/opcode/`Value`-size change across the
+  whole campaign** (`ASO_FORMAT_VERSION` 29 unchanged, `Value` 24; `tests/batt_negative_space.rs` pins both;
+  `vm_differential` four-mode unchanged at 445/0 both feature configs). **Real defects caught + fixed in-branch
+  by the review gates** (production-grade mandate, each failing-test-first): (1) **std/blob SigV4
+  double-encode** — keys + list/multipart queries were double-percent-encoded in the signature vs the wire URL;
+  ASCII-idempotent so all happy-path tests passed against a non-verifying mock, but real S3 would reject every
+  non-ASCII key / base64 continuation token with `SignatureDoesNotMatch`. Caught only because the review
+  upgraded the test stub to **RECOMPUTE the signature from the wire bytes** (the durable guard); fixed by
+  single-encoding (raw path/pairs → one `canonical_uri`/`canonical_query_pairs`, wire URL built from the same
+  strings). (2) **std/cron slab-`borrow()` VM panic** — `ObjectCell::borrow()` on a source-literal opts object
+  hard-aborts the VM (slab storage) while the tree-walker (Dict) succeeds — a four-mode divergence + uncatchable
+  crash that unit tests built from `IndexMap` (Dict) structurally could not catch; fixed with the slab-safe
+  `ObjectCell::get` accessor + a VM-path regression test. This **SHAPE footgun is now a documented DX rule** (any
+  stdlib fn reading user-Object fields uses `.get()`, never `.borrow()`). (3) **A1 missed a std_sigs row**, (4)
+  **Phase-A/B rt_select tiering rows**, (5) **B6 swapped gate-label counts** — drift caught at merge boundaries.
+  (6) **Carry-forward: a pre-existing tree-sitter gap** (the `template_string` rule had no escape alternative, so
+  `` `${x}\n${y}` `` produced editor ERROR nodes) surfaced by Phase-B's `blob_basics.as` and fixed root-cause
+  (`template_escape` rule + regen `parser.c --abi 14` + regression test) — the lesson: tree-sitter is a THIRD
+  parser that four-mode + `check` don't exercise. **Security batteries** (each adversarially reviewed + RUN):
+  zip-slip (lexical-normalize + canonical-root containment + symlink-nofollow), XXE (no entity table by
+  construction), XSS (fail-closed emit-from-parse sanitizer; reused as the single source of truth by markdown's
+  sanitize-by-default pipeline — 25+ vectors inert), SMTP STARTTLS-strip → Tier-1 / plaintext-auth → Tier-2 +
+  wire-layer CRLF re-validation, SigV4 (cross-checked vs the AWS test-suite vectors; semver cross-checked vs node
+  `semver`; diff byte-matched vs GNU `diff -u`; cron next-time cross-checked vs python `croniter`). **Caps:** the
+  `required_cap` chokepoint generalized to a `CapReq` conjunction (CNTR precedent) where needed; whole-module
+  `Net` for email/blob (incl. `blob.presign`), PER-FUNC `Fs` for archive, `KNOWN_UNGATED` for the pure modules;
+  `cap_audit` (Gate-10) + the classification-completeness test enforce the partition. **Determinism:** the C1
+  seam (`set_determinism`, `ascript test --seed/--frozen-time`) is INERT by default (no-flag run byte-identical),
+  installed per-test; `prop()` shrinking converges to exact boundaries (`x<=99`→`100`, `!contains("ab")`→`"ab"`).
+  10 new Cargo features (tls/auth/archive/xml/email/blob/cron/semver/markdown/diff), all default-on, all
+  `#[cfg]`-gated so `--no-default-features` still builds. CLAUDE.md gained a condensed BATT subsection + the 10
+  features; stdlib overview + README rows complete; per-module docs on their owning pages with NAV intact.
 
 - **DEFER** — ✅ MERGED to `main` (`--no-ff`). The campaign's one grammar change: `defer [await]
   <call>`, reserved keyword, call-only, args-evaluated-at-statement, per-activation LIFO, drained
