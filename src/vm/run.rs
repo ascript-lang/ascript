@@ -9046,6 +9046,15 @@ impl Vm {
             .map(|s| s.value.clone())
     }
 
+    /// EMBED hook: define (or overwrite) a module-scope user-global, defined MUTABLE
+    /// (like a top-level `let`) so a host can `set_global` repeatedly. Delegates to the
+    /// same `define_user_global` the compiler's `DEFINE_GLOBAL` uses — so the struct-gen
+    /// bump + class `def_env` sync that keep the user-global caches coherent happen
+    /// exactly as for an in-script define. Used only by `ascript::embed::Isolate`.
+    pub fn define_user_global_mutable(&self, name: &str, value: Value) {
+        self.define_user_global(Rc::from(name), value, true);
+    }
+
     /// Resolve a module-scope user-global by name, returning BOTH its stable
     /// `IndexMap` index and its (cloned) `Value`, or `None` if not yet defined (SP8).
     /// The index is stable for the `Vm`'s life (user-globals are only ever inserted),

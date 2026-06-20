@@ -274,6 +274,109 @@ impl Isolate {
         map_outcome(outcome)
     }
 
+    /// Call a module-scope global function by name (spec §3.3). If the callee is an
+    /// `async fn` (its call returns a `future<T>`, eager-scheduled per M17), the future
+    /// is driven to completion and its resolved value returned (**auto-await**).
+    ///
+    /// # Errors
+    ///
+    /// [`EmbedError::Undefined`] if no global named `name` exists;
+    /// [`EmbedError::Panic`] if the callee is not callable or the call panics;
+    /// [`EmbedError::NestedRuntime`] from inside an ambient runtime (use
+    /// [`call_async`](Self::call_async)).
+    pub fn call(&self, name: &str, args: &[AsValue]) -> Result<AsValue, EmbedError> {
+        self.guard_no_ambient_runtime()?;
+        let callee = self.lookup_global(name)?;
+        self.call_blocking(callee, args)
+    }
+
+    /// The async variant of [`call`](Self::call): a `!Send` future the host drives.
+    pub async fn call_async(&self, name: &str, args: &[AsValue]) -> Result<AsValue, EmbedError> {
+        let callee = self.lookup_global(name)?;
+        call_inner(&self.vm, callee, marshal_args(args)).await
+    }
+
+    /// Call a callable [`AsValue`] (a function handle previously read out via
+    /// [`global`](Self::global)). Auto-awaits a returned future, like [`call`](Self::call).
+    pub fn call_value(&self, callee: &AsValue, args: &[AsValue]) -> Result<AsValue, EmbedError> {
+        self.guard_no_ambient_runtime()?;
+        self.call_blocking(callee.value().clone(), args)
+    }
+
+    /// The async variant of [`call_value`](Self::call_value).
+    pub async fn call_value_async(
+        &self,
+        callee: &AsValue,
+        args: &[AsValue],
+    ) -> Result<AsValue, EmbedError> {
+        call_inner(&self.vm, callee.value().clone(), marshal_args(args)).await
+    }
+
+    /// Read a module-scope global by name (`None` if undefined).
+    pub fn global(&self, name: &str) -> Option<AsValue> {
+        self.vm.user_global(name).map(AsValue::from_value)
+    }
+
+    /// Define or overwrite a module-scope global, defined MUTABLE (like a top-level
+    /// `let`) so it can be set repeatedly and read by later evals.
+    pub fn set_global(&self, name: &str, value: AsValue) -> Result<(), EmbedError> {
+        self.vm
+            .define_user_global_mutable(name, value.into_value());
+        Ok(())
+    }
+
+    /// Load + run a compiled module archive (a single `.aso` `ascript build` output) as
+    /// the entry program on this isolate, verified through the same `.aso` trust
+    /// boundary the CLI uses ([`Chunk::from_bytes_verified`](crate::vm::chunk::Chunk)).
+    /// Returns the program's trailing value.
+    ///
+    /// # Errors
+    ///
+    /// [`EmbedError::Archive`] on a decode/verify failure (the verifier's message
+    /// verbatim); [`EmbedError::Panic`]/[`EmbedError::Exit`] for a run outcome;
+    /// [`EmbedError::NestedRuntime`] from inside an ambient runtime.
+    pub fn load_archive(&self, bytes: &[u8]) -> Result<AsValue, EmbedError> {
+        self.guard_no_ambient_runtime()?;
+        let fiber = prepare_archive_fiber(bytes)?;
+        let local = tokio::task::LocalSet::new();
+        let vm = Rc::clone(&self.vm);
+        let rt = self.rt();
+        let result = rt.block_on(local.run_until(async move { local_run(&vm, fiber).await }));
+        rt.block_on(local);
+        map_outcome(result)
+    }
+
+    /// The async variant of [`load_archive`](Self::load_archive).
+    pub async fn load_archive_async(&self, bytes: &[u8]) -> Result<AsValue, EmbedError> {
+        let fiber = prepare_archive_fiber(bytes)?;
+        let outcome = local_run(&self.vm, fiber).await;
+        map_outcome(outcome)
+    }
+
+    /// Resolve a module-scope global by name → its value, or `Undefined`.
+    fn lookup_global(&self, name: &str) -> Result<crate::value::Value, EmbedError> {
+        self.vm
+            .user_global(name)
+            .ok_or_else(|| EmbedError::Undefined(format!("'{name}' is not defined")))
+    }
+
+    /// Drive a `call` to completion on the owned runtime (blocking), with the per-call
+    /// LocalSet + drain (mirrors `eval`).
+    fn call_blocking(
+        &self,
+        callee: crate::value::Value,
+        args: &[AsValue],
+    ) -> Result<AsValue, EmbedError> {
+        let argv = marshal_args(args);
+        let local = tokio::task::LocalSet::new();
+        let vm = Rc::clone(&self.vm);
+        let rt = self.rt();
+        let result =
+            rt.block_on(local.run_until(async move { call_inner(&vm, callee, argv).await }));
+        rt.block_on(local); // drain spawned tasks
+        result
+    }
+
     /// Compile `src`, accumulate it onto the session source (so a `worker fn` defined
     /// in an earlier eval stays sliceable), and build the not-started top-level fiber.
     /// A compile error short-circuits with NO session mutation (the REPL rule).
@@ -384,6 +487,58 @@ fn make_top_fiber(chunk: Chunk) -> Fiber {
 /// telemetry/deadline task-locals seam — `None`/inert in the embed default).
 async fn local_run(vm: &Rc<Vm>, mut fiber: Fiber) -> Result<RunOutcome, Control> {
     ambient_root_scope(vm.run(&mut fiber)).await
+}
+
+/// Marshal host `AsValue` args into engine `Value`s (a refcount bump per container —
+/// the §5 "containers cross by handle" model; scalars copy).
+fn marshal_args(args: &[AsValue]) -> Vec<crate::value::Value> {
+    args.iter().map(|a| a.value().clone()).collect()
+}
+
+/// Invoke `callee` with `argv` on `vm`, auto-awaiting a returned future (spec §3.3 —
+/// an `async fn` callee returns an eager-scheduled `future<T>` which is driven to
+/// completion and its resolved value returned). The caller has already entered a
+/// `LocalSet`. A non-callable callee surfaces the engine's own "value is not callable"
+/// Tier-2 panic as `EmbedError::Panic`.
+async fn call_inner(
+    vm: &Rc<Vm>,
+    callee: crate::value::Value,
+    argv: Vec<crate::value::Value>,
+) -> Result<AsValue, EmbedError> {
+    let result = ambient_root_scope(async {
+        let r = vm
+            .call_value(callee, argv, crate::span::Span::new(0, 0))
+            .await?;
+        // Auto-await an `async fn` callee's returned future (the §3.3 rule, mirroring
+        // the VM's own native re-entry pattern `Future(f) => f.get().await`). Use the
+        // BORROWING `kind()` view + clone the `SharedFuture` (identity-equal, an `Rc`
+        // bump) so the non-future case returns `r` untouched without a rebuild.
+        let fut = match r.kind() {
+            crate::value::ValueKind::Future(f) => Some(f.clone()),
+            _ => None,
+        };
+        match fut {
+            Some(f) => f.get().await,
+            None => Ok(r),
+        }
+    })
+    .await;
+    match result {
+        Ok(v) => Ok(AsValue::from_value(v)),
+        Err(Control::Panic(e)) => Err(EmbedError::from_panic(&e)),
+        // A `?`-propagation out of the called fn → the `[nil, err]` pair is the result.
+        Err(Control::Propagate(pair)) => Ok(AsValue::from_value(pair)),
+        Err(Control::Exit(code)) => Err(EmbedError::Exit(code)),
+    }
+}
+
+/// Decode + verify a single `.aso` archive's bytes through the same trust boundary the
+/// CLI uses, building a not-started top-level fiber. A decode/verify failure is an
+/// `EmbedError::Archive` carrying the verifier's message.
+fn prepare_archive_fiber(bytes: &[u8]) -> Result<Fiber, EmbedError> {
+    let chunk = Chunk::from_bytes_verified(bytes)
+        .map_err(|e| EmbedError::Archive(format!("{e:?}")))?;
+    Ok(make_top_fiber(chunk))
 }
 
 /// Map a VM run outcome to the embed result (spec §3.3.4): the trailing-expression
