@@ -126,11 +126,28 @@ fn treesitter_parses_anonymous_fn_expressions() {
         "fn named() { return 1 }\nlet h = fn() { return 2 }",
         // async anonymous fn expression.
         "let p = recover(async fn() { return 1 })",
+        // BLOCKER 1: a fn-expression as a `return` / `yield` / ternary operand.
+        "fn make(n) { return fn() { return n * 2 } }",
+        "fn* g() { yield fn() { return 1 } }",
+        "let f = (c) => c ? fn() { return 1 } : nil",
     ] {
         let tree = parser.parse(src.as_bytes(), None).expect("parse");
         assert!(
             !tree.root_node().has_error(),
             "tree-sitter error on anonymous-fn-expression snippet: {src}"
+        );
+    }
+    // BLOCKER 2: a RETURN-type annotation on a fn-expression is NOT allowed (the
+    // `function_expression` rule has no return-type slot) — it must produce an
+    // error node, mirroring the hand front-ends' clean parse-error rejection.
+    for src in [
+        "let f = fn(x: int): string { return x }",
+        "let g = fn(): int { return 1 }",
+    ] {
+        let tree = parser.parse(src.as_bytes(), None).expect("parse");
+        assert!(
+            tree.root_node().has_error(),
+            "tree-sitter UNEXPECTEDLY accepted a fn-expr return type: {src}"
         );
     }
 }

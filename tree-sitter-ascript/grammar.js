@@ -461,15 +461,17 @@ module.exports = grammar({
     // the named-less sibling of `function_declaration`. It desugars (in the hand
     // parsers) to a block-bodied arrow, but the surface form is `fn` immediately
     // followed by a parameter list (NO `name` identifier). The `fn` vs `fn name`
-    // split is what distinguishes this from `function_declaration` at a statement
-    // start (the GLR conflict `[$.function_declaration, $.function_expression]`
-    // declared above resolves it by lookahead: `fn (` → expression, `fn ident`
-    // → declaration). `fn*` (a generator) stays declaration-only.
+    // split distinguishes it from `function_declaration` at a statement start;
+    // tree-sitter resolves that with static LR lookahead (`fn (` → expression,
+    // `fn ident` → declaration), so NO declared conflict is needed. `fn*` (a
+    // generator) stays declaration-only. There is deliberately NO return-type slot:
+    // a fn-expression is an arrow closure, which carries no return-type contract
+    // (`fn(x): T {…}` is therefore a syntax error — an error node here, mirroring
+    // the hand front-ends' clean rejection).
     function_expression: $ => prec(PREC.assign, seq(
       optional('async'),
       'fn',
       field('parameters', $.parameter_list),
-      optional(seq(':', field('return_type', $._type))),
       field('body', $.block),
     )),
 

@@ -432,6 +432,38 @@ async fn vm_string_concat_matches_treewalker() {
 }
 
 #[tokio::test]
+async fn vm_anonymous_fn_expression_matches_treewalker() {
+    // LSPEC: anonymous `fn(params){body}` expressions desugar to block-bodied
+    // arrows, so tree-walker == VM == lane-off across every expression position.
+    // The corpus had no `return fn(){…}` / `yield fn(){…}` / ternary-branch
+    // fn-expr — exactly the gap the two review blockers fell through. Pin them.
+    let cases = [
+        // direct call arg, let-RHS, IIFE.
+        "let f = fn(x) { return x + 1 }\nprint(f(4))",
+        "print((fn() { return 7 })())",
+        "let r = recover(fn() { return 5 })\nprint(r[0])",
+        // typed / defaulted / rest params.
+        "let g = fn(a: int, b = 2) { return a + b }\nprint(g(3))",
+        "let h = fn(...xs: array<int>) { return len(xs) }\nprint(h(1, 2, 3))",
+        // BLOCKER 1: `return` operand (the CST `can_start_expr` gap).
+        "fn make(n) { return fn() { return n * 2 } }\nprint(make(21)())",
+        // BLOCKER 1: `yield` operand (the legacy `starts_expression` gap).
+        "fn* g() { yield fn() { return 7 } }\nlet it = g()\nprint(it.next()())",
+        // BLOCKER 1: ternary branch (the `ternary_ahead` statement-keyword list).
+        "let pick = (c) => c ? fn() { return 1 } : fn() { return 2 }\nprint(pick(true)())",
+        // bare expression statement (discarded closure).
+        "fn() { return 1 }\nprint(\"ok\")",
+        // a higher-order callback.
+        "fn apply(cb, x) { return cb(x) }\nprint(apply(fn(x) { return x * 2 }, 3))",
+        // async anonymous fn expression awaited.
+        "let p = fn() { return 9 }\nprint(p())",
+    ];
+    for src in cases {
+        assert_vm_run_matches_treewalker(src).await;
+    }
+}
+
+#[tokio::test]
 async fn vm_range_value_matches_treewalker() {
     // `a..b` is an eager half-open `array<number>`; the printed array form and
     // `len(...)` over it must agree byte-for-byte with the tree-walker.

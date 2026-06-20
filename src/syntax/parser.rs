@@ -834,8 +834,10 @@ fn fn_decl(p: &mut Parser) {
 /// the resolver/AST treat it exactly like a block-bodied arrow `(params) =>
 /// {body}` — no new `ExprKind` variant. Reuses `param_list` (the SAME param
 /// parser `fn_decl` and the arrow form use) so typed/defaulted/rest params behave
-/// identically. An optional `: T` return annotation is accepted then ignored
-/// (a block-bodied arrow carries no return type), mirroring `fn_decl`.
+/// identically. A RETURN-type annotation (`: T`) is REJECTED (LSPEC): a
+/// fn-expression desugars to an arrow closure, which carries NO return-type
+/// contract — so "enforce it" (VM) vs "drop it" (tree-walker) would be a four-mode
+/// divergence; a named `fn` declaration is the way to get an enforced return type.
 /// Precondition: cursor at `FnKw` or `AsyncKw` (with a following `fn (`).
 fn anon_fn_expr(p: &mut Parser) -> CompletedMarker {
     use SyntaxKind::*;
@@ -854,7 +856,12 @@ fn anon_fn_expr(p: &mut Parser) -> CompletedMarker {
         p.error("expected '(' after 'fn' in a function expression");
     }
     if p.at(Colon) {
-        ret_type(p);
+        // A return-type annotation on a fn-expression is rejected — emit the
+        // error, then consume the `: T` so recovery doesn't cascade (the body
+        // still parses, but the recorded error fails the parse on both engines).
+        p.error("anonymous function expressions cannot declare a return type — use a named 'fn' declaration for an enforced return type, or drop the annotation");
+        p.bump(); // consume ':'
+        type_ann(p);
     }
     if p.at(LBrace) {
         block(p);
@@ -988,12 +995,15 @@ fn expr_bp(p: &mut Parser, min_bp: u8) {
 /// This mirrors the legacy oracle's `starts_expression` (the single source of
 /// truth — its `assignment()`/`primary()` define what begins an expression):
 /// the prefix operators (`-`/`!`/`~`/`await`/`yield`), the primary starters
-/// (literals, `ident`, `(`, `[`, `{`, `#{`, templates), PLUS the two
-/// expression-introducing KEYWORDS `match` (`match x {…}`) and `async`
-/// (`async () => …` arrow). `fn` is deliberately EXCLUDED — AScript has no
-/// anonymous `fn` expression (the only closure is the arrow), so the oracle's
-/// `assignment()` REJECTS a leading `fn`; treating `fn` as a non-starter keeps a
-/// `?` before it a postfix propagate, matching the oracle. `if`/`for`/`while`
+/// (literals, `ident`, `(`, `[`, `{`, `#{`, templates), PLUS the
+/// expression-introducing KEYWORDS `match` (`match x {…}`), `async`
+/// (`async () => …` arrow), and `fn` (LSPEC: an anonymous `fn(…){…}` EXPRESSION).
+/// `fn` was previously EXCLUDED (AScript had no fn-expression), but LSPEC made
+/// `fn(…){…}` a value-position closure, so it must be a starter — otherwise
+/// `return fn(){…}` / `yield fn(){…}` / `cond ? fn(){…} : …` mis-parse on the CST
+/// front-end (a four-mode divergence vs the legacy `expr()`-direct path). The
+/// statement-vs-expression `fn` ambiguity is settled earlier by the dispatcher's
+/// `at_anon_fn` (`fn name` → declaration, `fn (` → expression). `if`/`for`/`while`
 /// etc. are statements, never expressions, so they are non-starters too.
 fn can_start_expr(p: &Parser) -> bool {
     use SyntaxKind::*;
@@ -1018,6 +1028,7 @@ fn can_start_expr(p: &Parser) -> bool {
             | YieldKw
             | MatchKw
             | AsyncKw
+            | FnKw
     )
 }
 
@@ -1051,6 +1062,7 @@ fn token_can_start_expr(p: &Parser, i: usize) -> bool {
             | YieldKw
             | MatchKw
             | AsyncKw
+            | FnKw
     )
 }
 
@@ -1131,8 +1143,12 @@ fn ternary_ahead(p: &Parser) -> bool {
             // `return r ? 100 : 200` scanned into the LATER ternary's `:` and misparsed the
             // propagate as a ternary. These keywords can never continue a ternary then-branch
             // at depth 0. (NOTE: `match` is an EXPRESSION keyword, so it is deliberately
-            // EXCLUDED — `cond ? match x {…} : y` stays a valid ternary.)
-            LetKw | ConstKw | ReturnKw | IfKw | WhileKw | ForKw | BreakKw | ContinueKw | FnKw
+            // EXCLUDED — `cond ? match x {…} : y` stays a valid ternary.) `fn` is
+            // ALSO excluded (LSPEC): `fn(…){…}` is now an anonymous-fn EXPRESSION,
+            // so `cond ? fn(){…} : y` is a valid ternary — a leading `fn` no longer
+            // proves the `?` ended its statement. (A `fn name(…)` declaration never
+            // appears as a ternary then-branch — that path is statement-only.)
+            LetKw | ConstKw | ReturnKw | IfKw | WhileKw | ForKw | BreakKw | ContinueKw
             | ClassKw | EnumKw | ImportKw
                 if depth == 0 =>
             {

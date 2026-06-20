@@ -1634,12 +1634,16 @@ impl<'a> Parser<'a> {
         if *self.peek() == Tok::Fn && self.tokens[self.pos + 1].tok == Tok::LParen {
             self.advance(); // consume `fn`
             let params = self.param_list()?;
-            // An optional `: T` return annotation is accepted (parsed, then
-            // dropped — a block-bodied arrow carries no return type), mirroring
-            // `fn_decl`, so the expression form is a strict superset of nothing lost.
+            // A RETURN-type annotation (`: T`) is REJECTED — a fn-expression
+            // desugars to an arrow closure, which carries no return-type contract.
+            // Enforcing it (VM) vs dropping it (tree-walker) would be a four-mode
+            // divergence; a named `fn` declaration is the way to get an enforced
+            // return type. Same clean error as the CST front-end.
             if *self.peek() == Tok::Colon {
-                self.advance();
-                let _ = self.parse_type()?;
+                return Err(AsError::at(
+                    "anonymous function expressions cannot declare a return type — use a named 'fn' declaration for an enforced return type, or drop the annotation",
+                    self.span(),
+                ));
             }
             let body = ArrowBody::Block(self.block()?);
             let end = self.prev_end();
@@ -2664,6 +2668,11 @@ fn starts_expression(tok: &Tok) -> bool {
             | Tok::Yield
             | Tok::Async
             | Tok::Match
+            // `fn` (LSPEC): an anonymous `fn(…){…}` EXPRESSION is a valid operand
+            // (`yield fn(){…}`), so a leading `fn` starts an expression. The
+            // `fn`-vs-declaration ambiguity is settled in `statement` (`fn name` →
+            // declaration), never here in operand position.
+            | Tok::Fn
             | Tok::TemplateStr(_)
             | Tok::TemplateStart(_)
     )

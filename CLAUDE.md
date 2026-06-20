@@ -198,10 +198,17 @@ Terse per-feature notes (the non-obvious bits; read the cited file for the rest)
   of `try_arrow` (`src/parser.rs`). CST: `anon_fn_expr` emits an `ArrowExpr` node carrying the `fn`/`async`
   tokens — `compile_fn_proto` reads `AsyncKw`, the resolver treats `ArrowExpr` as a function frame, the AST
   accessors find `param_list()`/`block()` by kind (`src/syntax/parser.rs`). Tree-sitter: a `function_expression`
-  rule in `_expression` (no declared conflict — `fn`/`(` is static LR lookahead). **The formatter
-  canonicalizes `fn(x){…}` → `(x) => {…}`** (the single canonical lambda form — pinned in
-  `tests/cst_format.rs`). FOLLOW-UP (not done here): grammar mirror sync (`./scripts/sync-grammar.sh`) +
-  editor-pin bump (Zed/Nvim) — the in-repo conformance guards pass; the outward publish is a CI/manual step.
+  rule in `_expression` (no declared conflict — `fn`/`(` is static LR lookahead). **`fn` is an
+  expression-STARTER** — it had to be added to BOTH the CST `can_start_expr`/`token_can_start_expr` predicates
+  AND the legacy `starts_expression`, and REMOVED from the `ternary_ahead` statement-keyword list (alongside
+  `match`), or `return fn(){…}` / `yield fn(){…}` / `cond ? fn(){…} : …` mis-parse (the two review-blocker
+  four-mode divergences). **A RETURN-type annotation is a clean PARSE ERROR in all three parsers**
+  (`anonymous function expressions cannot declare a return type — use a named 'fn' declaration …`): a
+  fn-expression is an arrow closure (`ExprKind::Arrow` has no `ret_type`), so enforce-on-VM/drop-on-tree-walker
+  would diverge; PARAM-type annotations stay enforced. **The formatter canonicalizes `fn(x){…}` → `(x) => {…}`**
+  (the single canonical lambda form — pinned in `tests/cst_format.rs`). FOLLOW-UP (not done here): grammar
+  mirror sync (`./scripts/sync-grammar.sh`) + editor-pin bump (Zed/Nvim) — the in-repo conformance guards pass;
+  the outward publish is a CI/manual step.
 
 ## Larger subsystems (campaign work, condensed)
 

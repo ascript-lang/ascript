@@ -45,6 +45,50 @@ fn both_accept(src: &str) {
     cst_accepts(src);
 }
 
+/// Assert the legacy parser REJECTS `src` with a parse error whose message
+/// contains `needle`.
+fn legacy_rejects_with(src: &str, needle: &str) {
+    let toks = lex(src).unwrap_or_else(|e| panic!("lex failed for {src:?}: {e:?}"));
+    match parse(&toks) {
+        Ok(_) => panic!("legacy parser ACCEPTED {src:?}, expected a parse error"),
+        Err(e) => {
+            let msg = format!("{e:?}");
+            assert!(
+                msg.contains(needle),
+                "legacy parse error for {src:?} lacked {needle:?}: {msg}"
+            );
+        }
+    }
+}
+
+/// Assert the CST parser REJECTS `src` with an error whose message contains
+/// `needle`.
+fn cst_rejects_with(src: &str, needle: &str) {
+    let parsed = cst_parser::parse(src);
+    assert!(
+        !parsed.errors.is_empty(),
+        "CST parser ACCEPTED {src:?}, expected a parse error"
+    );
+    let joined = parsed
+        .errors
+        .iter()
+        .map(|e| format!("{e:?}"))
+        .collect::<Vec<_>>()
+        .join(" | ");
+    assert!(
+        joined.contains(needle),
+        "CST parse error for {src:?} lacked {needle:?}: {joined}"
+    );
+}
+
+/// Differential: BOTH hand front-ends must reject `src` with the SAME message
+/// fragment — so a four-mode runtime divergence is impossible (it's a syntax
+/// error on both, never a behavior difference).
+fn both_reject_with(src: &str, needle: &str) {
+    legacy_rejects_with(src, needle);
+    cst_rejects_with(src, needle);
+}
+
 /// `..=` (inclusive) and `step` parse on BOTH front-ends, in for-range and
 /// value position. Phase 1 is PARSE-only; semantics land in Phase 2/3.
 #[test]
@@ -90,6 +134,31 @@ fn both_frontends_accept_anonymous_fn_expressions() {
     both_accept("fn named() { return 1 }\nlet h = fn() { return 2 }");
     // async anonymous fn expression.
     both_accept("let p = recover(async fn() { return 1 })");
+    // BLOCKER 1: a fn-expression must be a valid expression-STARTER in every
+    // expression position the `can_start_expr` predicate gates — `return`,
+    // `yield` (in a generator), and a ternary branch. (Previously the CST front-
+    // end dropped `FnKw` from the starter set, so `return fn(){…}` parsed as
+    // `return;` + a discarded fn-expr statement — a four-mode divergence.)
+    both_accept("fn make(n) { return fn() { return n * 2 } }");
+    both_accept("fn* g() { yield fn() { return 1 } }");
+    both_accept("let f = (cond) => cond ? fn() { return 1 } : nil");
+}
+
+/// BLOCKER 2: a fn-expression CANNOT declare a RETURN type (it desugars to an
+/// arrow closure, which carries no return-type contract). Both hand front-ends
+/// must REJECT `fn(params): T {…}` with the SAME message — so it is a clean
+/// syntax error, never a four-mode runtime divergence (the VM enforced the
+/// contract while the tree-walker silently dropped it). PARAM-type annotations
+/// (`fn(x: int)`) stay valid on both engines.
+#[test]
+fn both_frontends_reject_fn_expr_return_type() {
+    const NEEDLE: &str = "anonymous function expressions cannot declare a return type";
+    both_reject_with("let f = fn(x: int): string { return x }", NEEDLE);
+    both_reject_with("let g = fn(): int { return 1 }", NEEDLE);
+    both_reject_with("recover(fn(): bool { return true })", NEEDLE);
+    both_reject_with("let h = async fn(x): int { return x }", NEEDLE);
+    // param-type annotations REMAIN valid (only the return annotation is rejected).
+    both_accept("let ok = fn(x: int, y: string) { return x }");
 }
 
 /// `static` is a member modifier on `fn` / `async fn` / `fn*` inside a class
