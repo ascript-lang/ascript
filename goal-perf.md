@@ -318,7 +318,8 @@ stated, results are measured.
   global state). Parked with sketches: hedged requests, AIMD adaptive concurrency, `std/k8s`.
   - Spec: `superpowers/specs/2026-06-12-resilience-stdlib-design.md` · Plan: `superpowers/plans/2026-06-12-resilience-stdlib.md`
 
-- 🔒 **EMBED — embedding API (Rust crate + C API).** A stable, versioned host API: create
+- ✅ **EMBED — embedding API (Rust crate + C API). MERGED to `main` (`--no-ff`, `aa512616`). See EXECUTION LOG.**
+  A stable, versioned host API: create
   isolates, eval/load archives, call script functions, register host functions/modules,
   value conversion, host-controlled caps, async integration — the `!Send`-isolate model is
   ideal for embedding (one isolate per host thread, no global VM lock). C API as a `cdylib`
@@ -397,6 +398,45 @@ stated, results are measured.
   revisit inline short strings ONLY behind its measured-win gate.
 
 ## EXECUTION LOG (live)
+
+- **EMBED** — ✅ MERGED to `main` (`--no-ff`, `aa512616`). A host-embedding API in **6 units** (subagent-driven; fresh
+  implementer + independent opus reviewer per unit; the host-module security phase + the C-FFI safety phase + a final
+  cross-subsystem holistic). **NO engine/`.aso`/opcode/`Value` change** — `ASO_FORMAT_VERSION` 29 + the `Op` count 121
+  pinned by `tests/embed_negative_space.rs`; `vm_differential` 445/0 four-mode UNCHANGED both configs; Gate-12 A/B
+  geomean **1.014×** (≈baseline), RSS identical (`bench/EMBED_RESULTS.md`) — the host-side facade adds nothing to the
+  hot path (the `host:` dispatch sits on the previously-error fall-through arm). **Unit A** (`src/embed/`, `embed`
+  feature): `Isolate` (`!Send+!Sync`, owns a current-thread `tokio::runtime::Runtime`; parallelism = more isolates),
+  blocking `eval` lifting the REPL substrate (`compile_source`→Fiber→`vm.run`; a compile error leaves the session
+  UNmutated) + a nested-runtime guard (ambient runtime → `EmbedError::NestedRuntime`, not a `block_on` panic),
+  `call`/globals/`load_archive` (+`*_async`), `EmbedError`, and **DENY-ALL caps by default** (the loud inverse of the
+  CLI's all-granted — a host that forgets to grant gets the safe default). **Unit B:** `AsValue(Value)` (`!Send`) —
+  container handles are LIVE ALIASES (same `Rc`/`Cc` cell, bidirectional host↔script visibility); mutators route
+  through the engine paths (`index_set`/`ObjectCell::insert`+`frozen_kind`) so type/frozen checks aren't bypassed
+  (Map/Set read-only host-side; SHAPE slab-safe `.get()`); the 25-kind table crosses every `Value` variant (opaque
+  kinds prove `Rc`/`Cc` pointer identity); `to_json`/`json_parse` deep bridge (cyclic → error, never hangs). **Unit C
+  (the only core touches, both behaviour-invisible):** `classify_specifier`→`SpecifierKind::Host` (after the `std/`
+  hot-path check) + `load_host_module` mirroring `load_std_module` on BOTH engines + the dispatch arm
+  `m if m.starts_with("host:")` riding the PREVIOUSLY-ERROR fall-through in `call_stdlib` (engine-parity test
+  byte-identical). FFI-mirrored tiering (`func` Recoverable→Tier-2, `fallible_func` Recoverable→`[nil,err]`,
+  `Panic`→Tier-2). **HOST FNS BYPASS CAPS** (native Rust the host wrote — LOUD docs). The `host_modules` registry is a
+  CORE `Interp` field (empty under `--no-default-features`). **Worker isolation (the #1 security threat, defended in
+  depth):** a `host:` import in a worker consults THAT isolate's registry → clean miss panic unless a
+  `host_module_factory` (a `Send` factory riding the SAME side-channel as `caps`, installed FRESH per pooled request →
+  no cross-isolate leak) is passed; a `Value::Builtin("host:…")` is non-sendable (can't cross the airlock).
+  `StdlibFilter` = availability knob, NOT a security boundary; checker `host:`-skip. **Unit D:** the `ascript-capi` C
+  crate (`capi/`, own empty `[workspace]`, NEVER in the root build graph) — every `unsafe extern "C"` fn does
+  NULL→thread(`AS_ERR_WRONG_THREAD`, the Isolate is thread-affine)→poison→`catch_unwind`; a wrong-thread `as_value_free`
+  LEAKS (documented contract — an off-thread `Rc` decrement is a data race); late host-fn registration errors if the
+  module was already imported; a hand-written `ascript.h` + a source-scan drift test + a compiled-C smoke test
+  (`cc::Build` links the cdylib, runs it, exit 0). The Unit-D review compiled a HOSTILE C misuse program (every misuse
+  → clean status code, no segfault), ran `leaks` (0 leaks), and `nm`-verified 23==23 exported symbols == header.
+  **Units E/F:** `examples/embed/{rust-host,c-host}` (CI-executed sentinel-checked, NOT corpus — discovery is
+  non-recursive over `examples/`); `docs/content/embedding.md` (+NAV `embedding`) + README + the §9 rustdoc stability
+  contract (`ascript::embed` is the only semver-promised Rust surface). The final cross-subsystem holistic verified the
+  seams per-unit reviews can't see (filter↔archive import filtering, Isolate-drop is leak-free via `leaks`,
+  poison↔output, host-fn re-entry can't double-borrow, async-`call` auto-await completes). Carry-forward: a pre-existing
+  jitter-sensitive DECODE microbench gate (`decode-on/off 1.056×`) is NOT EMBED (decode diff empty) — documented in
+  `EMBED_RESULTS.md`.
 
 - **BATT** — ✅ MERGED to `main` in **4 phases** (`--no-ff`): **A auth `fc21c1f`** (std/jwt typed-keys +
   std/oauth PKCE), **B data `bf13fb3`** (std/{archive,xml,html,email,blob}), **C testing `a1c92cf`**
