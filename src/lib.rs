@@ -1209,6 +1209,99 @@ pub async fn vm_run_source_deterministic(src: &str, seed: u64) -> Result<String,
 }
 
 #[cfg(not(ascript_rt))]
+/// REPLAY Task 5 (§6) test seam — run `src` on the TREE-WALKER with a `CliTrace`
+/// context pre-installed (`replay=false` → Record, `replay=true` → Replay primed with
+/// an EMPTY event stream). Mirrors [`run_source_with_interp`]'s wiring (install self,
+/// global env child, `ambient_root_scope`, drain), then installs the trace context
+/// BEFORE the run so worker-isolate creation reaches the §6 refusal guard. Returns the
+/// captured output, or the Tier-2 panic message on an uncaught panic. `#[doc(hidden)]`.
+#[doc(hidden)]
+pub async fn run_source_with_trace(src: &str, replay: bool) -> Result<String, AsError> {
+    let src_info = Rc::new(SourceInfo {
+        path: "<input>".to_string(),
+        text: src.to_string(),
+    });
+    let tokens = lexer::lex(src).map_err(|e| e.with_source(src_info.clone()))?;
+    let program = parser::parse(&tokens).map_err(|e| e.with_source(src_info.clone()))?;
+    let interp = Rc::new(Interp::new());
+    interp.install_self();
+    interp.set_worker_source(src);
+    if replay {
+        interp.__install_replay_trace(1, Vec::new());
+    } else {
+        interp.__install_record_trace(1);
+    }
+    let env = crate::interp::global_env().child();
+    let local = tokio::task::LocalSet::new();
+    let root = crate::interp::ambient_root_scope(interp.exec_program(&program, &env));
+    let result = local.run_until(root).await;
+    local.await;
+    match result {
+        Ok(_) => Ok(interp.output()),
+        Err(crate::interp::Control::Panic(e)) => Err(e.with_source(src_info)),
+        Err(crate::interp::Control::Propagate(_)) => Ok(interp.output()),
+        Err(crate::interp::Control::Exit(_)) => Ok(interp.output()),
+    }
+}
+
+#[cfg(not(ascript_rt))]
+/// REPLAY Task 5 (§6) test seam — the VM-side mirror of [`run_source_with_trace`]:
+/// run `src` on the SPECIALIZED bytecode VM with a `CliTrace` context pre-installed.
+/// The §6 guard lives in shared `Interp` methods + the worker dispatch funnel both
+/// engines reach, so the VM must refuse byte-identically. `#[doc(hidden)]`.
+#[doc(hidden)]
+pub async fn vm_run_source_with_trace(src: &str, replay: bool) -> Result<String, AsError> {
+    use crate::vm::chunk::FnProto;
+    use crate::vm::value_ext::{Closure, RunOutcome};
+    use crate::vm::Vm;
+
+    let src_info = Rc::new(SourceInfo {
+        path: "<input>".to_string(),
+        text: src.to_string(),
+    });
+    let chunk = crate::compile::compile_source(src)
+        .map_err(|e| AsError::at(e.message, e.span).with_source(src_info.clone()))?;
+    let proto = Rc::new(FnProto {
+        chunk,
+        arity: 0,
+        has_rest: false,
+        is_async: false,
+        is_generator: false,
+        is_worker: false,
+        owning_class: None,
+        params: Vec::new(),
+        ret: None,
+        local_names: Vec::new(),
+        debug_name: None,
+        name_span: None,
+    });
+    let closure = Closure::new(proto);
+    let interp = Rc::new(Interp::new());
+    interp.install_self();
+    interp.set_worker_source(src);
+    if replay {
+        interp.__install_replay_trace(1, Vec::new());
+    } else {
+        interp.__install_record_trace(1);
+    }
+    let vm = Vm::new(interp.clone());
+    let mut fiber = crate::vm::fiber::Fiber::new(closure);
+    let local = tokio::task::LocalSet::new();
+    let result = local
+        .run_until(crate::interp::ambient_root_scope(vm.run(&mut fiber)))
+        .await;
+    local.await;
+    crate::gc::collect();
+    match result {
+        Ok(RunOutcome::Done(_)) => Ok(interp.output()),
+        Ok(RunOutcome::Yielded(_)) => unreachable!("top-level program cannot yield"),
+        Err(crate::interp::Control::Panic(e)) => Err(e.with_source(src_info)),
+        Err(crate::interp::Control::Propagate(_)) => Ok(interp.output()),
+        Err(crate::interp::Control::Exit(_)) => Ok(interp.output()),
+    }
+}
+
+#[cfg(not(ascript_rt))]
 /// Like [`vm_run_source`] but with the VM's specialization fast paths DISABLED —
 /// the `--no-specialize` kill switch (V11-T5). All inline caches and PEP-659
 /// adaptive sites are skipped; every dispatch takes the generic path.

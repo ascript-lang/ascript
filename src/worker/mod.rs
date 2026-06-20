@@ -131,6 +131,13 @@ pub(crate) fn dispatch_worker_job(
     chunk: Option<ChunkJob>,
     span: Span,
 ) -> Result<Value, Control> {
+    // REPLAY §6 backstop: refuse pooled-isolate dispatch under a trace context. The
+    // high-level call sites (worker fn / static worker fn / pmap / preduce) carry the
+    // descriptive `what`; this is the by-construction net so no pooled path can record a
+    // non-replayable trace. INERT inside an isolate (a fresh `Interp` is never traced) and
+    // on the default path (`trace_active() == false`).
+    interp.refuse_worker_under_trace("dispatching a worker fn", span)?;
+
     // --- Inline nesting: run on the current isolate, no re-dispatch. ---
     // (The engine hooks call `dispatch_worker_inline` directly when in an isolate so
     // they can skip the cross-thread slice build entirely; this guard keeps
@@ -434,6 +441,10 @@ pub fn dispatch_worker_dedicated(
     caps: crate::stdlib::caps::CapSet,
     span: Span,
 ) -> Result<Value, Control> {
+    // REPLAY §6 backstop: refuse dedicated-isolate dispatch under a trace context. The
+    // `run_in_worker` call site carries the descriptive `what`; this nets any other path.
+    interp.refuse_worker_under_trace("dispatching a worker fn", span)?;
+
     // Sendability gate + encode (args wrapped as one array for one decode), exactly as
     // the pooled path: an FFI handle / closure / future arg is rejected with a field
     // path here, before any isolate spawn.

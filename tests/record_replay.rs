@@ -997,6 +997,252 @@ mod http_virtualization {
     }
 }
 
+// ===========================================================================
+// Task 5 — worker-isolate refusals under trace contexts (REPLAY §6).
+//
+// Under a CliTrace context (record AND replay), creating any worker isolate is a
+// clean Tier-2 refusal naming the construct + the "not supported under
+// --record/--replay" message — because shared-nothing isolates have no trace
+// identity (v1). Refusing at RECORD (not just replay) is the §2.1c guarantee: a
+// recorded trace is replayable by construction. The guard is `trace_active()`-gated
+// → INERT without a context (the full workers suite stays byte-identical).
+// ===========================================================================
+
+mod worker_refusals {
+    use super::*;
+
+    /// Block on a current-thread runtime + LocalSet (the run harnesses build their own
+    /// inner LocalSet; this just provides the reactor).
+    fn block<F: std::future::Future>(fut: F) -> F::Output {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let local = tokio::task::LocalSet::new();
+        local.block_on(&rt, fut)
+    }
+
+    /// Run `src` on the TREE-WALKER with a CliTrace context (record/replay) pre-installed
+    /// via the `#[doc(hidden)]` lib seam. Returns the captured stdout, or the Tier-2
+    /// panic message (an uncaught refusal that escapes `recover`).
+    fn run_tw(src: &str, replay: bool) -> Result<String, String> {
+        let src = src.to_string();
+        block(async move {
+            ascript::run_source_with_trace(&src, replay)
+                .await
+                .map_err(|e| e.message.clone())
+        })
+    }
+
+    /// Run `src` on the SPECIALIZED VM with a CliTrace context pre-installed (the guard
+    /// lives in shared `Interp` methods + worker dispatch both engines reach).
+    fn run_vm(src: &str, replay: bool) -> Result<String, String> {
+        let src = src.to_string();
+        block(async move {
+            ascript::vm_run_source_with_trace(&src, replay)
+                .await
+                .map_err(|e| e.message.clone())
+        })
+    }
+
+    /// Assert the captured output names the construct + the §6 refusal message under a
+    /// trace context, on BOTH engines and BOTH modes (record + replay).
+    fn assert_refused(src: &str, needle: &str) {
+        for replay in [false, true] {
+            for (engine, out) in [("tree-walker", run_tw(src, replay)), ("vm", run_vm(src, replay))] {
+                // Either the snippet recovered + printed the message (Ok) OR it escaped
+                // as a Tier-2 panic (Err) — in BOTH cases the message must be present.
+                let text = match &out {
+                    Ok(s) => s.clone(),
+                    Err(m) => m.clone(),
+                };
+                assert!(
+                    text.contains(needle),
+                    "[{engine} replay={replay}] refusal must name '{needle}', got: {text}"
+                );
+                assert!(
+                    text.contains("not supported under --record/--replay"),
+                    "[{engine} replay={replay}] refusal must carry the §6 message, got: {text}"
+                );
+            }
+        }
+    }
+
+    // ---- The unit guard: trace on → Err naming `what`; trace off → Ok. ---- //
+    #[test]
+    fn refuse_helper_is_loud_under_trace_inert_without() {
+        with_interp(|interp| async move {
+            // No context → Ok.
+            assert!(interp.__refuse_worker_under_trace("calling a worker fn").is_ok());
+
+            // Record → Err naming the construct + the message.
+            interp.__install_record_trace(1);
+            match interp.__refuse_worker_under_trace("calling a worker fn") {
+                Err(Control::Panic(e)) => {
+                    assert!(e.message.contains("calling a worker fn"), "{}", e.message);
+                    assert!(
+                        e.message.contains("not supported under --record/--replay"),
+                        "{}",
+                        e.message
+                    );
+                    assert!(e.message.contains("v2"), "{}", e.message);
+                }
+                other => panic!("trace-on refusal must be a Tier-2 panic, got {other:?}"),
+            }
+            interp.__clear_determinism();
+
+            // Replay → Err too.
+            interp.__install_replay_trace(1, vec![]);
+            assert!(matches!(
+                interp.__refuse_worker_under_trace("run_in_worker"),
+                Err(Control::Panic(_))
+            ));
+            interp.__clear_determinism();
+
+            // Cleared → Ok again (inert).
+            assert!(interp.__refuse_worker_under_trace("calling a worker fn").is_ok());
+        });
+    }
+
+    // ---- Pooled `worker fn` call ---- //
+    #[test]
+    fn pooled_worker_fn_refused() {
+        let src = r#"
+worker fn dbl(x: number) { return x * 2 }
+let [v, err] = recover(() => await dbl(21))
+print(err.message)
+"#;
+        assert_refused(src, "calling a worker fn");
+    }
+
+    // ---- `WorkerClass.spawn()` ---- //
+    #[test]
+    fn worker_class_spawn_refused() {
+        let src = r#"
+worker class Counter {
+    n: number = 0
+    fn bump() { self.n = self.n + 1; return self.n }
+}
+let [v, err] = recover(() => await Counter.spawn())
+print(err.message)
+"#;
+        assert_refused(src, "spawning a worker class actor");
+    }
+
+    // ---- `worker fn*` stream iteration ---- //
+    #[test]
+    fn worker_stream_refused() {
+        let src = r#"
+worker fn* nums() { yield 1; yield 2 }
+let [v, err] = recover(() => nums())
+print(err.message)
+"#;
+        assert_refused(src, "iterating a worker fn*");
+    }
+
+    // ---- `run_in_worker(f, x)` ---- //
+    #[test]
+    fn run_in_worker_refused() {
+        let src = r#"
+worker fn job(x: number) { return x + 1 }
+let [v, err] = recover(() => await run_in_worker(job, 41))
+print(err.message)
+"#;
+        assert_refused(src, "run_in_worker");
+    }
+
+    // ---- `task.pmap` / `task.preduce` ---- //
+    #[test]
+    fn pmap_refused() {
+        let src = r#"
+import * as task from "std/task"
+worker fn dbl(x: number) { return x * 2 }
+let [v, err] = recover(() => await task.pmap([1, 2, 3], dbl))
+print(err.message)
+"#;
+        assert_refused(src, "task.pmap");
+    }
+
+    #[test]
+    fn preduce_refused() {
+        let src = r#"
+import * as task from "std/task"
+worker fn add(a: number, b: number) { return a + b }
+let [v, err] = recover(() => await task.preduce([1, 2, 3], add, 0))
+print(err.message)
+"#;
+        assert_refused(src, "task.preduce");
+    }
+
+    // ---- An EMPTY pmap/preduce creates NO isolate → NOT refused (poolless §2.1). ---- //
+    #[test]
+    fn empty_pmap_preduce_not_refused_under_trace() {
+        let src = r#"
+import * as task from "std/task"
+worker fn dbl(x: number) { return x * 2 }
+worker fn add(a: number, b: number) { return a + b }
+let m = await task.pmap([], dbl)
+let r = await task.preduce([], add, 7)
+print(len(m))
+print(r)
+"#;
+        for replay in [false, true] {
+            for (engine, out) in [("tree-walker", run_tw(src, replay)), ("vm", run_vm(src, replay))] {
+                let text = out.unwrap_or_else(|m| {
+                    panic!("[{engine} replay={replay}] empty pmap/preduce must not refuse, got panic: {m}")
+                });
+                assert!(
+                    !text.contains("not supported under --record/--replay"),
+                    "[{engine} replay={replay}] empty pmap/preduce is poolless → no refusal: {text}"
+                );
+                assert!(text.contains('0') && text.contains('7'), "[{engine} replay={replay}]: {text}");
+            }
+        }
+    }
+
+    // ---- Inertness: the SAME worker fn runs for real with NO context. ---- //
+    // The worker actually dispatches to a real isolate (no trace context), proving the
+    // guard is INERT off the trace path — so the workers suite stays byte-identical.
+    // Driven through the real binary (`ascript run`) so a pooled isolate genuinely
+    // spawns (the in-process seams don't wire up the cross-thread pool source path).
+    #[test]
+    fn worker_fn_runs_without_trace() {
+        use std::process::Command;
+        let dir = std::env::temp_dir().join(format!("ascript-rr-inert-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("w.as");
+        std::fs::write(
+            &file,
+            "worker fn dbl(x: number) { return x * 2 }\nprint(await dbl(21))\n",
+        )
+        .unwrap();
+        let bin = env!("CARGO_BIN_EXE_ascript");
+        // Default engine (VM) and the tree-walker oracle — both must run the worker for
+        // real with NO trace flag (Task 6 adds --record; here we prove the no-flag path).
+        for engine_args in [vec!["run"], vec!["run", "--tree-walker"]] {
+            let mut cmd = Command::new(bin);
+            cmd.args(&engine_args).arg(&file);
+            let out = cmd.output().unwrap();
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            assert!(
+                out.status.success(),
+                "no-context worker run must succeed ({engine_args:?}): {stderr}"
+            );
+            assert!(
+                !stdout.contains("not supported under --record/--replay")
+                    && !stderr.contains("not supported under --record/--replay"),
+                "no-context run must NOT refuse ({engine_args:?}): {stdout}{stderr}"
+            );
+            assert!(
+                stdout.contains("42"),
+                "worker fn must really run with no context ({engine_args:?}): {stdout}"
+            );
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+}
+
 #[test]
 fn default_path_untouched() {
     with_interp(|interp| async move {

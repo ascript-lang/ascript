@@ -1984,6 +1984,28 @@ impl Interp {
         self.trace_active.get()
     }
 
+    /// REPLAY §6 — refuse creating a worker isolate under a `CliTrace` (record OR
+    /// replay) context. Determinism contexts are PER-`Interp` and an isolate builds a
+    /// fresh `Interp::new()` on its own thread, so a CLI trace context cannot extend
+    /// across the airlock — shared-nothing isolates have no trace identity in v1.
+    /// Refusing at RECORD (not just replay) is the §2.1c by-construction guarantee: a
+    /// trace that records successfully is replayable. `what` names the construct (e.g.
+    /// `"calling a worker fn"`). INERT without a `CliTrace` context (the common path) so
+    /// the whole workers suite stays byte-identical.
+    pub(crate) fn refuse_worker_under_trace(&self, what: &str, span: Span) -> Result<(), Control> {
+        if self.trace_active() {
+            return Err(AsError::at(
+                format!(
+                    "{what} is not supported under --record/--replay \
+                     (shared-nothing isolates have no trace identity; v2)"
+                ),
+                span,
+            )
+            .into());
+        }
+        Ok(())
+    }
+
     /// Install an explicit determinism context (Record or Replay), returning the
     /// previous one. Used by `workflow.resume` to prime a Replay context with the
     /// recorded event stream. A thin wrapper over the core [`Self::set_determinism`]
@@ -2435,6 +2457,14 @@ impl Interp {
     #[doc(hidden)]
     pub fn __clear_determinism(&self) -> Option<crate::det::DeterminismContext> {
         self.set_determinism(None)
+    }
+
+    /// REPLAY (test-only) — drive the §6 worker-refusal guard directly so a test can
+    /// assert it is loud under a `CliTrace` context and inert without one, independent of
+    /// wiring up a full worker isolate. Mirrors what each isolate-creation site reaches.
+    #[doc(hidden)]
+    pub fn __refuse_worker_under_trace(&self, what: &str) -> Result<(), Control> {
+        self.refuse_worker_under_trace(what, Span::new(0, 0))
     }
 
     /// REPLAY (test-only) — the live OS-resource table size. The Task-4 leak check
@@ -3550,6 +3580,9 @@ impl Interp {
         args: Vec<Value>,
         span: Span,
     ) -> Result<Value, Control> {
+        // REPLAY §6: refuse spawning an actor isolate under a trace context (record OR
+        // replay) — BEFORE any sendability/slice work, so no side effect precedes it.
+        self.refuse_worker_under_trace("spawning a worker class actor", span)?;
         // Sendability gate on the init args (field-path panic on failure).
         for a in &args {
             crate::worker::serialize::check_sendable(a)
@@ -3807,6 +3840,9 @@ impl Interp {
         args: Vec<Value>,
         span: Span,
     ) -> Result<Value, Control> {
+        // REPLAY §6: refuse creating a worker-generator isolate under a trace context
+        // (record OR replay) — at the EARLIEST point, before any slice/spawn work.
+        self.refuse_worker_under_trace("iterating a worker fn*", span)?;
         // Sendability gate on the call args (field-path panic on failure).
         for a in &args {
             crate::worker::serialize::check_sendable(a)
@@ -7380,6 +7416,8 @@ impl Interp {
         // handled inside `dispatch_worker`. A worker fn cannot also be `async`/`fn*`
         // (the surface form has no such combination), so this precedes those branches.
         if func.is_worker {
+            // REPLAY §6: refuse dispatching a worker fn isolate under a trace context.
+            self.refuse_worker_under_trace("calling a worker fn", span)?;
             let entry_name = func
                 .name
                 .clone()
@@ -8048,6 +8086,8 @@ impl Interp {
         // entry global is the bare method name; the code slice carries the class name
         // for diagnostics + future class binding.
         if method.is_worker {
+            // REPLAY §6: refuse dispatching a static worker fn isolate under a trace ctx.
+            self.refuse_worker_under_trace("calling a static worker fn", span)?;
             if crate::worker::pool::in_isolate() {
                 return crate::worker::dispatch_worker_inline(self, name, args, span);
             }
@@ -8131,6 +8171,9 @@ impl Interp {
     /// is terminal. Byte-identical across engines (the slice build + dispatch are the
     /// SAME mechanism `worker fn` uses; only the isolate lifecycle + caps differ).
     async fn call_run_in_worker(&self, args: &[Value], span: Span) -> Result<Value, Control> {
+        // REPLAY §6: refuse a `run_in_worker` isolate under a trace context, BEFORE any
+        // callee/opts/caps parsing — the earliest point, no side effect precedes it.
+        self.refuse_worker_under_trace("run_in_worker", span)?;
         let callee = args.first().cloned().unwrap_or(Value::nil());
         // The single payload arg (an array/object/scalar — structured-clone-sendable).
         let input = args.get(1).cloned().unwrap_or(Value::nil());

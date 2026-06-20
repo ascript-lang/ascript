@@ -890,6 +890,11 @@ impl Interp {
             return self.par_inline(&input, &entry_name, &plan, ChunkKind::Map, None, span);
         }
 
+        // REPLAY §6: a top-level (non-inline) pmap dispatches chunks to pooled worker
+        // isolates — refuse under a trace context (record OR replay). After the empty +
+        // in-isolate fast paths (neither creates an isolate), before the slice build.
+        self.refuse_worker_under_trace("task.pmap", span)?;
+
         // Build the slice once; clone_for_dispatch serves every chunk (§3.2).
         let slice = crate::worker::build_code_slice_for_interp(self, &entry_name)?;
         let mut chunk_futs: Vec<Value> = Vec::with_capacity(plan.len());
@@ -1034,6 +1039,11 @@ impl Interp {
         if crate::worker::pool::in_isolate() {
             return self.par_inline(&input, &entry_name, &plan, ChunkKind::Reduce, Some(init), span);
         }
+
+        // REPLAY §6: a top-level (non-inline) preduce dispatches chunks to pooled worker
+        // isolates — refuse under a trace context (record OR replay). After the empty +
+        // in-isolate fast paths (neither creates an isolate), before the slice build.
+        self.refuse_worker_under_trace("task.preduce", span)?;
 
         // Build the code slice ONCE — all chunk dispatches + the final combine share it.
         let slice = crate::worker::build_code_slice_for_interp(self, &entry_name)?;

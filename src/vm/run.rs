@@ -1910,6 +1910,15 @@ impl Vm {
         args: Vec<Value>,
         span: Span,
     ) -> Result<Value, Control> {
+        // REPLAY §6: refuse dispatching a worker fn isolate under a trace context, with a
+        // descriptive `what` matching the tree-walker `call_function` site (the backstop in
+        // `dispatch_worker` would also catch it, but with a generic message).
+        let what = if callee.proto.owning_class.is_some() {
+            "calling a static worker fn"
+        } else {
+            "calling a worker fn"
+        };
+        self.interp.refuse_worker_under_trace(what, span)?;
         let entry_name = callee.proto.chunk.name.as_deref().ok_or_else(|| {
             Control::Panic(crate::error::AsError::at(
                 "worker fn has no name (internal invariant)".to_string(),
