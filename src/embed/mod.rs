@@ -57,7 +57,9 @@ pub enum OutputMode {
 /// (spec §6.5). This is an **availability** knob, NOT a security boundary —
 /// capabilities ([`Caps`]) are the security boundary. The filter is enforced at the
 /// import chokepoint; an allowlisted module's transitively-reachable builtins are not
-/// re-walked.
+/// re-walked. **To sandbox untrusted scripts, set deny-all [`Caps`] (the embedded
+/// default) — do NOT rely on `StdlibFilter::Core` alone**, which only hides modules,
+/// not the authority they would grant.
 #[derive(Debug, Clone, Default)]
 #[non_exhaustive]
 pub enum StdlibFilter {
