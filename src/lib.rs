@@ -1141,6 +1141,71 @@ pub async fn vm_run_source(src: &str) -> Result<(String, Option<i32>), AsError> 
 }
 
 #[cfg(not(ascript_rt))]
+/// REPLAY Task 0 (§10.2) — the VM-side mirror of [`run_source_deterministic`]: run
+/// `src` on the SPECIALIZED bytecode VM in DETERMINISTIC mode with `seed`. Installs a
+/// fresh [`crate::det::DeterminismContext`] (Record mode, seed-derived virtual clock)
+/// on the VM's `Interp` BEFORE the run via `enter_deterministic`, so the clock/RNG/uuid
+/// seams route through it exactly as the tree-walker path does. Because `det.rs` is
+/// engine-shared (every seam accessor lives on `Interp`, which the VM holds), a run
+/// here MUST be byte-identical to `run_source_deterministic(src, seed)` for the same
+/// seed — the cross-engine determinism foundation pinned by `tests/determinism.rs`.
+/// Returns only the captured output (the determinism oracle compares text); an `exit(n)`
+/// returns the captured output, like [`run_source_deterministic`]. `#[doc(hidden)]` —
+/// not a stable public API.
+#[doc(hidden)]
+pub async fn vm_run_source_deterministic(src: &str, seed: u64) -> Result<String, AsError> {
+    use crate::vm::chunk::FnProto;
+    use crate::vm::value_ext::{Closure, RunOutcome};
+    use crate::vm::Vm;
+
+    let src_info = Rc::new(SourceInfo {
+        path: "<input>".to_string(),
+        text: src.to_string(),
+    });
+    let chunk = crate::compile::compile_source(src)
+        .map_err(|e| AsError::at(e.message, e.span).with_source(src_info.clone()))?;
+    let proto = Rc::new(FnProto {
+        chunk,
+        arity: 0,
+        has_rest: false,
+        is_async: false,
+        is_generator: false,
+        is_worker: false,
+        owning_class: None,
+        params: Vec::new(),
+        ret: None,
+        local_names: Vec::new(),
+        debug_name: None,
+        name_span: None,
+    });
+    let closure = Closure::new(proto.clone());
+
+    let interp = Rc::new(Interp::new());
+    interp.install_self();
+    interp.set_worker_source(src);
+    // Install the deterministic Record context on the VM's Interp before the run —
+    // the same `enter_deterministic` seam `run_source_deterministic` uses on the
+    // tree-walker. The seam lives on `Interp`, so the VM reaches it identically.
+    interp.enter_deterministic(seed);
+    let vm = Vm::new(interp.clone());
+    let mut fiber = crate::vm::fiber::Fiber::new(closure);
+
+    let local = tokio::task::LocalSet::new();
+    let result = local
+        .run_until(crate::interp::ambient_root_scope(vm.run(&mut fiber)))
+        .await;
+    local.await;
+    crate::gc::collect();
+    match result {
+        Ok(RunOutcome::Done(_)) => Ok(interp.output()),
+        Ok(RunOutcome::Yielded(_)) => unreachable!("top-level program cannot yield"),
+        Err(crate::interp::Control::Panic(e)) => Err(e.with_source(src_info)),
+        Err(crate::interp::Control::Propagate(_)) => Ok(interp.output()),
+        Err(crate::interp::Control::Exit(_)) => Ok(interp.output()),
+    }
+}
+
+#[cfg(not(ascript_rt))]
 /// Like [`vm_run_source`] but with the VM's specialization fast paths DISABLED —
 /// the `--no-specialize` kill switch (V11-T5). All inline caches and PEP-659
 /// adaptive sites are skipped; every dispatch takes the generic path.
