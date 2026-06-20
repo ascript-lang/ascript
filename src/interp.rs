@@ -907,6 +907,13 @@ pub struct Interp {
     /// value out / drop the borrow before returning, like the `resources`
     /// discipline).
     determinism: RefCell<Option<crate::det::DeterminismContext>>,
+    /// REPLAY §2.2 — the Gate-12 zero-cost flag mirroring `caps_bits().all_granted()`:
+    /// a `Cell<bool>` snapshot kept in sync by the single `set_determinism` chokepoint
+    /// (true iff the installed context is `Some(ctx) && ctx.origin == Origin::CliTrace`).
+    /// The `call_stdlib` trace hook reads it (`trace_active()`) BEFORE any `RefCell`
+    /// borrow, so the default path (no context, or a Workflow context) takes ONE
+    /// predictably-not-taken branch and is byte-identical.
+    trace_active: Cell<bool>,
     /// SP6 §6: the CLI-injected resolved third-party package set. `None` until
     /// [`Interp::set_package_resolver`] installs it (the REPL / tests / a project
     /// with no deps leave it `None` → every bare specifier is "unknown package").
@@ -1431,6 +1438,7 @@ impl Interp {
             ai: RefCell::new(crate::stdlib::ai::AiClient::default()),
             cli_args: RefCell::new(Vec::new()),
             determinism: RefCell::new(None),
+            trace_active: Cell::new(false),
             package_resolver: RefCell::new(None),
             // EMBED §6.3: no host modules until the embed builder registers them.
             host_modules: RefCell::new(HashMap::new()),
@@ -1902,9 +1910,10 @@ impl Interp {
         seed: u64,
     ) -> Option<crate::det::DeterminismContext> {
         let start_ms = crate::det::deterministic_start_ms(seed);
-        self.determinism
-            .borrow_mut()
-            .replace(crate::det::DeterminismContext::record(seed, start_ms))
+        // Route through the single `set_determinism` chokepoint so the REPLAY
+        // `trace_active` flag stays in sync (a `record` context is `Workflow`-origin →
+        // the flag is set false, matching the pre-REPLAY behavior).
+        self.set_determinism(Some(crate::det::DeterminismContext::record(seed, start_ms)))
     }
 
     /// BATT C1 (§10.2) — the CORE determinism install seam: swap the determinism cell to
@@ -1919,7 +1928,23 @@ impl Interp {
         &self,
         ctx: Option<crate::det::DeterminismContext>,
     ) -> Option<crate::det::DeterminismContext> {
+        // REPLAY §2.2 — keep the Gate-12 `trace_active` flag in sync at THE single
+        // install/take/restore/enter chokepoint: the stdlib trace hook fires only for a
+        // `CliTrace`-origin context. A `None` (default) or `Workflow` context → false →
+        // the default path is byte-identical.
+        self.trace_active.set(matches!(
+            &ctx,
+            Some(c) if c.origin == crate::det::Origin::CliTrace
+        ));
         std::mem::replace(&mut *self.determinism.borrow_mut(), ctx)
+    }
+
+    /// REPLAY §2.2 — the Gate-12 zero-cost snapshot: is a `CliTrace` (record/replay)
+    /// determinism context installed? Read by the `call_stdlib` trace hook BEFORE any
+    /// `RefCell` borrow. False on the default path (no context) and inside a `workflow`
+    /// context (origin `Workflow`), so both are byte-identical to pre-REPLAY.
+    pub(crate) fn trace_active(&self) -> bool {
+        self.trace_active.get()
     }
 
     /// Install an explicit determinism context (Record or Replay), returning the
@@ -1953,6 +1978,280 @@ impl Interp {
     /// fast paths (the default `None` path is byte-identical to pre-SP9).
     pub(crate) fn is_deterministic(&self) -> bool {
         self.determinism.borrow().is_some()
+    }
+
+    // ===================================================================== //
+    // REPLAY §2.2-2.4/§7 — the `call_stdlib` trace hook + divergence raise.  //
+    // ===================================================================== //
+
+    /// REPLAY §7 — raise the indexed divergence error if a strict (`CliTrace`) replay
+    /// set a `pending_divergence` at a seam. Consulted by `call_stdlib` after every
+    /// Seamed dispatch (only when `trace_active()`) and inside the trace hook itself —
+    /// this is the RAISE that Task 1 deferred ("Task 1 only PLUMBS the pending
+    /// divergence"). A `None` (no divergence) is the common case → `Ok(())`. The error
+    /// format mirrors the §7 model: an event index + the expected/got kind names.
+    pub(crate) fn check_divergence(&self, span: Span) -> Result<(), Control> {
+        let Some(d) = self.with_determinism_mut(|ctx| ctx.take_divergence()).flatten() else {
+            return Ok(());
+        };
+        let msg = match d {
+            crate::det::Divergence::Mismatch { at, expected, got } => format!(
+                "replay divergence at event {at}: expected {expected}, got {got} — the \
+                 program's effect order differs from the recording (re-record, or check \
+                 for unpinned nondeterminism)"
+            ),
+            crate::det::Divergence::Exhausted { at, wanted } => format!(
+                "replay divergence at event {at}: recorded stream exhausted (wanted \
+                 {wanted}) — the program performed more effects than were recorded \
+                 (re-record)"
+            ),
+        };
+        Err(AsError::at(msg, span).into())
+    }
+
+    /// REPLAY §2.4 — a lossy signature hash pinning a `(module, func, args)` call. It
+    /// only PINS the signature (a reordered/changed effect → a detected divergence); it
+    /// never reproduces values, so a lossy text projection of each arg is acceptable.
+    /// CORE (no `data`/`workflow` dependency): hashes the module/func + each arg's
+    /// `Display` (path strings / numbers / flags differ textually). `Display` shows the
+    /// NUM subtype (`5` vs `5.0`) so an int/float arg change is caught.
+    fn replay_args_hash(module: &str, func: &str, args: &[Value]) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        module.hash(&mut h);
+        func.hash(&mut h);
+        for a in args {
+            a.to_string().hash(&mut h);
+        }
+        h.finish()
+    }
+
+    /// REPLAY §2.2-2.4 — the trace hook's worker for a `Recorded` stdlib call. In Record
+    /// mode: dispatch the REAL call (the SAME `dispatch_stdlib` the fall-through reaches),
+    /// then encode the outcome through the worker airlock (NUM-faithful; a non-sendable
+    /// or `Shared`-carrying result is a LOUD record-time refusal naming the field path)
+    /// and append a `StdlibCall` event. In Replay mode: consume the recorded outcome at
+    /// the cursor (signature-verified), decode it through the airlock, and return WITHOUT
+    /// dispatching. A signature mismatch / exhaustion raises the §7 divergence error.
+    ///
+    /// Borrow discipline: NO `RefCell`/det-context borrow is held across the dispatch
+    /// `.await` — the mode is snapshotted up front, the encode happens AFTER the await in
+    /// a sync scope, and the append goes through the sync `with_determinism_mut` closure.
+    pub(crate) async fn trace_stdlib_call(
+        &self,
+        module: &str,
+        func: &str,
+        args: &[Value],
+        _shape: crate::stdlib::HandleShape,
+        span: Span,
+    ) -> Result<Value, Control> {
+        let args_hash = Self::replay_args_hash(module, func, args);
+        // Snapshot the mode WITHOUT holding the borrow across the await.
+        let mode = self
+            .with_determinism_mut(|ctx| ctx.mode)
+            .unwrap_or(crate::det::Mode::Record);
+
+        match mode {
+            crate::det::Mode::Replay => {
+                // Consume the recorded outcome at the cursor (sync — no await).
+                let outcome = self
+                    .with_determinism_mut(|ctx| {
+                        ctx.replay_stdlib_call(module, func, args_hash)
+                    })
+                    .flatten();
+                // A divergence (mismatch / exhaustion) was set by the helper when strict
+                // — raise it now. (When no divergence is pending this is a cheap no-op.)
+                self.check_divergence(span)?;
+                let Some(outcome) = outcome else {
+                    // Non-strict (Workflow) contexts never reach the hook, and a strict
+                    // miss always sets a divergence raised above; this is a belt-and-
+                    // braces guard for an unexpected `None` without a divergence.
+                    return Err(AsError::at(
+                        format!(
+                            "replay divergence: no recorded outcome for {}.{}",
+                            module, func
+                        ),
+                        span,
+                    )
+                    .into());
+                };
+                self.decode_trace_outcome(outcome, span)
+            }
+            crate::det::Mode::Record => {
+                // Dispatch the REAL call (await OUTSIDE any det borrow).
+                let result = self.dispatch_stdlib(module, func, args, span).await;
+                // Encode the outcome in a sync scope (after the await). `None` = a
+                // process-level `Control::Exit` that is propagated WITHOUT recording.
+                if let Some(outcome) = self.encode_trace_outcome(module, func, &result, span)? {
+                    self.with_determinism_mut(|ctx| {
+                        ctx.record_stdlib_call(module, func, args_hash, outcome);
+                    });
+                }
+                result
+            }
+        }
+    }
+
+    /// REPLAY §2.4 — encode a `Recorded` call's result into a [`crate::det::TraceOutcome`]
+    /// via the worker airlock. `Ok(v)` → `Value(bytes)`; a non-sendable / `Shared`-
+    /// carrying result is a LOUD record-time refusal (the §2.4 field-path message, never a
+    /// lossy fallback). `Err(Panic)` → `Panic(msg)`; `Err(Propagate(v))` → encoded
+    /// `Propagate`. Returns `Err` only for the record-time refusal (the call's own
+    /// `Err` is captured INTO the outcome, not propagated).
+    fn encode_trace_outcome(
+        &self,
+        module: &str,
+        func: &str,
+        result: &Result<Value, Control>,
+        span: Span,
+    ) -> Result<Option<crate::det::TraceOutcome>, Control> {
+        // A `Control::Exit` is process-level (not a recordable effect) — do NOT record
+        // it; propagate it as-is so `exit()` inside a Recorded call still exits.
+        if let Err(Control::Exit(_)) = result {
+            return Ok(None);
+        }
+        Ok(Some(match result {
+            Ok(v) => {
+                let (bytes, shared) = crate::worker::serialize::encode(v).map_err(|e| {
+                    let ae: AsError = e.into();
+                    AsError::at(
+                        format!(
+                            "{}.{} result is not recordable under --record: {} (a live \
+                             handle / closure cannot be replayed)",
+                            module,
+                            func,
+                            ae.message
+                        ),
+                        span,
+                    )
+                })?;
+                if !shared.is_empty() {
+                    return Err(AsError::at(
+                        format!(
+                            "{}.{} result contains a frozen (shared) value that cannot be \
+                             persisted to a trace — v2 may deep-materialize",
+                            module, func
+                        ),
+                        span,
+                    )
+                    .into());
+                }
+                crate::det::TraceOutcome::Value(bytes)
+            }
+            Err(Control::Panic(e)) => crate::det::TraceOutcome::Panic(e.message.clone()),
+            Err(Control::Propagate(v)) => {
+                let (bytes, shared) = crate::worker::serialize::encode(v).map_err(|e| {
+                    let ae: AsError = e.into();
+                    AsError::at(
+                        format!(
+                            "{}.{} propagated error is not recordable under --record: {}",
+                            module,
+                            func,
+                            ae.message
+                        ),
+                        span,
+                    )
+                })?;
+                if !shared.is_empty() {
+                    return Err(AsError::at(
+                        format!(
+                            "{}.{} propagated value contains a frozen (shared) value that \
+                             cannot be persisted to a trace",
+                            module, func
+                        ),
+                        span,
+                    )
+                    .into());
+                }
+                crate::det::TraceOutcome::Propagate(bytes)
+            }
+            // `Control::Exit` handled above (returns `Ok(None)`); other flow controls
+            // never reach here from a stdlib call.
+            Err(other) => return Err(other.clone()),
+        }))
+    }
+
+    /// REPLAY §2.4 — decode a recorded [`crate::det::TraceOutcome`] back into the call's
+    /// result during replay. `Value` → `Ok(v)`; `Panic` → re-raise the same Tier-2 panic;
+    /// `Propagate` → re-raise the `?` early return. A decode failure is a CLEAN corrupt-
+    /// trace error (never a panic — the trace is untrusted, §2.4).
+    fn decode_trace_outcome(
+        &self,
+        outcome: crate::det::TraceOutcome,
+        span: Span,
+    ) -> Result<Value, Control> {
+        match outcome {
+            crate::det::TraceOutcome::Value(bytes) => {
+                let v = crate::worker::serialize::decode(&bytes, self).map_err(|e| {
+                    AsError::at(format!("corrupt trace: {}", e.message()), span)
+                })?;
+                Ok(v)
+            }
+            crate::det::TraceOutcome::Panic(msg) => Err(AsError::at(msg, span).into()),
+            crate::det::TraceOutcome::Propagate(bytes) => {
+                let v = crate::worker::serialize::decode(&bytes, self).map_err(|e| {
+                    AsError::at(format!("corrupt trace: {}", e.message()), span)
+                })?;
+                Err(Control::Propagate(v))
+            }
+        }
+    }
+
+    // ----- REPLAY in-process test seams (the `ffi.rs` determinism-test precedent) ----- //
+
+    /// REPLAY (test-only) — install a fresh `CliTrace` Record-mode context (mirrors
+    /// `ascript run --record`). Returns the previous context. `#[doc(hidden)]`, used by
+    /// `tests/record_replay.rs` to drive record/replay in-process without spawning the
+    /// binary (that end-to-end coverage is a later REPLAY task).
+    #[doc(hidden)]
+    pub fn __install_record_trace(&self, seed: u64) -> Option<crate::det::DeterminismContext> {
+        let start_ms = crate::det::deterministic_start_ms(seed);
+        self.set_determinism(Some(crate::det::DeterminismContext::record_trace(
+            seed, start_ms,
+        )))
+    }
+
+    /// REPLAY (test-only) — install a strict `CliTrace` Replay-mode context primed with a
+    /// recorded `events` stream (mirrors `ascript run --replay`). Returns the previous.
+    #[doc(hidden)]
+    pub fn __install_replay_trace(
+        &self,
+        seed: u64,
+        events: Vec<crate::det::DetEvent>,
+    ) -> Option<crate::det::DeterminismContext> {
+        let start_ms = crate::det::deterministic_start_ms(seed);
+        self.set_determinism(Some(crate::det::DeterminismContext::replay_trace(
+            seed, start_ms, events,
+        )))
+    }
+
+    /// REPLAY (test-only) — take the current context's recorded event stream (cloned),
+    /// or `None` when no context is installed. Lets a test assert exactly which events a
+    /// recorded program produced.
+    #[doc(hidden)]
+    pub fn __take_trace_events(&self) -> Option<Vec<crate::det::DetEvent>> {
+        self.with_determinism_mut(|ctx| ctx.events.clone())
+    }
+
+    /// REPLAY (test-only) — clear any installed determinism context (and the
+    /// `trace_active` flag), returning it. Lets a test tear down between record/replay.
+    #[doc(hidden)]
+    pub fn __clear_determinism(&self) -> Option<crate::det::DeterminismContext> {
+        self.set_determinism(None)
+    }
+
+    /// REPLAY (test-only) — drive a qualified `(module, func)` stdlib call through the
+    /// FULL `call_stdlib` path (caps gate → trace hook → dispatch), so a test can record
+    /// or replay an effectful call in-process. Mirrors what a compiled program's stdlib
+    /// call reaches.
+    #[doc(hidden)]
+    pub async fn __call_stdlib(
+        &self,
+        module: &str,
+        func: &str,
+        args: &[Value],
+    ) -> Result<Value, Control> {
+        self.call_stdlib(module, func, args, Span::new(0, 0)).await
     }
 
     /// The wall clock in ms-epoch: the virtual/recorded clock when deterministic,
