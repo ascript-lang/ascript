@@ -88,6 +88,17 @@ test = false
 doc = false
 bench = false
 
+# REPLAY Task 2 — the `ASTRC` trace-container decoder byte-fuzz target (REPLAY §3).
+# Feeds ARBITRARY bytes to `ascript::trace::read_trace` — asserts no panic, no OOM,
+# no hang. The in-suite truncation/bomb/crc tests are the real guard; this is the
+# coverage-guided extension.
+[[bin]]
+name = "trace_roundtrip"
+path = "fuzz_targets/trace_roundtrip.rs"
+test = false
+doc = false
+bench = false
+
 # WARM Task 5 — the PGO section codec byte-fuzz target (WARM spec §3.2).
 # Feeds ARBITRARY bytes to PgoSection::decode — asserts no panic, no OOM, idempotent
 # re-encode if Some is returned. The in-suite truncation/bomb tests are the real guard;

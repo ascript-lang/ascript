@@ -1898,3 +1898,263 @@ mod object_storage_property {
         );
     }
 }
+
+// ===========================================================================
+// REPLAY §3 — the `ASTRC` trace-container decoder planted-bug guards (the
+// in-tree mirror of the `trace_roundtrip` libFuzzer target).
+//
+// A recorded trace is an attacker-WRITABLE file that `--replay` parses, so
+// `ascript::trace::read_trace` is a SECURITY surface (the `.aso` discipline).
+// These guards run in the NORMAL `cargo test` suite (the load-bearing
+// in-session proof; the cargo-fuzz campaign is the CI-side coverage-guided
+// extension) and pin: every curated known-bad buffer (truncations, crc flips,
+// length/count bombs, unknown version/kind, bad magic) classifies as a clean
+// `Err`, never a panic / OOM. They also seed `fuzz/corpus/trace_roundtrip/`.
+// ===========================================================================
+
+use ascript::det::{DetEvent, FfiRet, TraceOutcome};
+use ascript::trace::{
+    read_trace, write_trace, TraceHeader, TraceKind, TRACE_FORMAT_VERSION,
+};
+
+const TRACE_MAGIC: [u8; 8] = *b"ASTRC\0\0\0";
+
+/// A small reflected IEEE crc32 (the same polynomial `src/trace.rs` uses) so the
+/// test can hand-build records with a CORRECT crc (to reach a deeper rejection
+/// than `BadCrc`) — duplicated here on purpose to keep the guard independent of
+/// the codec internals.
+fn test_crc32(data: &[u8]) -> u32 {
+    let mut crc = 0xFFFF_FFFFu32;
+    for &b in data {
+        crc ^= b as u32;
+        for _ in 0..8 {
+            crc = if crc & 1 != 0 {
+                0xEDB8_8320 ^ (crc >> 1)
+            } else {
+                crc >> 1
+            };
+        }
+    }
+    crc ^ 0xFFFF_FFFF
+}
+
+fn sample_trace_header() -> TraceHeader {
+    TraceHeader {
+        seed: 0x0123_4567_89AB_CDEF,
+        start_ms: 1_700_000_000_000.0,
+        kind: TraceKind::Run,
+        program_path: "examples/api.as".to_string(),
+        source_sha256: [0x5A; 32],
+        argv: vec!["a".to_string(), "b".to_string()],
+        test_name: None,
+        filter: None,
+        created_ms: 1_700_000_000_500.0,
+        engine: 1,
+    }
+}
+
+fn sample_trace_events() -> Vec<DetEvent> {
+    vec![
+        DetEvent::ClockRead { value: 1.0 },
+        DetEvent::BytesRead {
+            bytes: vec![0, 255, 7, 7, 7],
+        },
+        DetEvent::StdlibCall {
+            module: "http".to_string(),
+            func: "get".to_string(),
+            args_hash: 99,
+            outcome: TraceOutcome::Value(vec![1, 2, 3]),
+        },
+        DetEvent::FfiCall {
+            ret: FfiRet::Int(-1),
+            out_params: vec![(0, vec![9])],
+        },
+        DetEvent::NativeCall {
+            vid: 3,
+            method: "json".to_string(),
+            args_hash: 5,
+            outcome: TraceOutcome::Propagate(vec![0xFF]),
+        },
+    ]
+}
+
+/// A real, well-formed encoded trace (header + a representative event mix) — the
+/// base for the truncation / crc-flip mutations.
+fn good_trace_bytes() -> Vec<u8> {
+    // We reach the private `encode_trace` indirectly via `write_trace` to a temp
+    // file, then read it back as bytes (the only public encode path).
+    let dir = std::env::temp_dir().join(format!(
+        "ascript_tracebuild_{}_{:?}",
+        std::process::id(),
+        std::thread::current().id()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("good.astrc");
+    write_trace(&path, &sample_trace_header(), &sample_trace_events()).expect("write good trace");
+    let bytes = std::fs::read(&path).expect("read good trace");
+    let _ = std::fs::remove_dir_all(&dir);
+    bytes
+}
+
+/// The curated KNOWN-BAD trace byte set — each must classify as a clean `Err`,
+/// never a panic / OOM. Mirrors the `bad_*` seeds committed under
+/// `fuzz/corpus/trace_roundtrip/`.
+fn known_bad_trace_inputs() -> Vec<(&'static str, Vec<u8>)> {
+    let good = good_trace_bytes();
+    let u32max = u32::MAX.to_le_bytes();
+
+    let mut bad_magic = good.clone();
+    bad_magic[0] ^= 0xFF;
+
+    let mut bad_version = good.clone();
+    // version is bytes [8..10] (after the 8-byte magic).
+    bad_version[8..10].copy_from_slice(&(TRACE_FORMAT_VERSION + 1).to_le_bytes());
+
+    let mut bad_header_crc = good.clone();
+    // Flip the first header-body byte (offset 14 = magic(8)+ver(2)+header_len(4))
+    // so the body's content no longer matches the stored header crc.
+    bad_header_crc[14] ^= 0x01;
+
+    // A bomb record: valid header (reuse `good`'s framing up to the first record)
+    // then a record whose declared payload_len = u32::MAX over no payload.
+    let bomb_record = {
+        // Find where the first record begins: re-parse the good bytes' framing.
+        // magic(8) + ver(2) + header_len(4) + body + header_crc(4).
+        let header_len =
+            u32::from_le_bytes([good[10], good[11], good[12], good[13]]) as usize;
+        let first_rec = 8 + 2 + 4 + header_len + 4;
+        let mut b = good[..first_rec].to_vec();
+        b.push(1); // kind = ClockRead
+        b.extend_from_slice(&u32max); // payload_len BOMB
+        b
+    };
+
+    // A record with an unknown kind byte (200) but a CORRECT crc — so it reaches
+    // `UnknownRecordKind`, not `BadCrc`.
+    let unknown_kind = {
+        let header_len =
+            u32::from_le_bytes([good[10], good[11], good[12], good[13]]) as usize;
+        let first_rec = 8 + 2 + 4 + header_len + 4;
+        let mut b = good[..first_rec].to_vec();
+        let kind = 200u8;
+        let payload: [u8; 0] = [];
+        b.push(kind);
+        b.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        b.extend_from_slice(&payload);
+        let mut crc_in = vec![kind];
+        crc_in.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        crc_in.extend_from_slice(&payload);
+        b.extend_from_slice(&test_crc32(&crc_in).to_le_bytes());
+        b.push(0xFF);
+        b.extend_from_slice(&1u32.to_le_bytes());
+        b
+    };
+
+    // Wrong event count in the end marker.
+    let mut wrong_count = good.clone();
+    let n = wrong_count.len();
+    wrong_count[n - 4..].copy_from_slice(&12345u32.to_le_bytes());
+
+    // Trailing byte after a complete (empty) trace.
+    let trailing = {
+        let mut b = good.clone();
+        b.push(0xAB);
+        b
+    };
+
+    vec![
+        ("bad_empty", Vec::new()),
+        ("bad_short_magic", vec![0x41, 0x53]),
+        ("bad_magic", bad_magic),
+        ("bad_version_future", bad_version),
+        ("bad_header_crc", bad_header_crc),
+        ("bad_truncated_after_magic", TRACE_MAGIC.to_vec()),
+        ("bad_bomb_record_len", bomb_record),
+        ("bad_unknown_record_kind", unknown_kind),
+        ("bad_wrong_event_count", wrong_count),
+        ("bad_trailing_bytes", trailing),
+    ]
+}
+
+/// PLANTED-BUG GUARD (REPLAY §3): every curated known-bad `ASTRC` input is a
+/// CLEAN `Err`, never a panic / abort / unbounded allocation — proving the
+/// `trace_roundtrip` fuzz target's invariant (and that its crash-detection can
+/// fire).
+#[test]
+fn trace_planted_bug_known_bad_bytes_are_clean_err() {
+    for (name, bytes) in known_bad_trace_inputs() {
+        let res = std::panic::catch_unwind(|| read_trace(&bytes));
+        match res {
+            Ok(Ok(_)) => panic!("planted-bug case `{name}` decoded Ok — must be a clean Err"),
+            Ok(Err(_)) => {} // clean error — good
+            Err(_) => panic!("planted-bug case `{name}` PANICKED — reader is not hostile-safe"),
+        }
+    }
+}
+
+/// Truncate the good trace at EVERY byte offset — every strict prefix is a clean
+/// `Err`, never a panic (the `.aso` fuzz discipline in-suite).
+#[test]
+fn trace_truncation_at_every_offset_is_clean_err() {
+    let full = good_trace_bytes();
+    for k in 0..full.len() {
+        let res = std::panic::catch_unwind(|| read_trace(&full[..k]));
+        match res {
+            Ok(Ok(_)) => panic!("prefix of len {k} decoded Ok — should be truncated"),
+            Ok(Err(_)) => {}
+            Err(_) => panic!("prefix of len {k} PANICKED — reader is not hostile-safe"),
+        }
+    }
+    assert!(read_trace(&full).is_ok(), "the full trace must decode");
+}
+
+/// Write the seed corpus for the `trace_roundtrip` libFuzzer target: a couple of
+/// real recorded traces + the curated known-bad buffers. The committed corpus is
+/// the libFuzzer starting set AND a regression guard; this test (re)materializes
+/// it so a fresh checkout has seeds.
+#[test]
+fn trace_seed_corpus_is_written_and_current() {
+    let corpus = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("fuzz/corpus/trace_roundtrip");
+    std::fs::create_dir_all(&corpus).expect("create corpus dir");
+
+    // A real recorded trace (run-kind) and a test-kind one.
+    let run_bytes = good_trace_bytes();
+    std::fs::write(corpus.join("ex_run.astrc"), &run_bytes).expect("write ex_run");
+    // The full event mix decodes cleanly.
+    assert!(read_trace(&run_bytes).is_ok());
+
+    let test_header = TraceHeader {
+        kind: TraceKind::Test,
+        test_name: Some("retries".to_string()),
+        filter: Some("retry".to_string()),
+        ..sample_trace_header()
+    };
+    {
+        let dir = std::env::temp_dir().join(format!(
+            "ascript_tracecorpus_{}_{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("t.astrc");
+        write_trace(&p, &test_header, &sample_trace_events()).expect("write test trace");
+        let test_bytes = std::fs::read(&p).expect("read test trace");
+        std::fs::write(corpus.join("ex_test.astrc"), &test_bytes).expect("write ex_test");
+        assert!(read_trace(&test_bytes).is_ok());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // The curated known-bad seeds (rejection seeds — must NOT decode).
+    for (name, bytes) in known_bad_trace_inputs() {
+        std::fs::write(corpus.join(name), &bytes).expect("write bad seed");
+        if !bytes.is_empty() {
+            assert!(
+                read_trace(&bytes).is_err(),
+                "known-bad seed `{name}` unexpectedly decoded Ok"
+            );
+        }
+    }
+}

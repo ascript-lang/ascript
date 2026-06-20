@@ -106,9 +106,12 @@ pub mod task;
 // `--watch` import-graph scoping. Core (no feature gate); the regex branch is
 // `data`/`sys`-gated and degrades to a clean error otherwise.
 pub mod test_filter;
+pub mod token;
+// REPLAY §3: the `ASTRC` trace container (record/replay on-disk format). CORE — no
+// serde, no feature gate; builds under `--no-default-features` (the det.rs constraint).
+pub mod trace;
 #[cfg(not(ascript_rt))]
 pub mod watch;
-pub mod token;
 pub mod value;
 pub mod vm;
 pub mod worker;
