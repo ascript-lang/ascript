@@ -19,6 +19,11 @@ dist/
 *.vsix
 *.wasm
 *.node
+# …but the committed browser-playground artifact is the exception: the static docs site
+# must run from a plain checkout (WASM §5.5), so the wasm-pack pkg/ for the playground is
+# tracked. Build scratch (ascript-wasm/pkg, target/) stays ignored by the rules above.
+!docs/assets/playground/pkg/
+!docs/assets/playground/pkg/*.wasm
 
 # Local tooling / session state — never publish
 /.claude/

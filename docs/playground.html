@@ -1,0 +1,59 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>AScript Playground — run AScript in your browser</title>
+<meta name="description" content="Compile and run AScript entirely in your browser. No server, no install — the bytecode VM ships as WebAssembly.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%2314110d'/%3E%3Ctext x='15' y='23' font-family='monospace' font-size='20' fill='%23f0a92b' text-anchor='middle' font-weight='700'%3Ea%3C/text%3E%3Ccircle cx='24' cy='23' r='2.6' fill='%23e7674a'/%3E%3C/svg%3E">
+<link rel="stylesheet" href="assets/styles.css">
+</head>
+<body>
+
+<header class="topbar">
+  <a class="brand" href="index.html"><span><b>ascript</b><span class="dot">.</span></span><span class="ext">as</span></a>
+  <nav class="topnav">
+    <a href="reader.html#/introduction">Docs</a>
+    <a href="reader.html#/stdlib/overview">Standard library</a>
+    <a href="reader.html#/examples">Examples</a>
+    <a href="playground.html" class="active">Playground</a>
+    <a href="https://github.com/ascript-lang/ascript" target="_blank" rel="noopener">GitHub</a>
+  </nav>
+  <span class="spacer"></span>
+  <a class="ghlink" href="reader.html#/tooling/playground">About the playground</a>
+</header>
+
+<main class="pg">
+  <div class="pg-head">
+    <h1>Playground</h1>
+    <p>Edit a program and press <b>Run</b>. It compiles and runs entirely in your browser on
+      the production bytecode VM, compiled to WebAssembly — no server, deny-all
+      capabilities. <a href="reader.html#/tooling/playground">What can and can't run here →</a></p>
+  </div>
+
+  <div class="pg-toolbar">
+    <button class="btn btn-primary" id="run">Run</button>
+    <button class="btn btn-ghost" id="stop" disabled>Stop</button>
+    <label class="pg-examples">
+      <span>Examples</span>
+      <select id="examples"></select>
+    </label>
+    <span class="spacer"></span>
+    <button class="btn btn-ghost" id="share">Share</button>
+  </div>
+
+  <div class="pg-grid">
+    <section class="pg-pane">
+      <div class="pg-pane-bar"><span>main.as</span></div>
+      <textarea id="src" spellcheck="false" autocapitalize="off" autocomplete="off" autocorrect="off"></textarea>
+    </section>
+    <section class="pg-pane">
+      <div class="pg-pane-bar"><span>output</span><span class="pg-status" id="status"></span></div>
+      <pre id="out" class="pg-out"></pre>
+    </section>
+  </div>
+</main>
+
+<script src="assets/playground.js"></script>
+</body>
+</html>
