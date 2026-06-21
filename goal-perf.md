@@ -327,11 +327,21 @@ stated, results are measured.
   edge hosts.
   - Spec: `superpowers/specs/2026-06-12-embedding-api-design.md` · Plan: `superpowers/plans/2026-06-12-embedding-api.md`
 
-- 🔒 **WASM — wasm32 target + browser playground (spike-gated).** v1 = compile front-end +
-  VM to wasm for an in-browser playground on the docs site (compile+run, captured output,
-  caps default-deny, wasm-compatible stdlib subset); WASI/edge runtimes recorded as the
-  evidence-gated follow-up. Phase 0 is a build-matrix feasibility spike (tokio-on-wasm,
-  stacker, tree-sitter C linkage) with GO/NO-GO recorded.
+- 🟡 **WASM — wasm32 target + browser playground (spike-gated). Phase-0 spike = GO** (evidence on
+  `spike/wasm-target` `ae9d0f99`, kept). v1 = compile front-end + VM to wasm for an in-browser
+  playground on the docs site (compile+run, captured output, caps default-deny, wasm-compatible
+  stdlib subset); WASI/edge runtimes recorded as the evidence-gated follow-up.
+  - **SPIKE RESULT (GO, controller-verified):** the curated lib (`data,binary,log,shared` +
+    `crypto`+`datetime`) compiles for `wasm32-unknown-unknown` with three sanctioned probe patches
+    (build.rs cc-skip; tokio/rustyline target-dep split — `rt-multi-thread` is vestigial, `repl`
+    cfg-gated; `uuid`/`getrandom` `js` backend). The tokio executor cell PASSED end-to-end under
+    Node (`spawn_local` + `JoinHandle::abort` cancel-on-drop + `tokio::sync::mpsc` + await, NO
+    enter-guard needed); gcmodule cycle-collection + hello + async examples ran **byte-equal to
+    native** under Node (release 7/7; one debug-only `debug_assert` tail-padding caveat); `stacker`
+    needs NO patch; size **5.0 MB raw / 1.75 MB gzipped**, ~5.9 ms cold-instantiate. **NATIVE stayed
+    byte-identical** (`cargo tree` identical both configs, `vm_differential` 446/0, conformance
+    16/0+36/0 — the probe patches are native-transparent, re-verified by the controller). Phase 1
+    (the real implementation, re-done TDD off `main`) is pending.
   - Spec: `superpowers/specs/2026-06-12-wasm-target-design.md` · Plan: `superpowers/plans/2026-06-12-wasm-target.md`
 
 ### Flagship & ecosystem track
