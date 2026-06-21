@@ -196,15 +196,25 @@ stated, results are measured.
 
 ### Evidence-gated (designed now, executed only when their gate opens — the JIT discipline)
 
-- 🔒 **EXEC — Bespoke single-thread executor.** Replace tokio `current_thread`+`LocalSet` as the
-  VM's task driver with a purpose-built `!Send` executor (intrusive run queue, no per-spawn
-  `JoinHandle`/`AbortHandle` allocations, same-thread wakes that never touch the reactor, tokio
-  retained solely as the I/O/timer driver). **Gate: a post-LANE re-profile showing the residual
-  async tax still material (≥15% on the async corpus).** Cancel-on-drop and structured-concurrency
-  semantics must survive byte-identically — this is the riskiest spec in the campaign and runs
-  last among engine specs.
+- ⚖️ **EXEC — Bespoke single-thread executor — BUILT, then PARKED at the ship gate
+  (EVIDENCE-REJECTED on perf). See EXECUTION LOG.** The build gate OPENED (post-LANE re-profile:
+  `async_inline` 90.7% async-runtime share ≥ 15%, `bench/EXEC_GATE.md`), so the full executor was
+  built honestly: a `!Send` per-isolate slab+FIFO executor (Architecture B — runs as one future
+  inside tokio's `LocalSet`), the `exec::spawn_local` seam over every spawn site, the
+  `ASCRIPT_EXECUTOR=tokio` kill switch, deferred-drop abort, and the full §6 differential/Miri/leak
+  batteries. **Proven SOUND + byte-invisible:** `vm_differential` **448/0** BOTH feature configs
+  (tree-walker == bespoke == tokio), property 35/0, async-weighted fuzz 0 divergences, Miri-clean
+  exec core, no RSS leak (un-awaited loop @ 1M = 14 MB ≈ tokio). **Phase-10 A/B → PARK:** the spec §7
+  ship gate requires a **≥10% async-corpus geomean win**; the measured win is **0.99x (neutral)** —
+  attribution shows bespoke `async_inline` spends ~95% in the reactor park, identical to tokio's
+  `kevent` 90.9%. **Architecture B cannot eliminate the `kevent` park** (the executor lives inside
+  tokio's `LocalSet` and returns `Pending` → tokio parks) and `SharedFuture`'s `tokio::sync::Notify`
+  await rendezvous was frozen (spec §8); the win needs the spec's explicitly-v2-on-evidence items
+  (Architecture A + a bespoke await rendezvous), out of v1 scope. PARKED on `feat/vm-executor`
+  (unmerged, kept like `spike/wasm-target`) — the substrate for an evidence-led v2.
   - Spec: `superpowers/specs/2026-06-12-vm-executor-design.md`
   - Plan: `superpowers/plans/2026-06-12-vm-executor.md`
+  - Evidence: `bench/EXEC_GATE.md` (build gate GO) + `bench/EXEC_RESULTS.md` (ship gate PARK).
 
 - ⚖️ **REGION — Task-scoped region allocation — EVIDENCE-REJECTED (NO-GO). See EXECUTION LOG.**
   The spike was executed honestly (probe → narrow prototype → A/B). The narrow refcount recycler
@@ -430,6 +440,40 @@ stated, results are measured.
   revisit inline short strings ONLY behind its measured-win gate.
 
 ## EXECUTION LOG (live)
+
+- **EXEC** — ⚖️ **BUILT, then PARKED at the ship gate (EVIDENCE-REJECTED on perf); 11 commits frozen on
+  `feat/vm-executor` (`710604cf`, UNMERGED, kept like `spike/wasm-target`).** The LAST campaign item, and the
+  honored evidence-park that completes it (**21/21 resolved**: 20 merged + EXEC + REGION evidence-rejected; JIT a
+  recorded deferral). **Build gate OPENED** (Task 0): the post-LANE re-profile measured `async_inline`'s
+  async-runtime share at **90.7% ≥ 15%** (fresh same-day on `main` `ff27977c`; `kevent`/reactor-park 88%;
+  `bench/EXEC_GATE.md`) → GO to build. **Built honestly** (Tasks 1–9, each subagent-implemented + independently
+  opus-reviewed + controller-verified): a `!Send` per-isolate generational-slab + FIFO executor (`src/exec/`),
+  the Send-safe `std::task::Wake` waker (same-thread fast path via `CURRENT_EXEC` + lock-free mpsc injection —
+  zero `unsafe`, Miri-clean), `JoinHandle`/`AbortHandle` parity with **deferred-drop abort** (the mid-poll-UB
+  guard), `run_until`/`drain` inside the unchanged `LocalSet` (Architecture B) with the tick-budget + lost-wakeup
+  re-check, the `exec::spawn_local` seam over EVERY spawn site (engine + worker + all stdlib incl. the drifted
+  cron/process/resilience), and the `ASCRIPT_EXECUTOR=tokio` permanent kill switch. **Proven SOUND + byte-invisible:**
+  `vm_differential` **448/0** BOTH feature configs (tree-walker == bespoke == tokio; the executor=tokio axis +
+  an 8-program scheduling battery the reviewer SABOTEUR-proved catches a FIFO→LIFO flip + a `spawned_total`
+  coverage assertion = 10000), property **35/0** both, async-weighted fuzz 0 divergences, Miri-clean exec core,
+  and **no per-spawn leak** (un-awaited-async-loop @ 1M iters = 14 MB bespoke ≈ 12.7 MB tokio — the M17 memory
+  bar held; the leak battery settled a libFuzzer exit-OOM as a pathological generated unit, not a leak).
+  **Phase-10 A/B → PARK** (spec §7 requires a ≥10% async-corpus geomean win): measured **0.991x / 0.998x**
+  (two controller runs) + **0.995x / 1.009x** (two independent-reviewer runs) — all robustly **< 1.10, neutral**.
+  Attribution (`sample`): bespoke `async_inline` spends **~95% in the reactor park, identical to tokio's `kevent`
+  90.9%** — **Architecture B cannot eliminate the `kevent` park** (the executor runs inside tokio's `LocalSet`
+  and returns `Pending` when idle → tokio parks), and `SharedFuture`'s `tokio::sync::Notify` await rendezvous was
+  frozen (spec §8). EXEC replaced the spawn *harness* (a small slice) but left the dominant park untouched → no
+  win. The win needs the spec's **explicitly-v2-on-evidence** items — Architecture A (own the outer park loop;
+  touch the reactor only when I/O can actually arrive) + a bespoke same-thread await rendezvous — both out of v1
+  scope and gated behind "ship B first." Per spec §7 a sub-10% win is a **failed gate → PARK with evidence**
+  (the JIT/REGION precedent), NOT a judgment call. The complete, tested, byte-identical, leak-free executor +
+  seam + kill switch is the durable substrate banked for an evidence-led v2. Independent opus reviewer
+  CONFIRMED the park (reproduced the A/B, verified the executor is genuinely active + the `kevent`-park parity +
+  the quality gates). Evidence: `bench/EXEC_GATE.md` + `bench/EXEC_RESULTS.md`. Non-blocking follow-ups recorded:
+  the property/fuzz async axis is weak on ready-queue ordering (the deterministic battery is the effective
+  scheduling-mutation catcher); the fuzzgen can generate a pathologically-expensive async unit (a `-timeout`/size
+  bound is the fix). **The 21-spec PERF campaign is now COMPLETE.**
 
 - **WASM** — ✅ MERGED to `main` (`--no-ff`, `2120476d`). wasm32 target + browser playground, SPIKE-GATED. The
   Phase-0 feasibility spike (a fixed build/executor/size matrix) returned a **GO** with full evidence under Node
