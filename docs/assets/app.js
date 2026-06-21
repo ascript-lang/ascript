@@ -76,6 +76,7 @@ const NAV = [
     ['stdlib/bench', 'Benchmarking'],
   ]},
   { title: 'Tooling', items: [
+    ['tooling/playground', 'Playground'],
     ['tooling/editor-setup', 'Editor setup'],
     ['tooling/lsp-capabilities', 'LSP capabilities'],
     ['tooling/debugging-profiling', 'Debugging & profiling'],

@@ -861,6 +861,23 @@ Spec `superpowers/specs/2026-06-12-lsp-stdlib-signatures-design.md`, plan
   Examples: stdlib completions, hover, and signature help verified via `tests/lsp.rs` JSON-RPC
   harness. Gate: `tests/std_sigs_docs.rs` + `tests/docs_drift.rs` green (both drift directions).
 
+## WASM — wasm32 target + browser playground ✅ PHASE 3 (playground UI + docs) DONE
+
+- Spec `superpowers/specs/2026-06-12-wasm-target-design.md`; plan
+  `superpowers/plans/2026-06-12-wasm-target.md`. Phases 0–2 (spike GO, `ascript-wasm/` wrapper,
+  `build-wasm.sh` + mini-differential) merged earlier on `feat/wasm-target`. Phase 3 ships the
+  browser playground: `docs/playground.html` + `docs/assets/playground.js` (Web-Worker driver,
+  Stop = `terminate()` + lazy respawn, examples manifest, `#code=` share link) +
+  `docs/assets/playground-worker.js`, the committed wasm-pack artifact at
+  `docs/assets/playground/pkg/`, and `docs/content/tooling/playground.md` (the §5.2 subset table
+  reflecting the shipped `ascript-wasm/Cargo.toml` features: `data`/`binary`/`log`/`shared`;
+  `crypto`/`datetime` recorded out). Docs-and-assets only — no engine/`src/` change.
+- **Deferred stretch (recorded follow-up, not silently dropped):** Task 3.3 — the "Run ▶" button
+  injection into fenced `ascript` code blocks on docs pages (`app.js` `renderMarkdown`) — is **NOT
+  shipped in v1**. The read-side support (the `#code=` hash loader) ships regardless, so the
+  stretch is purely the button injection. Owner: a docs-UX follow-up; the plan sanctions skipping
+  it with this roadmap note.
+
 ## Working notes (carry forward across compaction)
 
 - Single crate `ascript` (lib + bin); modules mirror future crate split (deferred

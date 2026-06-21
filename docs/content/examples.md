@@ -10,6 +10,11 @@ with:
 ascript run examples/advanced/data_pipeline.as
 ```
 
+> Want to run these without installing anything? Many of the introductory programs run in the
+> browser-based [**Playground**](../tooling/playground) (the **Playground** link in the top
+> navigation) — anything that stays within its [stdlib subset](../tooling/playground) (no
+> filesystem, network, processes, or workers).
+
 ## Introductory examples
 
 Short, single-concept programs in `examples/`:
