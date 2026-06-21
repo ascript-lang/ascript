@@ -34,7 +34,7 @@ are compiled out. This table is the documentation contract — it mirrors the fe
 | **In — core (always compiled)** | `math`, `string`, `array`, `object`, `map`/`set`, `convert`, `task`, `sync` (channels), `stream`, `time` (clock), `schema`, `caps`, `assert`, `bench`, plus the events / LRU / template utilities | un-gated core language |
 | **In — features (`data`, `binary`, `log`, `shared`)** | `data` → `json`, `regex`, `encoding` (base64/hex/url/percent), `csv`, `yaml`, `uuid`, `url`; `binary` → `msgpack`, `cbor`; `log` (routed to the capture buffer); `shared` → `freeze` (pure in-memory) | the shipped wasm feature list |
 | **Out — OS surface** | `fs`, `env`, `process`, `io`, `os`, `net`/`http`/`ws`/server, `sqlite`/`postgres`/`redis`, `compress`, `tui`, `workflow`, `ffi`, `intl`, `sysinfo`, `telemetry`, `ai`, `pkg` | the feature is absent, so `import "std/fs"` is the ordinary **unknown-module** error |
-| **Out — platform** | workers (all three forms, `run_in_worker`, `task.pmap`/`preduce`), interval/timer resources (`time.every`), the REPL | a clean **Tier-2 platform error** at the point of use |
+| **Out — platform** | workers (all three forms, `run_in_worker`, `task.pmap`/`preduce`), interval/timer resources (`time.interval`), the REPL | a clean **Tier-2 platform error** at the point of use |
 
 > `crypto` and `datetime` are portable-in-principle but are **not** in the current wasm build
 > — they remain candidates for a later release. Importing them gives the unknown-module error
@@ -49,7 +49,7 @@ running `ascript` natively:
    programs hit `maximum recursion depth exceeded` sooner — with the *same* error text as
    native.
 2. **No workers, no timers, no OS stdlib.** The `worker` forms, `run_in_worker`,
-   `task.pmap`/`preduce`, and `time.every` raise a Tier-2 `… is not available on this
+   `task.pmap`/`preduce`, and `time.interval` raise a Tier-2 `… is not available on this
    platform (wasm)` error; `import "std/fs"` (and the other OS modules) are the ordinary
    unknown-module error. Nothing is silently stubbed.
 3. **Captured output only.** `print` and `log` are captured and shown when the run finishes —
