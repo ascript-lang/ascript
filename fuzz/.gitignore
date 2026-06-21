@@ -54,3 +54,12 @@ corpus/archive_roundtrip/*
 corpus/pgo_section/*
 !corpus/pgo_section/ex_*
 !corpus/pgo_section/bad_*
+
+# REPLAY Task 2 — the `trace_roundtrip` `ASTRC` trace-container decoder target: same
+# discipline. Ignore the (nightly-GROWN, hash-named) corpus, RE-INCLUDE only the curated
+# `ex_*.astrc` recorded-trace seeds and the `bad_*` rejection seeds (truncations / crc flips /
+# length bombs / unknown version+kind). Not `.aso` files, so the root `*.aso` rule does not
+# touch them; these two negations are what tracks the curated seeds.
+corpus/trace_roundtrip/*
+!corpus/trace_roundtrip/ex_*
+!corpus/trace_roundtrip/bad_*

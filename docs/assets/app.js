@@ -79,6 +79,7 @@ const NAV = [
     ['tooling/editor-setup', 'Editor setup'],
     ['tooling/lsp-capabilities', 'LSP capabilities'],
     ['tooling/debugging-profiling', 'Debugging & profiling'],
+    ['tooling/record-replay', 'Record & replay'],
     ['tooling/doc-generation', 'Doc generation'],
   ]},
   { title: 'Resources', items: [

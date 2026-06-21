@@ -88,6 +88,22 @@ pub enum Command {
         /// never cached regardless of this flag.
         #[arg(long = "no-cache")]
         no_cache: bool,
+        /// REPLAY §4.1: record this run's non-deterministic effects (clock/RNG/uuid/fs/
+        /// env/process.run/DNS/buffered-http/workflow.run) to <FILE> as a replayable
+        /// trace. The run executes in deterministic mode (virtual clock, instant sleeps,
+        /// seeded RNG); the trace is written even if the program panics or exits non-zero.
+        /// Bypasses the compile cache. Composes with `--tree-walker` and `.aso`.
+        #[arg(long = "record", value_name = "FILE", conflicts_with = "replay")]
+        record: Option<String>,
+        /// REPLAY §4.1: replay a previously recorded <FILE>, reproducing the run's exact
+        /// effects with NO real I/O (strict divergence detection). Pass the same program
+        /// file; a source change since recording is a clean error. Bypasses the cache.
+        #[arg(long = "replay", value_name = "FILE")]
+        replay: Option<String>,
+        /// REPLAY §4.1: pin the RNG seed for `--record` (default: OS entropy). The same
+        /// program + seed records an identical event stream.
+        #[arg(long = "seed", value_name = "N", requires = "record")]
+        seed: Option<u64>,
         file: String,
         /// Trailing arguments forwarded to the script as `env.args()`.
         /// Hyphen-prefixed values (e.g. `--flag`) are also captured.
@@ -342,6 +358,19 @@ pub enum Command {
         /// on the real clock (§10.2).
         #[arg(long = "frozen-time", value_name = "RFC3339|EPOCH_MS")]
         frozen_time: Option<String>,
+        /// REPLAY §4.2-4.3: record per-test traces for this run. Each test FILE runs
+        /// under one deterministic Record context; a trace is auto-saved ONLY for a
+        /// FAILED test under `.ascript-traces/<file_stem>__<test-name-slug>.trace`
+        /// (a green run writes nothing). Replay one with `--replay`. Conflicts with
+        /// `--parallel`/`--watch`/`--replay` (v1).
+        #[arg(long = "record", conflicts_with = "replay")]
+        record: bool,
+        /// REPLAY §4.2-4.3: replay a previously recorded per-test trace, re-running
+        /// module load + exactly that one test under strict Replay (every effect
+        /// returns its recorded value — no real I/O). A changed test file proceeds
+        /// with a printed warning (the point is editing the test between replays).
+        #[arg(long = "replay", value_name = "FILE")]
+        replay: Option<String>,
     },
     /// Run the language server (LSP over stdio)
     #[cfg(feature = "lsp")]
@@ -360,6 +389,12 @@ pub enum Command {
         /// the only transport, so this is a no-op.
         #[arg(long = "stdio")]
         stdio: bool,
+        /// REPLAY §5: replay-debugging. Run the debuggee under the strict Replay context
+        /// (no real I/O — clock/RNG/fs/effects pinned from <FILE>) and enable time travel
+        /// (`stepBack`/`reverseContinue` via deterministic re-execution). The program to
+        /// debug is taken from the trace.
+        #[arg(long = "replay", value_name = "FILE")]
+        replay: Option<String>,
     },
     /// Add a dependency to ascript.toml + lock (git/url/path spec).
     #[cfg(feature = "pkg")]

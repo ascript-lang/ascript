@@ -1,6 +1,19 @@
 # Record/Replay as a User-Facing Flagship — Design (REPLAY)
 
-- **Status:** Draft for review
+- **Status:** Implemented (Tasks 0–11 done on `feat/record-replay`; merge SHA recorded at Task 12).
+  Deltas from this draft, all owner-noted: (1) the trace file extension shipped as `.astrc`
+  for `run` traces (matching the `ASTRC` magic) and `.trace` for the per-test auto-saved files
+  under `.ascript-traces/`; (2) `test --replay` against a CHANGED test file proceeds with a
+  printed **warning** rather than a hard error (the §4.3 source-digest check was sharpened in
+  Task 7 — editing the test/code between replays is the normal loop, so a digest change is a
+  warning, while a seam-order divergence is still a loud error); (3) the §8 coverage table was
+  FINALIZED in Task 9 with two reclassifications (`time.interval`/`debounce`/`throttle` →
+  Refused; `archive.tarExtractTo`/`zipExtractTo`/`tarCreateFromDir` → Recorded(Plain)). All
+  in-spec invariants (zero-cost-when-off `Cell` gate, completeness test, strict CliTrace vs
+  lenient Workflow origins, HttpResponse-only virtualization, worker refusal, hostile-safe
+  `ASTRC` reader + fuzz target, DAP stepBack-by-re-execution, the §0.5 bare-sleep fix) shipped
+  as specified.
+- **Status (original):** Draft for review
 - **Date:** 2026-06-12
 - **Code:** REPLAY (goal-perf.md, "Flagship & ecosystem track")
 - **Depends on:** nothing unmerged. Builds entirely on shipped subsystems: SP9 determinism
@@ -561,33 +574,74 @@ pub struct DeterminismContext {
 Every stdlib module is classified in `replay_class`, with a completeness test forcing
 classification of every `STD_MODULES` entry (the `required_cap_complete_enumeration` +
 FFI-holistic "completeness sweep" precedents). The audit sweep verifies each cell against the
-code (not assumption); known nondeterminism sources found during drafting:
+code (not assumption).
 
-| Source | Evidence | Class |
+> **Audit status — Task 9 FINALIZED (2026-06-21).** Every `STD_MODULES` entry is now
+> classified by an EXPLICIT `replay_class` arm or an audited `KNOWN_HARMLESS` listing, and
+> `tests/record_replay.rs::classification_is_complete` trips on any module that is in NEITHER
+> set (a fabricated module fails the test — sabotage-verified). Two cells changed from the
+> drafting table as a result of reading the source:
+>
+> 1. **`time.interval`/`time.debounce`/`time.throttle` → Refused** (was implicitly Seamed
+>    under the coarse `"time" => Seamed` arm). These mint a LIVE `tokio::time::Interval` /
+>    `sleep`-backed handle (`time_timers.rs:99/249`) that **bypasses** the clock seam — under
+>    replay they would real-sleep and the live handle can't be reproduced. No virtual-tick
+>    seam ships in v1, so they are Refused (the fs/socket precedent: refusal at RECORD, never
+>    a wrong replay). `time.now`/`monotonic`/`sleep` stay Seamed.
+> 2. **`archive.tarExtractTo`/`zipExtractTo`/`tarCreateFromDir` → Recorded(Plain)** (was
+>    implicitly Harmless under the `_` fall-through). These are fs-shaped — they WRITE
+>    extracted files / READ a directory tree (`archive.rs:1043/1165/1271`) and return plain
+>    data, so they Record like `fs` and replay without disk access. The in-memory builders
+>    (`tarWriter`/`tarEntries`/`tarAppend`/gzip/zip-in-memory) stay Harmless.
+
+The finalized per-function coverage (dispatch-site keys; e.g. `net_http` = `std/net/http`):
+
+| Module / func | Evidence (read in the audit) | Class |
 |---|---|---|
-| wall/monotonic clock, `date.now` | seams shipped (`mod.rs:520/755`) | Seamed |
-| `math.random`, uuid v4/v7, crypto random/salts | `fill_seeded_bytes`/`next_seeded_f64` | Seamed |
-| `time.sleep` | virtual-clock advance (`mod.rs:771`) + §0.5 fix | Seamed (replay consumes + skips delay) |
-| `ffi sym.call` | `ffi.rs:635` (ptr returns refused) | Seamed |
-| fs read/write/stat/exists/grep | plain results (`fs.rs`) | Recorded |
-| `fs.readDir`/`walk` **OS-order, unsorted** | `fs.rs:179` (no sort) | Recorded (replay faithful; order documented as platform-dependent outside replay) |
-| env get/set/all, `env.args` | plain | Recorded (argv also pinned in header) |
-| `process.run` | plain `{stdout,stderr,code}` (`process.rs:375`) | Recorded |
-| `os.*` (cpuCount, memory, disks, hostname, pid, uptime, cpuUsage) | sysinfo reads | Recorded |
-| `net.lookup/lookupOne` (DNS) | plain | Recorded |
-| http buffered requests + response accessors | §2.5 virtualization | Recorded |
-| `workflow.run/resume` | plain result (`is_serializable`) | Recorded |
-| `num_cpus` (pool sizing), `$ASCRIPT_WORKERS` | only reachable via workers | Refused-by-construction (§6) |
-| sockets/servers/ws/sse/stream-bodies, `process.spawn`, sqlite/postgres/redis, tui, ai, telemetry.init | live handles / streams | Refused |
-| `intl`/locale | audit verifies: pure given args (bundled data) vs system-locale reads | Harmless expected; audit decides per-fn |
-| Object/Map/Set iteration order | insertion-ordered `IndexMap` (`value.rs`, CLAUDE.md) | Harmless (deterministic) |
-| hash randomization | SipHash keys are process-internal; no iteration order exposed beyond IndexMap | Harmless (audit confirms no exposed ordering) |
+| wall/monotonic clock, `date.now`, `time.now`/`monotonic`/`sleep` | clock + virtual-clock seams; `time.sleep` consumes a `TimerSet` (§0.5) | Seamed |
+| `math.random`, `uuid.v4`/`v7`, `crypto` random/salts | `fill_seeded_bytes`/`next_seeded_f64` (RNG seam); uuid v7 time = virtual clock | Seamed (module-level Harmless: seam events flow without the hook) |
+| `ffi sym.call` | `ffi.rs` (ptr returns refused) | Seamed |
+| `time.interval`/`debounce`/`throttle` | LIVE tokio timer, BYPASSES the clock seam (`time_timers.rs`) — no v1 virtual-tick | **Refused** (Task 9 reclass) |
+| `fs` read/write/stat/exists/grep/readDir/walk | plain results (`fs.rs`); readDir/walk OS-order (platform-dependent outside replay) | Recorded(Plain) |
+| `env` get/set/all, `env.args` | plain (argv also pinned in the header) | Recorded(Plain) |
+| `io` stdin reads | plain | Recorded(Plain) |
+| `os.*` (cpuCount/memory/disks/hostname/pid/uptime/cpuUsage) | sysinfo reads | Recorded(Plain) |
+| `net.lookup`/`lookupOne` (DNS) | plain | Recorded(Plain) |
+| `process.run` | plain `{stdout,stderr,code}` | Recorded(Plain) |
+| `net_http` buffered verbs (get/post/…/request) + response accessors | §2.5 virtualization | Recorded(HttpResponse) |
+| `workflow.run`/`resume` | plain result (`is_serializable`); internal events go to the workflow log | Recorded(Plain) |
+| `archive.tarExtractTo`/`zipExtractTo`/`tarCreateFromDir` | fs-shaped (write extracted / read dir), plain result (`archive.rs`) | **Recorded(Plain)** (Task 9 reclass) |
+| `net_tcp`/`net_udp`/`net_ws`/`http_server`/`net_unix` | live sockets / servers / streams | Refused |
+| `process.spawn` | live child handle | Refused |
+| `sqlite`/`postgres`/`redis`/`tui`/`ai`/`telemetry`/`docker`/`blob`/`oauth` | live connections / handles | Refused |
+| `net_http.sse`/`cancelToken` + `{stream:true}` opt | live stream / cancel handle (opt refused at parse, §2.5) | Refused |
+| `jwt.jwks` | live network key fetch | Refused (rest of `jwt` Harmless) |
+| `email.send`/`connect` | live SMTP socket | Refused (`message`/`validateAddress` Harmless) |
+| `caps.drop`/`dropAll` | IRREVERSIBLE cap mutation the trace can't see | Refused (`caps` reads Harmless) |
+| `num_cpus` (pool sizing), `$ASCRIPT_WORKERS`; workers / `task.pmap`/`preduce` | only reachable via workers | Refused-by-construction (§6) |
+| `intl` | locale is ALWAYS an explicit string arg over BUNDLED ICU data; instant from explicit `epochMs`; NO system-locale / clock read (`intl.rs`) | **Harmless** (audit confirmed) |
+| `stream` | all sources pure — `from` (array/generator), `range` (numeric); NO fs/net-backed source (`stream.rs:64`) | **Harmless** (audit confirmed) |
+| `sync` | in-memory channels/semaphores/rate-limiter (`tokio::sync::Notify`+`RefCell`); no recorded value is clock-dependent | **Harmless** (audit confirmed) |
+| `log` | stderr / capture sink — output is OBSERVATION, not an effect event | **Harmless** (audit confirmed) |
+| `compress`/`encoding` | pure (de)compression / (de)coding; no random, no clock | Harmless |
+| `task` | combinators over `future<T>`; determinism is in the awaited work | Harmless |
+| `cron`/`resilience` | pure computation + (seamed) timer machinery | Harmless (effectful callbacks gated independently) |
+| math/string/json/regex/schema/array/object/map/set/decimal/bytes/convert/color/template/cli/url/csv/toml/yaml/msgpack/cbor/xml/html/markdown/diff/semver/assert/bench/test/shared/lru/events | pure transforms over arguments | Harmless |
+| Object/Map/Set iteration order | insertion-ordered `IndexMap` (`value.rs`) | Harmless (deterministic) |
+| hash randomization | SipHash keys are process-internal; no iteration order exposed beyond IndexMap | Harmless (no exposed ordering) |
 | task interleaving | SP9 §3.6 residual | NOT pinned — documented + divergence-detected (§7) |
 | GC timing | no observable hooks | Harmless |
 
-The table (finalized per-function by the audit task) is reproduced in
-`docs/content/tooling/record-replay.md` as the user-facing "what replays / what's refused /
-what's pure" reference.
+**Drafted user-facing table** (Task 11 finalizes `docs/content/tooling/record-replay.md`).
+The user-facing "what replays / what's refused / what's pure" reference collapses the dispatch
+keys back to `std/*` specifiers:
+
+| What you call | Under `--record`/`--replay` |
+|---|---|
+| `std/math`, `std/string`, `std/json`, collections, `std/intl`, `std/stream`, `std/sync`, `std/log`, `std/compress`, `std/encoding`, `std/crypto` (hashes), pure `std/jwt`/`std/email` builders | **Runs for real both times** — pure / in-memory (no event). |
+| `math.random`, `uuid.v4`/`v7`, `crypto` random+salts, `time.now`/`monotonic`/`sleep`, `date.now`, `ffi.call` | **Seamed** — recorded once, replayed from the seed/trace with no real RNG/clock/sleep. |
+| `fs.read`/`write`/…, `env.get`/`set`, `os.*`, `io` stdin, `net.lookup`, `process.run`, buffered `http.get`/`post`/…, `workflow.run`/`resume`, `archive.tarExtractTo`/`zipExtractTo`/`tarCreateFromDir` | **Recorded** — the result is captured at record; replay returns it with NO real I/O (delete the file / change the env between runs and replay still matches). |
+| sockets/servers/websockets/SSE/streaming bodies, `process.spawn`, sqlite/postgres/redis, tui, ai, telemetry, docker, blob, oauth, `jwt.jwks`, `email.send`/`connect`, `time.interval`/`debounce`/`throttle`, `caps.drop`/`dropAll`, workers / `task.pmap`/`preduce` | **Refused** — a LOUD error at RECORD (no determinism seam in v1), so a trace that records successfully always replays. |
 
 ## 9. Performance
 

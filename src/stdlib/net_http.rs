@@ -1114,6 +1114,18 @@ impl Interp {
                 )
             }
         };
+        // REPLAY §2.5 — refuse `{stream:true}` at OPTION PARSE during a record/replay so a
+        // recorded trace never contains a stream (the HttpBody reader is not virtualized;
+        // streaming is v2). Fires BEFORE any connect, so no network egress / handle is
+        // created. Gate-12: `trace_active()` is the zero-cost flag — off on every normal run.
+        if self.trace_active()
+            && matches!(
+                opt_field(opts, "stream").map(|x| x.into_kind()),
+                Some(OwnedKind::Bool(true))
+            )
+        {
+            return Err(crate::interp::Interp::trace_streaming_refused(span));
+        }
         // RESIL §5.4: deadline pre-check. If a `resilience.deadline(...)` budget is
         // active and already exhausted, refuse BEFORE any connect/DNS — return the
         // deadline-exceeded pair (distinct from a plain timeout) immediately. NO
@@ -1272,6 +1284,16 @@ impl Interp {
         // §3.1 carve-out (stage-2): enforce a `net` carve-out against the resolved
         // socket path BEFORE connecting. Gate-12: no carve-out → immediate Ok.
         self.check_unix_path(socket_path, span)?;
+        // REPLAY §2.5 — refuse `{stream:true}` over UDS under record/replay too (the same
+        // v2 streaming refusal as the TCP path), fired before connecting.
+        if self.trace_active()
+            && matches!(
+                opt_field(opts, "stream").map(|x| x.into_kind()),
+                Some(OwnedKind::Bool(true))
+            )
+        {
+            return Err(crate::interp::Interp::trace_streaming_refused(span));
+        }
 
         // Build the request-target: merge `opts.query` onto `path` (the TCP path uses
         // reqwest's `.query()`; here we append the encoded pairs to the target).

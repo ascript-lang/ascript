@@ -1,0 +1,6 @@
+# exit: none
+config non-empty: true
+subprocess succeeded: true
+token is the echoed line: true
+pipeline valid: true
+done — record: ascript run --record crash.astrc <file>

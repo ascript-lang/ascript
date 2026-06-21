@@ -1,0 +1,8 @@
+# exit: none
+random in [0,1): true
+uuid is 36 chars: true
+clock is positive: true
+time moved forward: true
+PATH is string or nil: true
+read this file, non-empty: true
+done — try: ascript run --record run.astrc examples/record_replay.as

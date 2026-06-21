@@ -63,14 +63,62 @@ and register the adapter (in an extension or your settings) as
 | `disconnect` / `terminate` | Resume the program to completion and end the session. |
 | Re-`launch` | A `launch` while a session is already live cleanly reaps the old session (resumes it, joins its threads) and resets the session state, so the re-launch behaves like a fresh session with no stale frames or zombie threads. |
 
+### Replay debugging (time travel)
+
+Record a run, then debug the recorded trace with **backward stepping** — the campaign's
+flagship. For the full record/replay model (the deterministic-mode contract, what gets
+recorded vs refused, and the trace format) see [Record & replay](record-replay). Capture a
+trace with `ascript run --record crash.trace app.as` (or let `ascript test --record` capture a
+failing test), then:
+
+```text
+ascript dap --replay crash.trace          # editor-driven
+ascript run --inspect --replay crash.trace app.as   # run-path equivalent
+```
+
+The debuggee runs under the strict **Replay** context — every HTTP response, `fs` read,
+clock value, and random draw is exactly as it was recorded, with **no real I/O**. Because
+the run is fully deterministic, the adapter advertises the DAP `supportsStepBack`
+capability and implements both `stepBack` and `reverseContinue`:
+
+| Command | Lands on |
+|---|---|
+| `stepBack` | The **previous stop** (breakpoint / step boundary). |
+| `reverseContinue` | The previous **breakpoint** stop (or the entry stop if none). |
+
+A backward step is **deterministic re-execution** (the rr model — no checkpointing, no VM
+state capture): the adapter tears down the debuggee, respawns it on the same trace, and
+re-runs the program prefix to the target stop, replaying the navigation log and absorbing
+the intermediate stops. Set a breakpoint at the panic, run to it, then **step backwards**
+to the corruption point — with every effect pinned. The honest cost is one re-execution
+per backward step (O(stops × prefix)); because replay does no I/O and sleeps are virtual,
+the prefix re-executes at full VM speed (interactive-fast for the programs a debugger
+session handles).
+
+`evaluate` works for pure-value inspection at any stop, but an expression that would call a
+recorded function (e.g. `time.now()` / `fs.read(…)`) is **refused** with a clean message —
+running it would consume a trace event and desync the replay. A `stepBack` while a
+re-execution is already in flight is refused (`time travel in progress`); a `stepBack` at
+the entry stop is a clean error (nowhere to go). A non-replay `ascript dap` /
+`run --inspect` session is byte-for-byte unchanged — `supportsStepBack` is absent and the
+time-travel paths are inert.
+
 ### v1 limitations
 
 - **Stepping** (`next` / `stepIn` / `stepOut`) currently resumes to the next breakpoint
   rather than single source line (transient line-stepping is a follow-up). The commands
   are accepted and honest about this.
+- **stepBack granularity:** a backward step lands on the previous *stop*
+  (breakpoint/step boundary), not the previous *instruction*. Periodic checkpointing to
+  make backsteps O(1) is the recorded v2.
+- A breakpoint inside a function called multiple times traps at most once per
+  `setBreakpoints` (the documented trap-once trade-off); time-travel re-execution re-applies
+  the breakpoint set on each respawn, so the navigation log replays correctly regardless.
 - Conditional breakpoints and logpoints reuse the same expression evaluator and are a
   documented follow-up.
 - A breakpoint inside a `worker fn` (a separate isolate) is not yet supported.
+- Replay debugging is single-isolate: a trace recorded under workers refuses at record
+  time (shared-nothing isolates have no trace identity in v1).
 
 ## Profiling
 

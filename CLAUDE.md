@@ -722,6 +722,66 @@ Terse per-feature notes (the non-obvious bits; read the cited file for the rest)
   are CI-executed sentinel-checked hosts (NOT corpus members — the differential discovery is non-recursive over
   `examples/`). Docs `docs/content/embedding.md` (+ the NAV `embedding` entry); `ascript::embed` is the §9
   semver-contracted surface (the rest of the crate is `pub` for the bin/tests with no stability promise).
+- **REPLAY — record/replay as a user-facing flagship** (spec `superpowers/specs/2026-06-12-record-replay-design.md`;
+  both engines; **NO grammar/`Value`/opcode change, `ASO_FORMAT_VERSION` 29 unchanged**, `vm_differential`
+  untouched — the feature is flag-gated and INERT by default). Turns the shipped-but-INERT SP9 determinism
+  plumbing (`src/det.rs` Record/Replay, virtual clock, seeded RNG, FFI replay; workflow event-sourced replay)
+  into `ascript run --record/--replay/--seed`, `ascript test --record/--replay`, and DAP time-travel.
+  **The chokepoint hook + `Cell` gate:** the trace hook sits in `Interp::call_stdlib` immediately after the
+  caps gate (the same single dispatch root), guarded by a `trace_active()` `Cell<bool>` snapshot mirroring
+  `caps_bits().all_granted()` — ONE predictably-not-taken branch on the default path, no `RefCell` borrow when
+  off (the Gate-12/17 zero-cost posture; `dbg_zero_cost_gate` 0.969×). **The classification table +
+  completeness test:** `replay_class(module, func) -> ReplayClass{Seamed|Recorded|Refused|Harmless}` is a
+  central, complete table like `required_cap`, enforced by `tests/record_replay.rs::classification_is_complete`
+  (every `STD_MODULES` entry must be in an explicit arm or an audited `KNOWN_HARMLESS` listing — a fabricated
+  module fails the test, sabotage-verified; finalized in Task 9, two reclasses: `time.interval`/`debounce`/
+  `throttle` → Refused, `archive.{tarExtractTo,zipExtractTo,tarCreateFromDir}` → Recorded). **Airlock
+  outcomes:** effect results encode with the worker airlock serializer (`worker::serialize`), NOT JSON — exact
+  `Value` fidelity incl. the NUM Int/Float split (a JSON `5` vs `5.0` would be an observable replay divergence);
+  `DetEvent::StdlibCall`/`NativeCall` carry `TraceOutcome::{Value|Handle|Panic|Propagate}` (a recorded panic
+  replays as the same panic, a `?`-propagate as the same propagation); a non-sendable or `Shared`-carrying
+  recorded result is a LOUD record-time refusal (never a lossy fallback). **HttpResponse-only virtualization:**
+  the single v1 handle case — buffered `http.get`/`post`/… returns `Native(HttpResponse)`, so record assigns a
+  trace-scoped `vid` + captures the handle `fields` and each `resp.text()`/`json()`/`bytes()` accessor result
+  (`NativeCall` via a `call_native_method` hook on the same `Cell` flag); replay mints a `ResourceState::
+  ReplayVirtual{vid}` that serves them with no real http. `{stream:true}`/`http.sse`/`http.cancelToken`/ws are
+  refused at the option parse (v2). **Strict CliTrace vs lenient Workflow origins:** `DeterminismContext` gains
+  `origin: Origin{Workflow|CliTrace}` + `strict: bool` — Workflow contexts are bit-for-bit unchanged
+  (origin=Workflow, strict=false: the existing best-effort fall-through-to-Record crash-point semantics);
+  CliTrace+Replay is STRICT — exhaustion/mismatch is a loud, indexed divergence error (`replay divergence at
+  event N of M …`), never a silent wrong replay. The stdlib hook fires ONLY for CliTrace, so a workflow inside
+  a recorded run records exactly one boundary `StdlibCall` and the workflow module is otherwise untouched (its
+  suite passes unmodified). **Worker refusal:** any isolate-creating op under `Origin::CliTrace` (pooled
+  `worker fn`, `spawn()` actor, `worker fn*` stream, `run_in_worker`, `task.pmap`/`preduce`, `test --record
+  --parallel`) is a clean Tier-2 refusal — determinism contexts are per-`Interp` with no cross-airlock identity
+  (per-isolate traces are v2). **The trace format + fuzz target:** a new core module `src/trace.rs` (no serde,
+  builds under `--no-default-features`) — the `ASTRC` container (magic `b"ASTRC\0\0\0"`, `TRACE_FORMAT_VERSION
+  = 1`, length-prefixed, crc-framed, hostile-safe reader: every length bounds-checked, bad crc / truncation /
+  unknown kind / newer version → clean Tier-1 error, never a panic/OOM); `fuzz/fuzz_targets/trace_roundtrip.rs`
+  follows `aso_roundtrip`. Header carries seed/start/path/source-sha256/argv; replay verifies version + crc +
+  source digest (a changed `.as` is a clean re-record error; a `.aso` skips the digest check). Flushed at
+  program end INCL. panic/`exit(n)` (a failed run is the one worth replaying), atomic temp+rename.
+  **`.ascript-traces/`:** `test --record` auto-saves a per-test trace ONLY for a FAILED test (a green file
+  writes nothing) under `.ascript-traces/<stem>__<slug>.trace` in the CWD (project-local, gitignore it); a
+  sliced per-test replay re-runs module load + one test (a sibling-state dependency diverges loudly — itself a
+  finding). **DAP stepBack-by-re-execution:** `ascript dap --replay` / `run --inspect --replay` advertise
+  `supportsStepBack` ONLY when a trace is present and implement `stepBack`/`reverseContinue` by deterministic
+  re-execution (the rr model — no checkpointing): the adapter keeps a navigation log, tears down + respawns the
+  debuggee on the same trace, and re-runs the prefix to the target stop (honest O(stops × prefix) cost; replay
+  does no I/O + virtual sleeps so the prefix re-executes at full VM speed); `evaluate` of a Recorded fn in a
+  replay session is refused (it would consume a trace event). **The §0.5 sleep fix** (Gate-14, failing-test-
+  first): bare `time.sleep` under a Replay context now CONSUMES the recorded `TimerSet` at the cursor (mirroring
+  `ctx.sleep`) instead of appending a fresh one — a workflow calling bare `time.sleep` between activities no
+  longer desyncs resume. **Bench headline** (`bench/REPLAY_RESULTS.md`): plain→record `sleep_heavy` **56.0×**
+  (real sleeps become virtual the moment a det context installs); `proc_heavy` replay skips fork/exec
+  (effectively free); record≈replay parity is the byte-invisibility proof; spec/tw geomean 3.78× ≥ 2×. The
+  cross-engine differential (record on tree-walker → replay on specialized/generic VM/`.aso` and vice-versa) is
+  asserted in `tests/record_replay.rs`. Examples `examples/record_replay.as` + `examples/advanced/
+  replay_repro.as` (four-mode in-corpus, deterministic derived-fact output); docs
+  `docs/content/tooling/record-replay.md` (+ the NAV `tooling/record-replay` entry). Recorded v2 (none silent):
+  streaming/SSE/WS + general handle virtualization, per-isolate worker traces, replay checkpointing (O(1)
+  backsteps), task-identity event tags, a `--deterministic --seed N` alias, the `--inspect`/`--profile`/
+  `--watch` × record matrices.
 
 ## Commands
 

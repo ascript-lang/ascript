@@ -365,3 +365,125 @@ print(result)
         "WARM §0.1: log file must exist after run() returns, but was not found at {log}"
     );
 }
+
+/// Like [`run_as`] but sets one environment variable on the spawned binary — used to
+/// flip an activity's behavior (panic vs. succeed) between a record run and a resume
+/// run from the SAME source, the spec §0.5 crash-path shape.
+fn run_as_env(src: &str, tag: &str, env_key: &str, env_val: &str) -> (String, Option<i32>) {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    src.hash(&mut h);
+    tag.hash(&mut h);
+    let file = std::env::temp_dir().join(format!("ascript_wf_{}_{:x}.as", tag, h.finish()));
+    std::fs::write(&file, src).unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_ascript"))
+        .arg("run")
+        .arg(&file)
+        .env(env_key, env_val)
+        .output()
+        .unwrap();
+    (
+        String::from_utf8_lossy(&out.stdout).into_owned() + &String::from_utf8_lossy(&out.stderr),
+        out.status.code(),
+    )
+}
+
+/// REPLAY §0.5 — bare-`time.sleep`-under-Replay replay desync (the Gate-14 pre-existing
+/// bug REPLAY Task 1 fixes; pinned here failing-first).
+///
+/// A workflow body calls bare `time.sleep(10)` (NOT `ctx.sleep`) BETWEEN two
+/// `ctx.call` activities. During RECORD the sleep appends a `TimerSet` between the two
+/// `ActivityCompleted` events. During RESUME (Replay), the buggy bare-sleep site
+/// (`src/stdlib/mod.rs` `call_time`) UNCONDITIONALLY appends a fresh `TimerSet`
+/// instead of CONSUMING the recorded one at the cursor (only `ctx.sleep` consumes —
+/// `workflow.rs` ctx "sleep" arm). So after the first activity replays, the recorded
+/// `TimerSet` is still at the cursor; the second `ctx.call` finds a non-activity event
+/// there and raises a FALSE "workflow non-determinism" error naming the post-sleep
+/// activity.
+///
+/// Crash path (spec §0.5): an env-controlled activity panics AFTER the sleep during
+/// record (leaving a partial log `[ActivityCompleted(step), TimerSet]`), then resume
+/// runs with the panic cause removed. The bug makes resume FAIL with the false
+/// non-determinism error rather than completing.
+///
+/// TODO(REPLAY Task 1): this is RED on the branch on purpose. Task 1's fix
+/// (consume-at-cursor for bare `time.sleep` in Replay, mirroring `ctx.sleep`) turns it
+/// GREEN. Committed un-ignored per the plan (the branch tolerates a transient red).
+#[test]
+fn bare_sleep_between_activities_replays_without_false_nondeterminism() {
+    let log = temp_log("bare_sleep_desync");
+    let counter = temp_log("bare_sleep_desync_counter").replace(".log", ".cnt");
+    let _ = std::fs::remove_file(&counter);
+
+    // The workflow source is IDENTICAL for record and resume; the crash is driven by
+    // the env var `ASCRIPT_REPLAY_CRASH` read inside the post-sleep activity.
+    let src = format!(
+        r#"
+import {{ run, resume, activity }} from "std/workflow"
+import {{ read, write, exists }} from "std/fs"
+import {{ toNumber }} from "std/convert"
+import {{ get }} from "std/env"
+import {{ sleep }} from "std/time"
+let step = activity("step", (n) => {{
+  let prev = exists("{counter}") ? toNumber(read("{counter}")[0]) : 0
+  write("{counter}", `${{prev + 1}}`)
+  return n + 100
+}})
+let after = activity("after", (n) => {{
+  assert(get("ASCRIPT_REPLAY_CRASH") != "1", "boom (record-time crash)")
+  return n + 1
+}})
+fn flow(ctx, input) {{
+  let a = ctx.call(step, input)
+  await sleep(10)
+  let b = ctx.call(after, a)
+  return b
+}}
+let r = await run(flow, 1, {{ log: "{log}" }})
+print(r)
+"#,
+        log = log,
+        counter = counter
+    );
+
+    // Phase 1: RECORD with the post-sleep activity crashing → partial log persisted
+    // with the bare-sleep TimerSet recorded between the two activities.
+    let (out_rec, code_rec) = run_as_env(&src, "bare_sleep_record", "ASCRIPT_REPLAY_CRASH", "1");
+    assert_ne!(
+        code_rec,
+        Some(0),
+        "record run is expected to crash in the post-sleep activity; got: {out_rec}"
+    );
+    let log_text = std::fs::read_to_string(&log).unwrap_or_default();
+    assert!(
+        log_text.contains("\"kind\":\"TimerSet\""),
+        "the partial record log must contain the bare-sleep TimerSet; got log:\n{log_text}"
+    );
+
+    // Phase 2: a resume-from-disk source (so `step` replays from the log and the bare
+    // sleep must consume the recorded TimerSet) with the crash cause removed.
+    let resume_src = src.replace(
+        "let r = await run(flow, 1, ",
+        "let r = await resume(flow, 1, ",
+    );
+    let (out_res, code_res) =
+        run_as_env(&resume_src, "bare_sleep_resume", "ASCRIPT_REPLAY_CRASH", "0");
+
+    // The FAILING assertion (RED today): the buggy bare-sleep makes resume raise a
+    // FALSE "workflow non-determinism" error at the post-sleep activity ("after").
+    assert!(
+        !out_res.contains("workflow non-determinism"),
+        "REPLAY §0.5: bare time.sleep between activities desyncs replay — resume \
+         raised a FALSE non-determinism error (Task 1 fixes this). got: {out_res}"
+    );
+    assert_eq!(
+        code_res,
+        Some(0),
+        "resume with the crash removed should complete; got: {out_res}"
+    );
+    assert_eq!(
+        out_res.lines().next(),
+        Some("102"),
+        "resume result 1→101 (step replayed) →102 (after ran): got: {out_res}"
+    );
+}

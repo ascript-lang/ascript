@@ -697,6 +697,22 @@ pub(crate) enum ResourceState {
     /// Feature `blob`.
     #[cfg(feature = "blob")]
     BlobClient(Box<crate::stdlib::blob::BlobClientState>),
+    /// REPLAY §2.5: a VIRTUALIZED native handle minted during replay (today: an
+    /// `HttpResponse` whose accessor methods are themselves recorded). It holds NO OS
+    /// resource — only the trace-scoped virtual id (`vid`) that the
+    /// `call_native_method` replay hook uses to consume the next `NativeCall` event.
+    /// CORE (NOT feature-gated — the variant + the vid map are core per the plan; the
+    /// http virtualization logic that mints it is net-gated). Inert: no fd, no cleanup
+    /// beyond the Drop that removes the table entry, and NO `Trace` (the native-resource
+    /// rule, §2.6 — `Value::native` already traces as a no-op, so the invariant holds;
+    /// the materialized `fields` live in the `Rc<NativeObject>`, off the Cc graph).
+    ReplayVirtual {
+        // Read by the net-gated `call_native_method` replay hook (`trace_native_method`);
+        // under `--no-default-features` (no virtualizable handle kind) the field is
+        // carried but never consumed — the variant stays CORE per the plan.
+        #[allow(dead_code)]
+        vid: u32,
+    },
     /// A resource that has been closed/consumed. Also the always-present variant
     /// so the enum is non-empty under `--no-default-features`.
     #[allow(dead_code)]
@@ -907,6 +923,26 @@ pub struct Interp {
     /// value out / drop the borrow before returning, like the `resources`
     /// discipline).
     determinism: RefCell<Option<crate::det::DeterminismContext>>,
+    /// REPLAY §2.2 — the Gate-12 zero-cost flag mirroring `caps_bits().all_granted()`:
+    /// a `Cell<bool>` snapshot kept in sync by the single `set_determinism` chokepoint
+    /// (true iff the installed context is `Some(ctx) && ctx.origin == Origin::CliTrace`).
+    /// The `call_stdlib` trace hook reads it (`trace_active()`) BEFORE any `RefCell`
+    /// borrow, so the default path (no context, or a Workflow context) takes ONE
+    /// predictably-not-taken branch and is byte-identical.
+    trace_active: Cell<bool>,
+    /// REPLAY §2.5 — the trace-side virtual-handle map. On the RECORD side it maps a
+    /// live resource id (the `HttpResponse` handle's `NativeObject.id`) → its assigned
+    /// trace-scoped `vid` (assigned in event order, starting at 0), so a subsequent
+    /// accessor call on that handle records a `NativeCall { vid, … }`. CLEARED whenever
+    /// the determinism context is installed/cleared (mirrors `trace_active` resets in
+    /// `set_determinism`), so each record/replay run gets a fresh vid namespace. CORE
+    /// (a plain `HashMap<u64, u32>` — builds under `--no-default-features`; empty + cold
+    /// on every non-trace run).
+    replay_vid_map: RefCell<HashMap<u64, u32>>,
+    /// REPLAY §2.5 — the vid counter, assigning `vid`s in handle-birth order (0, 1, …)
+    /// during a record run. Reset alongside [`Self::replay_vid_map`] at every
+    /// `set_determinism` install/clear. CORE.
+    replay_vid_counter: Cell<u32>,
     /// SP6 §6: the CLI-injected resolved third-party package set. `None` until
     /// [`Interp::set_package_resolver`] installs it (the REPL / tests / a project
     /// with no deps leave it `None` → every bare specifier is "unknown package").
@@ -1282,6 +1318,10 @@ impl Drop for InflightGuard {
     }
 }
 
+/// REPLAY §4.3 — the sink `test --record` passes into the per-test runner to collect
+/// each test's `(name, event-index range)` segment over the file-level event Vec.
+pub type TestSliceSink = RefCell<Vec<(String, std::ops::Range<usize>)>>;
+
 /// Outcome of running the tests registered on an `Interp`.
 #[derive(Debug, Default)]
 pub struct TestSummary {
@@ -1431,6 +1471,9 @@ impl Interp {
             ai: RefCell::new(crate::stdlib::ai::AiClient::default()),
             cli_args: RefCell::new(Vec::new()),
             determinism: RefCell::new(None),
+            trace_active: Cell::new(false),
+            replay_vid_map: RefCell::new(HashMap::new()),
+            replay_vid_counter: Cell::new(0),
             package_resolver: RefCell::new(None),
             // EMBED §6.3: no host modules until the embed builder registers them.
             host_modules: RefCell::new(HashMap::new()),
@@ -1902,9 +1945,10 @@ impl Interp {
         seed: u64,
     ) -> Option<crate::det::DeterminismContext> {
         let start_ms = crate::det::deterministic_start_ms(seed);
-        self.determinism
-            .borrow_mut()
-            .replace(crate::det::DeterminismContext::record(seed, start_ms))
+        // Route through the single `set_determinism` chokepoint so the REPLAY
+        // `trace_active` flag stays in sync (a `record` context is `Workflow`-origin →
+        // the flag is set false, matching the pre-REPLAY behavior).
+        self.set_determinism(Some(crate::det::DeterminismContext::record(seed, start_ms)))
     }
 
     /// BATT C1 (§10.2) — the CORE determinism install seam: swap the determinism cell to
@@ -1919,7 +1963,93 @@ impl Interp {
         &self,
         ctx: Option<crate::det::DeterminismContext>,
     ) -> Option<crate::det::DeterminismContext> {
+        // REPLAY §2.2 — keep the Gate-12 `trace_active` flag in sync at THE single
+        // install/take/restore/enter chokepoint: the stdlib trace hook fires only for a
+        // `CliTrace`-origin context. A `None` (default) or `Workflow` context → false →
+        // the default path is byte-identical.
+        self.trace_active.set(matches!(
+            &ctx,
+            Some(c) if c.origin == crate::det::Origin::CliTrace
+        ));
+        // REPLAY §2.5 — reset the virtual-handle vid namespace at the SAME chokepoint
+        // (a fresh record/replay run starts vids at 0, with no stale id→vid mappings
+        // from a previous context). Zero-cost on the default path (clearing an already-
+        // empty map + resetting a `Cell` to 0).
+        self.replay_vid_map.borrow_mut().clear();
+        self.replay_vid_counter.set(0);
         std::mem::replace(&mut *self.determinism.borrow_mut(), ctx)
+    }
+
+    /// REPLAY §2.2 — the Gate-12 zero-cost snapshot: is a `CliTrace` (record/replay)
+    /// determinism context installed? Read by the `call_stdlib` trace hook BEFORE any
+    /// `RefCell` borrow. False on the default path (no context) and inside a `workflow`
+    /// context (origin `Workflow`), so both are byte-identical to pre-REPLAY.
+    pub(crate) fn trace_active(&self) -> bool {
+        self.trace_active.get()
+    }
+
+    /// REPLAY §5.2 — a snapshot of the live REPLAY (CliTrace, Replay-mode) determinism
+    /// state for the DAP `evaluate` trace-consumption guard: the current replay cursor
+    /// plus a CLONE of the whole context to restore if an evaluate consumes a trace event.
+    /// Returns `None` when no strict replay context is installed (record mode, no context,
+    /// or a workflow context) — the common path, where `evaluate` is unguarded. The clone
+    /// is cheap relative to a debugger stop (an `evaluate` is interactive, not hot); it
+    /// carries NO `File` appender (`Clone` drops `group`), which a replay context never has.
+    pub(crate) fn det_replay_snapshot(&self) -> Option<(usize, crate::det::DeterminismContext)> {
+        let det = self.determinism.borrow();
+        let ctx = det.as_ref()?;
+        if ctx.origin == crate::det::Origin::CliTrace && ctx.mode == crate::det::Mode::Replay {
+            Some((ctx.cursor, ctx.clone()))
+        } else {
+            None
+        }
+    }
+
+    /// REPLAY §5.2 — the live replay cursor (only meaningful when a strict replay context
+    /// is installed). Read AFTER a DAP `evaluate` to detect whether it consumed a trace
+    /// event (the cursor advanced → a Recorded fn was called → the eval must be refused +
+    /// the context restored from the snapshot). `None` when no replay context is installed.
+    pub(crate) fn det_replay_cursor(&self) -> Option<usize> {
+        self.determinism
+            .borrow()
+            .as_ref()
+            .filter(|c| c.origin == crate::det::Origin::CliTrace && c.mode == crate::det::Mode::Replay)
+            .map(|c| c.cursor)
+    }
+
+    /// REPLAY §4.3 — the current length of the installed determinism context's recorded
+    /// event stream (0 when no context is installed). Used by `test --record` to mark
+    /// the module-load prefix `P` and each per-test segment `S_k` as INDEX RANGES over
+    /// the single file-level event Vec (so 50 failing tests slice in O(1) each — no
+    /// quadratic clone). All-synchronous; no borrow is held across an await.
+    pub(crate) fn det_event_count(&self) -> usize {
+        self.determinism
+            .borrow()
+            .as_ref()
+            .map(|ctx| ctx.events.len())
+            .unwrap_or(0)
+    }
+
+    /// REPLAY §6 — refuse creating a worker isolate under a `CliTrace` (record OR
+    /// replay) context. Determinism contexts are PER-`Interp` and an isolate builds a
+    /// fresh `Interp::new()` on its own thread, so a CLI trace context cannot extend
+    /// across the airlock — shared-nothing isolates have no trace identity in v1.
+    /// Refusing at RECORD (not just replay) is the §2.1c by-construction guarantee: a
+    /// trace that records successfully is replayable. `what` names the construct (e.g.
+    /// `"calling a worker fn"`). INERT without a `CliTrace` context (the common path) so
+    /// the whole workers suite stays byte-identical.
+    pub(crate) fn refuse_worker_under_trace(&self, what: &str, span: Span) -> Result<(), Control> {
+        if self.trace_active() {
+            return Err(AsError::at(
+                format!(
+                    "{what} is not supported under --record/--replay \
+                     (shared-nothing isolates have no trace identity; v2)"
+                ),
+                span,
+            )
+            .into());
+        }
+        Ok(())
     }
 
     /// Install an explicit determinism context (Record or Replay), returning the
@@ -1953,6 +2083,477 @@ impl Interp {
     /// fast paths (the default `None` path is byte-identical to pre-SP9).
     pub(crate) fn is_deterministic(&self) -> bool {
         self.determinism.borrow().is_some()
+    }
+
+    // ===================================================================== //
+    // REPLAY §2.2-2.4/§7 — the `call_stdlib` trace hook + divergence raise.  //
+    // ===================================================================== //
+
+    /// REPLAY §7 — raise the indexed divergence error if a strict (`CliTrace`) replay
+    /// set a `pending_divergence` at a seam. Consulted by `call_stdlib` after every
+    /// Seamed dispatch (only when `trace_active()`) and inside the trace hook itself —
+    /// this is the RAISE that Task 1 deferred ("Task 1 only PLUMBS the pending
+    /// divergence"). A `None` (no divergence) is the common case → `Ok(())`. The error
+    /// format mirrors the §7 model: an event index + the expected/got kind names.
+    pub(crate) fn check_divergence(&self, span: Span) -> Result<(), Control> {
+        let Some(d) = self.with_determinism_mut(|ctx| ctx.take_divergence()).flatten() else {
+            return Ok(());
+        };
+        let msg = match d {
+            crate::det::Divergence::Mismatch { at, expected, got } => format!(
+                "replay divergence at event {at}: expected {expected}, got {got} — the \
+                 program's effect order differs from the recording (re-record, or check \
+                 for unpinned nondeterminism)"
+            ),
+            crate::det::Divergence::Exhausted { at, wanted } => format!(
+                "replay divergence at event {at}: recorded stream exhausted (wanted \
+                 {wanted}) — the program performed more effects than were recorded \
+                 (re-record)"
+            ),
+        };
+        Err(AsError::at(msg, span).into())
+    }
+
+    /// REPLAY §2.4 — a lossy signature hash pinning a `(module, func, args)` call. It
+    /// only PINS the signature (a reordered/changed effect → a detected divergence); it
+    /// never reproduces values, so a lossy text projection of each arg is acceptable.
+    /// CORE (no `data`/`workflow` dependency): hashes the module/func + each arg's
+    /// `Display` (path strings / numbers / flags differ textually). `Display` shows the
+    /// NUM subtype (`5` vs `5.0`) so an int/float arg change is caught.
+    fn replay_args_hash(module: &str, func: &str, args: &[Value]) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        module.hash(&mut h);
+        func.hash(&mut h);
+        for a in args {
+            a.to_string().hash(&mut h);
+        }
+        h.finish()
+    }
+
+    /// REPLAY §2.2-2.4 — the trace hook's worker for a `Recorded` stdlib call. In Record
+    /// mode: dispatch the REAL call (the SAME `dispatch_stdlib` the fall-through reaches),
+    /// then encode the outcome through the worker airlock (NUM-faithful; a non-sendable
+    /// or `Shared`-carrying result is a LOUD record-time refusal naming the field path)
+    /// and append a `StdlibCall` event. In Replay mode: consume the recorded outcome at
+    /// the cursor (signature-verified), decode it through the airlock, and return WITHOUT
+    /// dispatching. A signature mismatch / exhaustion raises the §7 divergence error.
+    ///
+    /// Borrow discipline: NO `RefCell`/det-context borrow is held across the dispatch
+    /// `.await` — the mode is snapshotted up front, the encode happens AFTER the await in
+    /// a sync scope, and the append goes through the sync `with_determinism_mut` closure.
+    pub(crate) async fn trace_stdlib_call(
+        &self,
+        module: &str,
+        func: &str,
+        args: &[Value],
+        shape: crate::stdlib::HandleShape,
+        span: Span,
+    ) -> Result<Value, Control> {
+        let args_hash = Self::replay_args_hash(module, func, args);
+        // Snapshot the mode WITHOUT holding the borrow across the await.
+        let mode = self
+            .with_determinism_mut(|ctx| ctx.mode)
+            .unwrap_or(crate::det::Mode::Record);
+
+        match mode {
+            crate::det::Mode::Replay => {
+                // Consume the recorded outcome at the cursor (sync — no await).
+                let outcome = self
+                    .with_determinism_mut(|ctx| {
+                        ctx.replay_stdlib_call(module, func, args_hash)
+                    })
+                    .flatten();
+                // A divergence (mismatch / exhaustion) was set by the helper when strict
+                // — raise it now. (When no divergence is pending this is a cheap no-op.)
+                self.check_divergence(span)?;
+                let Some(outcome) = outcome else {
+                    // Non-strict (Workflow) contexts never reach the hook, and a strict
+                    // miss always sets a divergence raised above; this is a belt-and-
+                    // braces guard for an unexpected `None` without a divergence.
+                    return Err(AsError::at(
+                        format!(
+                            "replay divergence: no recorded outcome for {}.{}",
+                            module, func
+                        ),
+                        span,
+                    )
+                    .into());
+                };
+                // REPLAY §2.5 — a `Handle` outcome (a virtualized `HttpResponse`): mint a
+                // fresh handle carrying the decoded fields + a `ReplayVirtual { vid }`
+                // state, wrapped in the canonical `[handle, nil]` Tier-1 pair. The real
+                // http machinery is NEVER touched (the flagship offline guarantee).
+                if let crate::det::TraceOutcome::Handle { vid, fields, .. } = outcome {
+                    return self.mint_virtual_handle(vid, fields, span);
+                }
+                self.decode_trace_outcome(outcome, span)
+            }
+            crate::det::Mode::Record => {
+                // Dispatch the REAL call (await OUTSIDE any det borrow).
+                let result = self.dispatch_stdlib(module, func, args, span).await;
+                // REPLAY §2.5 — when the call is shaped `HttpResponse` and the real result
+                // is the canonical `[Native(HttpResponse), nil]` pair, virtualize the
+                // handle: assign a vid, map id→vid, snapshot the `fields` (airlock), and
+                // record a `StdlibCall` with a `Handle` outcome. A `[nil, err]` connection
+                // failure (no handle) falls through to the plain encode below (§2.5
+                // http_error_pair_round_trips).
+                if matches!(shape, crate::stdlib::HandleShape::HttpResponse) {
+                    if let Ok(v) = &result {
+                        if let Some(handle_outcome) = self.record_handle_outcome(v, span)? {
+                            self.with_determinism_mut(|ctx| {
+                                ctx.record_stdlib_call(module, func, args_hash, handle_outcome);
+                            });
+                            return result;
+                        }
+                    }
+                }
+                // Encode the outcome in a sync scope (after the await). `None` = a
+                // process-level `Control::Exit` that is propagated WITHOUT recording.
+                if let Some(outcome) = self.encode_trace_outcome(module, func, &result, span)? {
+                    self.with_determinism_mut(|ctx| {
+                        ctx.record_stdlib_call(module, func, args_hash, outcome);
+                    });
+                }
+                result
+            }
+        }
+    }
+
+    /// REPLAY §2.5 — the loud v2 refusal for `{stream:true}` (the `HttpBody` reader)
+    /// under `--record`/`--replay`, fired at OPTION PARSE so a recorded trace never
+    /// contains a stream. Public so the net_http request paths can raise it before
+    /// connecting. A Tier-2 panic (a misuse the user fixes by buffering, not a
+    /// recoverable result).
+    #[cfg(feature = "net")]
+    pub(crate) fn trace_streaming_refused(span: Span) -> Control {
+        AsError::at(
+            "streaming http ({stream:true}) is not supported under --record/--replay — \
+             buffered requests only; streaming is v2",
+            span,
+        )
+        .into()
+    }
+
+    /// REPLAY §2.5 — the stable per-`NativeKind` tag for a virtualized handle. v1
+    /// virtualizes EXACTLY `HttpResponse` (tag 1); the mapping is small and forward-
+    /// stable (the v2 handle-virtualization story — files/sockets/children — extends it).
+    /// `0` is reserved as "not a virtualizable handle kind".
+    fn handle_kind_tag(kind: crate::value::NativeKind) -> u8 {
+        match kind {
+            crate::value::NativeKind::HttpResponse => 1,
+            _ => 0,
+        }
+    }
+
+    /// REPLAY §2.5 (record side) — if `v` is the canonical `[Native(HttpResponse), nil]`
+    /// pair, virtualize it: assign a fresh `vid` (counter++), map the handle's resource id
+    /// → vid (so a later accessor call records a `NativeCall { vid, … }`), airlock-encode
+    /// the handle's plain `fields`, and return `Some(TraceOutcome::Handle{..})`. Returns
+    /// `Ok(None)` when `v` is NOT a recordable handle pair (e.g. a `[nil, err]` connection
+    /// failure) — the caller then records it as a plain `Value` outcome. A `fields` encode
+    /// failure is a clean record-time refusal (the §2.4 discipline). NO `.await` (sync).
+    fn record_handle_outcome(
+        &self,
+        v: &Value,
+        span: Span,
+    ) -> Result<Option<crate::det::TraceOutcome>, Control> {
+        // The canonical success shape is the Tier-1 `[handle, nil]` array pair.
+        let ValueKind::Array(a) = v.kind() else {
+            return Ok(None);
+        };
+        let elems = a.borrow();
+        let (Some(first), Some(second)) = (elems.first(), elems.get(1)) else {
+            return Ok(None);
+        };
+        // element 0 must be a live `Native(HttpResponse)`; element 1 must be `nil` (a
+        // `[nil, err]` failure is NOT a handle — record it as a plain value).
+        let ValueKind::Native(n) = first.kind() else {
+            return Ok(None);
+        };
+        if Self::handle_kind_tag(n.kind) == 0 || !matches!(second.kind(), ValueKind::Nil) {
+            return Ok(None);
+        }
+        let kind_tag = Self::handle_kind_tag(n.kind);
+        let resource_id = n.id;
+        // Assign the next vid in birth order and map the live id → vid.
+        let vid = self.replay_vid_counter.get();
+        self.replay_vid_counter.set(vid + 1);
+        self.replay_vid_map.borrow_mut().insert(resource_id, vid);
+        // Snapshot the handle's plain `fields` as a fresh Object and airlock-encode it.
+        let fields_obj = Value::object(
+            n.fields
+                .iter()
+                .map(|(k, val)| (k.clone(), val.clone()))
+                .collect::<indexmap::IndexMap<String, Value>>(),
+        );
+        let (fields_bytes, shared) =
+            crate::worker::serialize::encode(&fields_obj).map_err(|e| {
+                let ae: AsError = e.into();
+                AsError::at(
+                    format!(
+                        "http response fields are not recordable under --record: {} (a \
+                         live handle / closure cannot be replayed)",
+                        ae.message
+                    ),
+                    span,
+                )
+            })?;
+        if !shared.is_empty() {
+            return Err(AsError::at(
+                "http response fields contain a frozen (shared) value that cannot be \
+                 persisted to a trace",
+                span,
+            )
+            .into());
+        }
+        Ok(Some(crate::det::TraceOutcome::Handle {
+            kind_tag,
+            vid,
+            fields: fields_bytes,
+        }))
+    }
+
+    /// REPLAY §2.5 (replay side) — mint a fresh virtual `HttpResponse` handle from a
+    /// recorded `Handle` outcome: decode the `fields` (airlock; an untrusted-decode
+    /// failure is a clean corrupt-trace error), register a `ReplayVirtual { vid }` state,
+    /// and return the canonical `[Native(HttpResponse), nil]` pair. The real http
+    /// machinery is never touched. Sync (no `.await`).
+    fn mint_virtual_handle(
+        &self,
+        vid: u32,
+        fields: Vec<u8>,
+        span: Span,
+    ) -> Result<Value, Control> {
+        let fields_val = crate::worker::serialize::decode(&fields, self)
+            .map_err(|e| AsError::at(format!("corrupt trace: {}", e.message()), span))?;
+        // The decoded fields are an Object (we encoded one); rebuild the `IndexMap` the
+        // NativeObject carries. A non-Object (corrupt trace) is a clean error.
+        let ValueKind::Object(o) = fields_val.kind() else {
+            return Err(AsError::at(
+                "corrupt trace: virtualized handle fields are not an object",
+                span,
+            )
+            .into());
+        };
+        let mut fields_map: indexmap::IndexMap<String, Value> = indexmap::IndexMap::new();
+        for (k, val) in o.entries() {
+            fields_map.insert(k.to_string(), val);
+        }
+        let handle = self.register_resource(
+            crate::value::NativeKind::HttpResponse,
+            fields_map,
+            ResourceState::ReplayVirtual { vid },
+        );
+        Ok(Value::array(vec![handle, Value::nil()]))
+    }
+
+    /// REPLAY §2.4 — encode a `Recorded` call's result into a [`crate::det::TraceOutcome`]
+    /// via the worker airlock. `Ok(v)` → `Value(bytes)`; a non-sendable / `Shared`-
+    /// carrying result is a LOUD record-time refusal (the §2.4 field-path message, never a
+    /// lossy fallback). `Err(Panic)` → `Panic(msg)`; `Err(Propagate(v))` → encoded
+    /// `Propagate`. Returns `Err` only for the record-time refusal (the call's own
+    /// `Err` is captured INTO the outcome, not propagated).
+    fn encode_trace_outcome(
+        &self,
+        module: &str,
+        func: &str,
+        result: &Result<Value, Control>,
+        span: Span,
+    ) -> Result<Option<crate::det::TraceOutcome>, Control> {
+        // A `Control::Exit` is process-level (not a recordable effect) — do NOT record
+        // it; propagate it as-is so `exit()` inside a Recorded call still exits.
+        if let Err(Control::Exit(_)) = result {
+            return Ok(None);
+        }
+        Ok(Some(match result {
+            Ok(v) => {
+                let (bytes, shared) = crate::worker::serialize::encode(v).map_err(|e| {
+                    let ae: AsError = e.into();
+                    AsError::at(
+                        format!(
+                            "{}.{} result is not recordable under --record: {} (a live \
+                             handle / closure cannot be replayed)",
+                            module,
+                            func,
+                            ae.message
+                        ),
+                        span,
+                    )
+                })?;
+                if !shared.is_empty() {
+                    return Err(AsError::at(
+                        format!(
+                            "{}.{} result contains a frozen (shared) value that cannot be \
+                             persisted to a trace — v2 may deep-materialize",
+                            module, func
+                        ),
+                        span,
+                    )
+                    .into());
+                }
+                crate::det::TraceOutcome::Value(bytes)
+            }
+            Err(Control::Panic(e)) => crate::det::TraceOutcome::Panic(e.message.clone()),
+            Err(Control::Propagate(v)) => {
+                let (bytes, shared) = crate::worker::serialize::encode(v).map_err(|e| {
+                    let ae: AsError = e.into();
+                    AsError::at(
+                        format!(
+                            "{}.{} propagated error is not recordable under --record: {}",
+                            module,
+                            func,
+                            ae.message
+                        ),
+                        span,
+                    )
+                })?;
+                if !shared.is_empty() {
+                    return Err(AsError::at(
+                        format!(
+                            "{}.{} propagated value contains a frozen (shared) value that \
+                             cannot be persisted to a trace",
+                            module, func
+                        ),
+                        span,
+                    )
+                    .into());
+                }
+                crate::det::TraceOutcome::Propagate(bytes)
+            }
+            // `Control::Exit` handled above (returns `Ok(None)`); other flow controls
+            // never reach here from a stdlib call.
+            Err(other) => return Err(other.clone()),
+        }))
+    }
+
+    /// REPLAY §2.4 — decode a recorded [`crate::det::TraceOutcome`] back into the call's
+    /// result during replay. `Value` → `Ok(v)`; `Panic` → re-raise the same Tier-2 panic;
+    /// `Propagate` → re-raise the `?` early return. A decode failure is a CLEAN corrupt-
+    /// trace error (never a panic — the trace is untrusted, §2.4).
+    fn decode_trace_outcome(
+        &self,
+        outcome: crate::det::TraceOutcome,
+        span: Span,
+    ) -> Result<Value, Control> {
+        match outcome {
+            crate::det::TraceOutcome::Value(bytes) => {
+                let v = crate::worker::serialize::decode(&bytes, self).map_err(|e| {
+                    AsError::at(format!("corrupt trace: {}", e.message()), span)
+                })?;
+                Ok(v)
+            }
+            crate::det::TraceOutcome::Panic(msg) => Err(AsError::at(msg, span).into()),
+            crate::det::TraceOutcome::Propagate(bytes) => {
+                let v = crate::worker::serialize::decode(&bytes, self).map_err(|e| {
+                    AsError::at(format!("corrupt trace: {}", e.message()), span)
+                })?;
+                Err(Control::Propagate(v))
+            }
+            // A `Handle` outcome is consumed by the §2.5 virtual-handle minting paths
+            // (`trace_stdlib_call` / `mint_virtual_handle`), never decoded as a plain
+            // value. Reaching here means a recorded `Handle` was routed to a non-handle
+            // seam (a corrupt/misrouted trace) — a CLEAN error, never a panic.
+            crate::det::TraceOutcome::Handle { .. } => Err(AsError::at(
+                "corrupt trace: a virtualized-handle outcome appeared at a plain-value seam",
+                span,
+            )
+            .into()),
+        }
+    }
+
+    // ----- REPLAY in-process test seams (the `ffi.rs` determinism-test precedent) ----- //
+
+    /// REPLAY (test-only) — install a fresh `CliTrace` Record-mode context (mirrors
+    /// `ascript run --record`). Returns the previous context. `#[doc(hidden)]`, used by
+    /// `tests/record_replay.rs` to drive record/replay in-process without spawning the
+    /// binary (that end-to-end coverage is a later REPLAY task).
+    #[doc(hidden)]
+    pub fn __install_record_trace(&self, seed: u64) -> Option<crate::det::DeterminismContext> {
+        let start_ms = crate::det::deterministic_start_ms(seed);
+        self.set_determinism(Some(crate::det::DeterminismContext::record_trace(
+            seed, start_ms,
+        )))
+    }
+
+    /// REPLAY (test-only) — install a strict `CliTrace` Replay-mode context primed with a
+    /// recorded `events` stream (mirrors `ascript run --replay`). Returns the previous.
+    #[doc(hidden)]
+    pub fn __install_replay_trace(
+        &self,
+        seed: u64,
+        events: Vec<crate::det::DetEvent>,
+    ) -> Option<crate::det::DeterminismContext> {
+        let start_ms = crate::det::deterministic_start_ms(seed);
+        self.set_determinism(Some(crate::det::DeterminismContext::replay_trace(
+            seed, start_ms, events,
+        )))
+    }
+
+    /// REPLAY (test-only) — take the current context's recorded event stream (cloned),
+    /// or `None` when no context is installed. Lets a test assert exactly which events a
+    /// recorded program produced.
+    #[doc(hidden)]
+    pub fn __take_trace_events(&self) -> Option<Vec<crate::det::DetEvent>> {
+        self.with_determinism_mut(|ctx| ctx.events.clone())
+    }
+
+    /// REPLAY (test-only) — clear any installed determinism context (and the
+    /// `trace_active` flag), returning it. Lets a test tear down between record/replay.
+    #[doc(hidden)]
+    pub fn __clear_determinism(&self) -> Option<crate::det::DeterminismContext> {
+        self.set_determinism(None)
+    }
+
+    /// REPLAY (test-only) — drive the §6 worker-refusal guard directly so a test can
+    /// assert it is loud under a `CliTrace` context and inert without one, independent of
+    /// wiring up a full worker isolate. Mirrors what each isolate-creation site reaches.
+    #[doc(hidden)]
+    pub fn __refuse_worker_under_trace(&self, what: &str) -> Result<(), Control> {
+        self.refuse_worker_under_trace(what, Span::new(0, 0))
+    }
+
+    /// REPLAY (test-only) — the live OS-resource table size. The Task-4 leak check
+    /// asserts a replay run that drops its virtual handles ends with an empty table
+    /// (no `ReplayVirtual` leak).
+    #[doc(hidden)]
+    pub fn __resource_count(&self) -> usize {
+        self.resources.borrow().len()
+    }
+
+    /// REPLAY (test-only) — drive a qualified `(module, func)` stdlib call through the
+    /// FULL `call_stdlib` path (caps gate → trace hook → dispatch), so a test can record
+    /// or replay an effectful call in-process. Mirrors what a compiled program's stdlib
+    /// call reaches.
+    #[doc(hidden)]
+    pub async fn __call_stdlib(
+        &self,
+        module: &str,
+        func: &str,
+        args: &[Value],
+    ) -> Result<Value, Control> {
+        self.call_stdlib(module, func, args, Span::new(0, 0)).await
+    }
+
+    /// REPLAY (test-only) — drive a method call on a native handle through the FULL
+    /// `call_native_method` path (caps re-check → virtual-handle trace hook → dispatch),
+    /// so a test can record/replay an `HttpResponse` accessor in-process. `recv` is a
+    /// `Value::native` handle (e.g. the `[handle, nil]` pair's element 0).
+    #[doc(hidden)]
+    pub async fn __call_native_method(
+        &self,
+        recv: &Value,
+        method: &str,
+        args: Vec<Value>,
+    ) -> Result<Value, Control> {
+        let ValueKind::Native(n) = recv.kind() else {
+            return Err(AsError::at("__call_native_method: receiver is not a native handle", Span::new(0, 0)).into());
+        };
+        let m = std::rc::Rc::new(crate::value::NativeMethod {
+            receiver: n.clone(),
+            method: method.to_string(),
+        });
+        self.call_native_method(m, args, Span::new(0, 0)).await
     }
 
     /// The wall clock in ms-epoch: the virtual/recorded clock when deterministic,
@@ -3025,6 +3626,9 @@ impl Interp {
         args: Vec<Value>,
         span: Span,
     ) -> Result<Value, Control> {
+        // REPLAY §6: refuse spawning an actor isolate under a trace context (record OR
+        // replay) — BEFORE any sendability/slice work, so no side effect precedes it.
+        self.refuse_worker_under_trace("spawning a worker class actor", span)?;
         // Sendability gate on the init args (field-path panic on failure).
         for a in &args {
             crate::worker::serialize::check_sendable(a)
@@ -3282,6 +3886,9 @@ impl Interp {
         args: Vec<Value>,
         span: Span,
     ) -> Result<Value, Control> {
+        // REPLAY §6: refuse creating a worker-generator isolate under a trace context
+        // (record OR replay) — at the EARLIEST point, before any slice/spawn work.
+        self.refuse_worker_under_trace("iterating a worker fn*", span)?;
         // Sendability gate on the call args (field-path panic on failure).
         for a in &args {
             crate::worker::serialize::check_sendable(a)
@@ -3485,6 +4092,27 @@ impl Interp {
         filter: Option<&crate::test_filter::TestFilter>,
         det: Option<crate::det::DetTestConfig>,
     ) -> Result<TestSummary, Control> {
+        self.run_registered_tests_det_sliced(filter, det, None).await
+    }
+
+    /// REPLAY §4.3 — the per-test runner with an optional `record_slices` sink. When
+    /// `Some`, the runner marks `(name, start..end)` over the file-level determinism
+    /// context's event Vec for EACH test it runs (skipped/filtered tests record no
+    /// slice), pushing into the shared `Vec`. This is the `test --record` slicing seam:
+    /// the caller installs ONE file-level `CliTrace` Record context, this fn marks each
+    /// test's segment, and the caller writes `P ⧺ S_k` for the failures.
+    ///
+    /// **BATT reconciliation:** the per-test BATT install (a fresh `record` context per
+    /// test when `det` is `Some`) and REPLAY recording (one file-level context, sliced)
+    /// are MUTUALLY EXCLUSIVE — `test --record` passes `det: None` so the per-test
+    /// install below never fires, and the file-level context the caller installed stays
+    /// the single source. The two paths cannot both be active.
+    pub async fn run_registered_tests_det_sliced(
+        &self,
+        filter: Option<&crate::test_filter::TestFilter>,
+        det: Option<crate::det::DetTestConfig>,
+        record_slices: Option<&TestSliceSink>,
+    ) -> Result<TestSummary, Control> {
         let mut summary = TestSummary::default();
         // Clone out the registrations first so the table borrow is not held across
         // each `call_value` await.
@@ -3506,6 +4134,10 @@ impl Interp {
                     cfg.start_ms,
                 )))
             });
+            // REPLAY §4.3 — mark this test's segment START over the file-level event Vec
+            // (the index BEFORE the body runs). Read in a sync scope; no borrow held
+            // across the await below.
+            let slice_start = record_slices.map(|_| self.det_event_count());
             // BATT C3 (§10.3): a `prop()` registration is a `{__prop}`-tagged Object,
             // not a callable — drive the property runner (draw + shrink + report)
             // instead of the plain `call_value` path. The per-test det context is
@@ -3522,6 +4154,14 @@ impl Interp {
             // and the next test starts from a clean cell.
             if let Some(prev) = prev {
                 self.set_determinism(prev);
+            }
+            // REPLAY §4.3 — mark this test's segment END (the index AFTER the body) and
+            // record `(name, start..end)` over the file-level event Vec. An `Exit`
+            // unwinds below before reaching this, so an exiting test contributes no
+            // slice (it never produces a saved failure trace anyway).
+            if let (Some(sink), Some(start)) = (record_slices, slice_start) {
+                let end = self.det_event_count();
+                sink.borrow_mut().push((name.clone(), start..end));
             }
             match outcome {
                 Ok(_) | Err(Control::Propagate(_)) => summary.passed += 1,
@@ -5968,6 +6608,85 @@ impl Interp {
         }
     }
 
+    /// REPLAY §2.5 — the virtual-handle trace hook body. Returns `Some(result)` when the
+    /// call was record-routed or replay-virtualized (the caller returns it directly), or
+    /// `None` when the receiver is NOT a virtualized handle (fall through to the normal
+    /// kind dispatch). Only ever entered when `trace_active()`.
+    ///
+    /// - **Record:** the receiver's resource id is in the vid map → dispatch the REAL
+    ///   accessor (the SAME handler the fall-through reaches), encode the outcome through
+    ///   the airlock, and append a `NativeCall { vid, method, args_hash, outcome }`.
+    /// - **Replay:** the receiver's `ResourceState` is `ReplayVirtual { vid }` → consume
+    ///   the next `NativeCall` event (vid + method + args_hash verified; mismatch /
+    ///   exhaustion → §7 divergence) and decode the outcome WITHOUT dispatching. The real
+    ///   http machinery is never touched — the flagship offline guarantee.
+    ///
+    /// Borrow discipline: the mode + (replay) the `vid` are snapshotted up front; the
+    /// record-side dispatch `.await`s OUTSIDE any det/resources borrow; the encode +
+    /// append happen AFTER the await in a sync scope.
+    #[cfg(feature = "net")]
+    async fn trace_native_method(
+        &self,
+        m: &std::rc::Rc<crate::value::NativeMethod>,
+        args: &[Value],
+        span: Span,
+    ) -> Option<Result<Value, Control>> {
+        let id = m.receiver.id;
+        let method = m.method.as_str();
+        let args_hash = Self::replay_args_hash("__native__", method, args);
+        // Is this receiver a replay-virtual handle? (a short borrow, dropped immediately).
+        let replay_vid = self.with_resource(id, |r| match r {
+            Some(ResourceState::ReplayVirtual { vid }) => Some(*vid),
+            _ => None,
+        });
+
+        if let Some(vid) = replay_vid {
+            // ---- Replay: consume the recorded NativeCall WITHOUT dispatching. ---- //
+            let outcome = self
+                .with_determinism_mut(|ctx| ctx.replay_native_call(vid, method, args_hash))
+                .flatten();
+            // Raise a strict divergence (mismatch / exhaustion) if one was set.
+            if let Err(e) = self.check_divergence(span) {
+                return Some(Err(e));
+            }
+            let Some(outcome) = outcome else {
+                return Some(Err(AsError::at(
+                    format!(
+                        "replay divergence: no recorded outcome for virtual handle method '{}'",
+                        method
+                    ),
+                    span,
+                )
+                .into()));
+            };
+            return Some(self.decode_trace_outcome(outcome, span));
+        }
+
+        // ---- Record: is this receiver a virtualized (id→vid mapped) handle? ---- //
+        let record_vid = self.replay_vid_map.borrow().get(&id).copied();
+        let Some(vid) = record_vid else {
+            // Not a virtualized handle — fall through to the normal kind dispatch.
+            return None;
+        };
+        // Dispatch the REAL accessor (v1 virtualizes EXACTLY HttpResponse). The await is
+        // OUTSIDE any det/resources/vid-map borrow (all dropped above).
+        let result = self
+            .call_http_response_method(m, args.to_vec(), span)
+            .await;
+        // Encode the outcome (after the await) and append the NativeCall event.
+        match self.encode_trace_outcome("__native__", method, &result, span) {
+            Ok(Some(outcome)) => {
+                self.with_determinism_mut(|ctx| {
+                    ctx.record_native_call(vid, method, args_hash, outcome);
+                });
+            }
+            // `Ok(None)` = a process-level Control::Exit (not recorded); pass `result` through.
+            Ok(None) => {}
+            Err(e) => return Some(Err(e)),
+        }
+        Some(result)
+    }
+
     /// Dispatch a `NativeMethod` (e.g. `conn.query`, `child.wait`) to the handler
     /// for its receiver's kind. Async + recursive because handlers (added by
     /// sqlite/process tasks) re-enter the interpreter via `call_value`. For now
@@ -5996,6 +6715,19 @@ impl Interp {
             // → byte-identical. A `CapReq::NONE` handle iterates zero times (ungated).
             for cap in m.receiver.kind.governing_caps().iter() {
                 self.require_cap(cap, m.receiver.kind.type_name(), &m.method, &args, span)?;
+            }
+        }
+        // REPLAY §2.5 — the virtual-handle trace hook. Gate-12: `trace_active()` is the
+        // same `Cell<bool>` the `call_stdlib` hook reads — ONE predictably-not-taken
+        // branch on the default path; no `RefCell` borrow when off. It sits AFTER the
+        // caps re-check (a denied cap under --record/--replay still errors with the CAP
+        // message, never a recorded event), mirroring the FFI B3 re-check site exactly.
+        // v1 virtualizes EXACTLY `HttpResponse` (net-gated); under `--no-default-features`
+        // there is no virtualizable handle kind, so the hook is compiled out entirely.
+        #[cfg(feature = "net")]
+        if self.trace_active() {
+            if let Some(routed) = self.trace_native_method(&m, &args, span).await {
+                return routed;
             }
         }
         #[cfg(feature = "sql")]
@@ -6763,6 +7495,8 @@ impl Interp {
         // handled inside `dispatch_worker`. A worker fn cannot also be `async`/`fn*`
         // (the surface form has no such combination), so this precedes those branches.
         if func.is_worker {
+            // REPLAY §6: refuse dispatching a worker fn isolate under a trace context.
+            self.refuse_worker_under_trace("calling a worker fn", span)?;
             let entry_name = func
                 .name
                 .clone()
@@ -7431,6 +8165,8 @@ impl Interp {
         // entry global is the bare method name; the code slice carries the class name
         // for diagnostics + future class binding.
         if method.is_worker {
+            // REPLAY §6: refuse dispatching a static worker fn isolate under a trace ctx.
+            self.refuse_worker_under_trace("calling a static worker fn", span)?;
             if crate::worker::pool::in_isolate() {
                 return crate::worker::dispatch_worker_inline(self, name, args, span);
             }
@@ -7514,6 +8250,9 @@ impl Interp {
     /// is terminal. Byte-identical across engines (the slice build + dispatch are the
     /// SAME mechanism `worker fn` uses; only the isolate lifecycle + caps differ).
     async fn call_run_in_worker(&self, args: &[Value], span: Span) -> Result<Value, Control> {
+        // REPLAY §6: refuse a `run_in_worker` isolate under a trace context, BEFORE any
+        // callee/opts/caps parsing — the earliest point, no side effect precedes it.
+        self.refuse_worker_under_trace("run_in_worker", span)?;
         let callee = args.first().cloned().unwrap_or(Value::nil());
         // The single payload arg (an array/object/scalar — structured-clone-sendable).
         let input = args.get(1).cloned().unwrap_or(Value::nil());

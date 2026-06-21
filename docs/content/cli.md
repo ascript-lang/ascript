@@ -61,6 +61,16 @@ missing lock, or integrity mismatch. For CI and air-gapped environments. See [Pa
 | `--no-elide` | Force contract elision **off** (the permanent kill switch; wins over `--elide`). Equivalent to `ASCRIPT_NO_ELIDE=1`. |
 | `--no-cache` | Bypass the **compile cache** for this run — always parse/resolve/compile from source. Equivalent to `ASCRIPT_NO_COMPILE_CACHE=1`. The cache only ever applies to the plain `.as`-on-the-VM path: `.aso`, `--tree-walker`, `--inspect`, `--profile`, and explicit `--elide` runs are never cached regardless of this flag. See [`ascript cache`](#ascript-cache). |
 
+### Record & replay flags
+
+Record a run's non-deterministic effects to a portable trace, then replay it deterministically — the same program reproduces byte-for-byte with **no real I/O** (the file fixture can be deleted, the network can be down). See [Tooling → Record & replay](tooling/record-replay) for the deterministic-mode contract, the full coverage table, and replay debugging.
+
+| Flag | Effect |
+|---|---|
+| `--record <FILE>` | Run in **deterministic mode** (virtual clock, instant sleeps, seeded RNG) and write a replayable trace to `<FILE>` — clock/RNG/UUID plus effectful results (`fs`, `env`, `process.run`, DNS, buffered `http`, `workflow.run`). The trace is written even if the program panics or exits non-zero (a failed run is the one worth replaying). Bypasses the compile cache; composes with `--tree-walker` and `.aso`. Sockets/servers/streams/workers are refused under a trace (v2). |
+| `--replay <FILE>` | Replay a previously recorded `<FILE>`, reproducing every effect from the trace with **no real I/O** (strict divergence detection). Pass the same program file; a source change since recording is a clean error (a `.as` is verified by source digest; a `.aso` runs without the digest check). A recorded trace replays byte-identically across engines (`--tree-walker`, the VM, `--no-specialize`, and `.aso`). |
+| `--seed <N>` | Pin the RNG seed for `--record` (default: OS entropy). The same program plus the same seed records an identical event stream. Requires `--record`. |
+
 ## `ascript build`
 
 Compile a `.as` program to a `.aso` bytecode file, then run the artifact with no compile step.
@@ -301,6 +311,8 @@ and they can coexist (import under a different alias if needed: `import * as A f
 | `--sandbox` | Deny all five dangerous capabilities for the test run. |
 | `--elide` | Enable contract elision for the (serial) test run (default-off; behavior byte-identical). Equivalent to `ASCRIPT_ELIDE=1`. The `--parallel` path runs each file in a worker isolate, which never elides. |
 | `--no-elide` | Force contract elision off (kill switch). Equivalent to `ASCRIPT_NO_ELIDE=1`. |
+| `--record` | Record per-test traces for this run. Each test file runs under one deterministic Record context (virtual clock, instant sleeps, seeded RNG — pin it with `--seed N`); a replayable trace is auto-saved **only for a failed test** under `.ascript-traces/<file_stem>__<test-name-slug>.trace` (a fully-green file writes nothing). After the tally, each saved trace prints a `trace saved:` hint. Conflicts with `--parallel`/`--watch`/`--replay` (v1). Add `.ascript-traces/` to your `.gitignore`. See [Tooling → Record & replay](tooling/record-replay). |
+| `--replay <FILE>` | Replay a previously recorded per-test trace: re-run module load + exactly that one test under strict Replay — every effect (clock/RNG/`fs`/buffered `http`/…) returns its recorded value with **no real I/O**, so you can replay a failed test after the fixture/network is gone. The program path and test name come from the trace (the `files` args are ignored). A changed test file proceeds with a printed **warning** (not an error — the point is editing the test/code between replays); a divergence at a seam is still reported. A sliced per-test replay re-runs module load + one test, so a test depending on a sibling test's seam effects diverges loudly (itself a finding: the test is order-dependent). |
 
 ## `ascript lsp`
 
@@ -436,10 +448,26 @@ the editor's `launch` request.
 
 ```text
 ascript dap
+ascript dap --replay <trace>
 ```
 
 `--stdio` is accepted for compatibility with DAP clients that pass it; stdio is the only transport,
 so it is a no-op.
+
+`--replay <trace>` starts a **replay-debugging** session (time travel): the debuggee runs under the
+strict Replay context — **no real I/O**, every clock/RNG/effect value pinned from the trace — and the
+adapter advertises the DAP `supportsStepBack` capability, enabling `stepBack` and `reverseContinue`.
+The program path is taken from the trace, so `launch` needs no `program` argument (`ascript run
+--inspect --replay <trace> <file>` is the equivalent run-path route). A backward step is implemented
+by **deterministic re-execution** (the rr model — no checkpointing): the adapter tears down the
+debuggee and re-runs the program prefix to the previous stop, replaying the recorded navigation log.
+Because replay does no I/O and sleeps are virtual, the prefix re-executes at full VM speed; the
+honest cost is one re-execution per backward step (O(stops × prefix)). `stepBack` lands on the
+previous **stop** (breakpoint/step boundary), not the previous instruction (v1 granularity).
+`evaluate` works for pure-value inspection; an `evaluate` whose expression calls a recorded function
+(e.g. `time.now()` / `fs.read(…)`) is **refused** with a clean message — running it would consume a
+trace event and desync the replay. A non-replay `ascript dap` session is unchanged (the capability is
+absent; the time-travel paths are inert).
 
 `ascript dap` takes no capability sandbox flags — the program path is not known at server start. If
 you need a sandboxed debug session, use `ascript run --inspect --sandbox <file>` instead: that path
@@ -448,7 +476,8 @@ that restrict a normal run restrict the debugged run).
 
 For quick in-editor setup, use `ascript run --inspect <file>` to pre-set the program from the CLI.
 See [Debugging & profiling](tooling/debugging-profiling) for the full setup guide and VS Code
-launch configuration.
+launch configuration, and [Record & replay](tooling/record-replay) for replay debugging
+(time travel over a recorded trace).
 
 ## Package management
 

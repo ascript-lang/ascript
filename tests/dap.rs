@@ -72,6 +72,39 @@ impl DapClient {
         Self::wrap(child.stdin.take().unwrap(), child.stdout.take().unwrap(), child)
     }
 
+    /// Spawn `ascript dap --replay <trace>` (REPLAY §5 — the replay-debugging form). The
+    /// program comes from the trace; the session runs under the strict Replay context, so
+    /// it advertises `supportsStepBack`.
+    fn spawn_dap_replay(trace: &std::path::Path) -> Self {
+        let mut child = Command::new(env!("CARGO_BIN_EXE_ascript"))
+            .arg("dap")
+            .arg("--replay")
+            .arg(trace)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("failed to spawn `ascript dap --replay`");
+        Self::wrap(child.stdin.take().unwrap(), child.stdout.take().unwrap(), child)
+    }
+
+    /// Spawn `ascript run --inspect --replay <trace> <program>` (REPLAY §5 — the
+    /// run-path replay-debugging route).
+    fn spawn_inspect_replay(program: &std::path::Path, trace: &std::path::Path) -> Self {
+        let mut child = Command::new(env!("CARGO_BIN_EXE_ascript"))
+            .arg("run")
+            .arg("--inspect")
+            .arg("--replay")
+            .arg(trace)
+            .arg(program)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("failed to spawn `ascript run --inspect --replay`");
+        Self::wrap(child.stdin.take().unwrap(), child.stdout.take().unwrap(), child)
+    }
+
     fn wrap(stdin: ChildStdin, stdout: ChildStdout, child: Child) -> Self {
         let stdout = BufReader::new(stdout);
         let (tx, rx) = mpsc::channel();
@@ -259,6 +292,52 @@ fn temp_program(name: &str, src: &str) -> std::path::PathBuf {
 }
 
 const PROGRAM: &str = "fn add(a, b) {\n  let s = a + b\n  return s\n}\nprint(add(2, 3))\n";
+
+/// A recordable program with THREE distinct functions, each reading the (recorded)
+/// virtual clock, so a replay reproduces the exact same clock values across any number of
+/// re-executions — the determinism that makes time-travel sound. Distinct functions (not
+/// one called thrice) give three DISTINCT breakpoint lines (3 / 7 / 11), each a function
+/// frame whose param `n` is inspectable — exactly the multi-stop, non-empty-variables
+/// shape stepBack/reverseContinue need. (A breakpoint inside a single function called
+/// thrice would trap only ONCE — the documented DBG v1 trap-once trade-off, `vm/run.rs`
+/// `Op::Break`; distinct lines side-step it.) Breakpoint lines: 3, 7, 11.
+const REC_PROGRAM: &str = "import * as time from \"std/time\"\n\
+                           fn one(n) {\n\
+                           \x20 let t = time.now()\n\
+                           \x20 return n\n\
+                           }\n\
+                           fn two(n) {\n\
+                           \x20 let t = time.now()\n\
+                           \x20 return n\n\
+                           }\n\
+                           fn three(n) {\n\
+                           \x20 let t = time.now()\n\
+                           \x20 return n\n\
+                           }\n\
+                           let a = one(1)\n\
+                           let b = two(2)\n\
+                           let c = three(3)\n\
+                           print(a + b + c)\n";
+
+/// Record a `run --record` trace for `program` via the real binary, returning the trace
+/// path. The recorded trace pins the clock so a replay is byte-identically reproducible.
+fn record_trace(program: &std::path::Path) -> std::path::PathBuf {
+    let mut trace = program.to_path_buf();
+    trace.set_extension("trace");
+    let out = Command::new(env!("CARGO_BIN_EXE_ascript"))
+        .arg("run")
+        .arg("--record")
+        .arg(&trace)
+        .arg(program)
+        .output()
+        .expect("spawn `ascript run --record`");
+    assert!(
+        out.status.success(),
+        "ascript run --record failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    trace
+}
 
 /// Test 1 — the happy path: initialize → launch (stop at entry) → setBreakpoints on the
 /// `let s` line → configurationDone → stop at the breakpoint → stackTrace/scopes/
@@ -888,4 +967,413 @@ fn dap_subcommand_launch_with_program_arg() {
 
     c.close_stdin();
     let _ = std::fs::remove_file(&program);
+}
+
+// ---------------------------------------------------------------------------
+// REPLAY §5 — replay-debugging: stepBack / reverseContinue by deterministic
+// re-execution (the rr model). `ascript dap --replay <trace>` runs the debuggee
+// under the strict Replay context and advertises `supportsStepBack`.
+// ---------------------------------------------------------------------------
+
+/// REPLAY §5.1 — the `supportsStepBack` capability is advertised ONLY when a replay
+/// trace is present: a `dap --replay` session sees `supportsStepBack: true`, a plain
+/// `--inspect` session does NOT carry the field at all (bitwise-unchanged response).
+#[test]
+fn dap_replay_advertises_step_back_only_with_trace() {
+    let _serial = dap_serial();
+    let deadline = Instant::now() + Duration::from_secs(180);
+    let program = temp_program("replay_caps", REC_PROGRAM);
+    let trace = record_trace(&program);
+
+    // (a) With --replay: supportsStepBack present and true.
+    let mut c = DapClient::spawn_dap_replay(&trace);
+    let init = c.request("initialize", json!({}));
+    let resp = c.read_response(init, deadline);
+    assert_eq!(resp["success"], json!(true), "initialize ok: {resp}");
+    assert_eq!(
+        resp["body"]["supportsStepBack"], json!(true),
+        "a replay session advertises stepBack: {resp}"
+    );
+    c.close_stdin();
+    drop(c);
+
+    // (b) Without --replay: the field is ABSENT (not present, not false) — a non-replay
+    // session's initialize response is bitwise-unchanged.
+    let mut c2 = DapClient::spawn_inspect(&program);
+    let init2 = c2.request("initialize", json!({}));
+    let resp2 = c2.read_response(init2, deadline);
+    assert_eq!(resp2["success"], json!(true), "initialize ok: {resp2}");
+    assert!(
+        resp2["body"].get("supportsStepBack").is_none(),
+        "a non-replay session must NOT carry supportsStepBack at all: {resp2}"
+    );
+    c2.close_stdin();
+
+    let _ = std::fs::remove_file(&program);
+    let _ = std::fs::remove_file(&trace);
+}
+
+/// Helper: read the variable `name` from the innermost frame's `Locals` at the CURRENT
+/// stop (stackTrace → scopes → variables on frame 0). Returns its rendered value. Used to
+/// prove a stepBack/reverseContinue lands on byte-identical state.
+fn step_var_at_stop(c: &mut DapClient, deadline: Instant, name: &str) -> Option<String> {
+    let st = c.request("stackTrace", json!({ "threadId": 1 }));
+    let st_resp = c.read_response(st, deadline);
+    let frames = st_resp["body"]["stackFrames"].as_array().expect("frames");
+    let frame_id = frames[0]["id"].as_i64().expect("frame id");
+    let sc = c.request("scopes", json!({ "frameId": frame_id }));
+    let sc_resp = c.read_response(sc, deadline);
+    let var_ref = sc_resp["body"]["scopes"][0]["variablesReference"]
+        .as_i64()
+        .expect("var ref");
+    let vr = c.request("variables", json!({ "variablesReference": var_ref }));
+    let vr_resp = c.read_response(vr, deadline);
+    let vars = vr_resp["body"]["variables"].as_array().expect("variables");
+    vars.iter()
+        .find(|v| v["name"].as_str() == Some(name))
+        .and_then(|v| v["value"].as_str().map(String::from))
+}
+
+/// REPLAY §5.2 — breakpoints inside `one`/`two`/`three` (lines 3/7/11), continue once
+/// (two breakpoint hits), inspect `n` at the 2nd hit (n=2), then `stepBack` → a
+/// `stopped(reason:"step")` at the PREVIOUS hit with byte-identical `n` (n=1). This is
+/// the flagship: re-execution reaches the same state.
+#[test]
+fn dap_replay_step_back_lands_previous_stop_identical_state() {
+    let _serial = dap_serial();
+    let deadline = Instant::now() + Duration::from_secs(240);
+    let program = temp_program("replay_stepback", REC_PROGRAM);
+    let trace = record_trace(&program);
+    let mut c = DapClient::spawn_dap_replay(&trace);
+
+    let init = c.request("initialize", json!({}));
+    c.read_response(init, deadline);
+    c.read_event("initialized", deadline);
+    let launch = c.request("launch", json!({}));
+    c.read_response(launch, deadline);
+    let entry = c.read_event("stopped", deadline);
+    assert_eq!(entry["body"]["reason"], json!("entry"), "{entry}");
+
+    // Breakpoints on the `let t = time.now()` line in each of one/two/three (3/7/11).
+    let sb = c.request(
+        "setBreakpoints",
+        json!({
+            "source": { "path": program.to_string_lossy() },
+            "breakpoints": [ { "line": 3 }, { "line": 7 }, { "line": 11 } ],
+        }),
+    );
+    c.read_response(sb, deadline);
+    c.read_event("breakpoint", deadline);
+    let cd = c.request("configurationDone", json!({}));
+    c.read_response(cd, deadline);
+
+    // 1st hit: one(1) → n=1.
+    let s1 = c.read_event("stopped", deadline);
+    assert_eq!(s1["body"]["reason"], json!("breakpoint"), "{s1}");
+    let n1 = step_var_at_stop(&mut c, deadline, "n");
+    assert_eq!(n1.as_deref(), Some("1"), "first hit n=1");
+
+    // 2nd hit: two(2) → n=2.
+    let cont = c.request("continue", json!({ "threadId": 1 }));
+    c.read_response(cont, deadline);
+    let s2 = c.read_event("stopped", deadline);
+    assert_eq!(s2["body"]["reason"], json!("breakpoint"), "{s2}");
+    let n2 = step_var_at_stop(&mut c, deadline, "n");
+    assert_eq!(n2.as_deref(), Some("2"), "second hit n=2");
+
+    // stepBack → land on the PREVIOUS stop (the 1st hit) as reason "step", with
+    // byte-identical state (n=1) reproduced by re-execution.
+    let sb_req = c.request("stepBack", json!({ "threadId": 1 }));
+    let sb_resp = c.read_response(sb_req, deadline);
+    assert_eq!(sb_resp["success"], json!(true), "stepBack ok: {sb_resp}");
+    let back = c.read_event("stopped", deadline);
+    assert_eq!(
+        back["body"]["reason"], json!("step"),
+        "stepBack surfaces a step-reason stop: {back}"
+    );
+    let n_back = step_var_at_stop(&mut c, deadline, "n");
+    assert_eq!(
+        n_back.as_deref(), Some("1"),
+        "stepBack reproduces the previous stop's state exactly"
+    );
+
+    c.close_stdin();
+    let _ = std::fs::remove_file(&program);
+    let _ = std::fs::remove_file(&trace);
+}
+
+/// REPLAY §5.2 — `reverseContinue` from a later breakpoint hit lands on the PREVIOUS
+/// breakpoint hit (the greatest stop index `< k` whose reason was a breakpoint).
+#[test]
+fn dap_replay_reverse_continue_lands_previous_breakpoint() {
+    let _serial = dap_serial();
+    let deadline = Instant::now() + Duration::from_secs(240);
+    let program = temp_program("replay_revcont", REC_PROGRAM);
+    let trace = record_trace(&program);
+    let mut c = DapClient::spawn_dap_replay(&trace);
+
+    let init = c.request("initialize", json!({}));
+    c.read_response(init, deadline);
+    c.read_event("initialized", deadline);
+    let launch = c.request("launch", json!({}));
+    c.read_response(launch, deadline);
+    c.read_event("stopped", deadline); // entry
+
+    let sb = c.request(
+        "setBreakpoints",
+        json!({
+            "source": { "path": program.to_string_lossy() },
+            "breakpoints": [ { "line": 3 }, { "line": 7 }, { "line": 11 } ],
+        }),
+    );
+    c.read_response(sb, deadline);
+    c.read_event("breakpoint", deadline);
+    let cd = c.request("configurationDone", json!({}));
+    c.read_response(cd, deadline);
+
+    // Drive to the 3rd breakpoint hit (n=3).
+    c.read_event("stopped", deadline); // hit 1, n=1
+    let cont1 = c.request("continue", json!({ "threadId": 1 }));
+    c.read_response(cont1, deadline);
+    c.read_event("stopped", deadline); // hit 2, n=2
+    let cont2 = c.request("continue", json!({ "threadId": 1 }));
+    c.read_response(cont2, deadline);
+    let s3 = c.read_event("stopped", deadline); // hit 3, n=3
+    assert_eq!(s3["body"]["reason"], json!("breakpoint"), "{s3}");
+    assert_eq!(step_var_at_stop(&mut c, deadline, "n").as_deref(), Some("3"));
+
+    // reverseContinue → previous breakpoint hit (n=2).
+    let rc = c.request("reverseContinue", json!({ "threadId": 1 }));
+    let rc_resp = c.read_response(rc, deadline);
+    assert_eq!(rc_resp["success"], json!(true), "reverseContinue ok: {rc_resp}");
+    let back = c.read_event("stopped", deadline);
+    assert_eq!(back["body"]["reason"], json!("step"), "{back}");
+    assert_eq!(
+        step_var_at_stop(&mut c, deadline, "n").as_deref(), Some("2"),
+        "reverseContinue lands on the previous breakpoint hit (n=2)"
+    );
+
+    c.close_stdin();
+    let _ = std::fs::remove_file(&program);
+    let _ = std::fs::remove_file(&trace);
+}
+
+/// REPLAY §5.2 — `stepBack` at the ENTRY stop (nowhere to go) is a clean error response
+/// (success:false), not a crash or a hang.
+#[test]
+fn dap_replay_step_back_at_entry_is_clean_error() {
+    let _serial = dap_serial();
+    let deadline = Instant::now() + Duration::from_secs(180);
+    let program = temp_program("replay_entry_back", REC_PROGRAM);
+    let trace = record_trace(&program);
+    let mut c = DapClient::spawn_dap_replay(&trace);
+
+    let init = c.request("initialize", json!({}));
+    c.read_response(init, deadline);
+    c.read_event("initialized", deadline);
+    let launch = c.request("launch", json!({}));
+    c.read_response(launch, deadline);
+    let entry = c.read_event("stopped", deadline);
+    assert_eq!(entry["body"]["reason"], json!("entry"), "{entry}");
+
+    // stepBack at the entry stop: nothing before it → a clean error response.
+    let sb = c.request("stepBack", json!({ "threadId": 1 }));
+    let sb_resp = c.read_response(sb, deadline);
+    assert_eq!(
+        sb_resp["success"], json!(false),
+        "stepBack at entry has nowhere to go → clean error: {sb_resp}"
+    );
+
+    // The session is still healthy: configurationDone runs to completion.
+    let cd = c.request("configurationDone", json!({}));
+    c.read_response(cd, deadline);
+    let output = c.drain_output_until_terminated(deadline);
+    assert!(output.contains("6"), "program still completes: {output:?}");
+
+    c.close_stdin();
+    let _ = std::fs::remove_file(&program);
+    let _ = std::fs::remove_file(&trace);
+}
+
+/// REPLAY §5.2 — an `evaluate` of a PURE expression at a stop works; an `evaluate` that
+/// would call a Recorded fn (consuming a trace event, desyncing the replay) is REFUSED
+/// with a clean `success:false` message. Pure-value inspection is unaffected.
+#[cfg(feature = "datetime")]
+#[test]
+fn dap_replay_evaluate_pure_ok_recorded_refused() {
+    let _serial = dap_serial();
+    let deadline = Instant::now() + Duration::from_secs(180);
+    let program = temp_program("replay_eval", REC_PROGRAM);
+    let trace = record_trace(&program);
+    let mut c = DapClient::spawn_dap_replay(&trace);
+
+    let init = c.request("initialize", json!({}));
+    c.read_response(init, deadline);
+    c.read_event("initialized", deadline);
+    let launch = c.request("launch", json!({}));
+    c.read_response(launch, deadline);
+    c.read_event("stopped", deadline); // entry
+
+    // Stop inside `one` (line 3) where the param `n` is bound (n=1).
+    let sb = c.request(
+        "setBreakpoints",
+        json!({
+            "source": { "path": program.to_string_lossy() },
+            "breakpoints": [ { "line": 3 }, { "line": 7 }, { "line": 11 } ],
+        }),
+    );
+    c.read_response(sb, deadline);
+    c.read_event("breakpoint", deadline);
+    let cd = c.request("configurationDone", json!({}));
+    c.read_response(cd, deadline);
+    let s1 = c.read_event("stopped", deadline);
+    assert_eq!(s1["body"]["reason"], json!("breakpoint"), "{s1}");
+
+    let st = c.request("stackTrace", json!({ "threadId": 1 }));
+    let st_resp = c.read_response(st, deadline);
+    let frame_id = st_resp["body"]["stackFrames"][0]["id"].as_i64().expect("frame id");
+
+    // (1) A pure expression over the paused local `n` (n=1) → "2".
+    let ev = c.request(
+        "evaluate",
+        json!({ "expression": "n + 1", "frameId": frame_id, "context": "watch" }),
+    );
+    let ev_resp = c.read_response(ev, deadline);
+    assert_eq!(ev_resp["success"], json!(true), "pure evaluate ok: {ev_resp}");
+    assert_eq!(ev_resp["body"]["result"], json!("2"), "n + 1 == 2: {ev_resp}");
+
+    // (2) An evaluate that calls a Recorded fn (the clock) is REFUSED — it would consume
+    // a trace event and desync the replay.
+    let ev2 = c.request(
+        "evaluate",
+        json!({ "expression": "time.now()", "frameId": frame_id, "context": "repl" }),
+    );
+    let ev2_resp = c.read_response(ev2, deadline);
+    assert_eq!(
+        ev2_resp["success"], json!(false),
+        "an evaluate hitting the trace hook is refused: {ev2_resp}"
+    );
+
+    // The session stays usable AFTER the refusal: a pure evaluate still works (proving
+    // the refusal restored the determinism cursor, not desynced).
+    let ev3 = c.request(
+        "evaluate",
+        json!({ "expression": "n", "frameId": frame_id, "context": "watch" }),
+    );
+    let ev3_resp = c.read_response(ev3, deadline);
+    assert_eq!(ev3_resp["success"], json!(true), "pure evaluate still ok after refusal: {ev3_resp}");
+    assert_eq!(ev3_resp["body"]["result"], json!("1"), "n == 1: {ev3_resp}");
+
+    // Disconnect cleanly (the program has further breakpoints; the adapter's teardown
+    // clears them and runs the debuggee to completion — no need to step through each).
+    let dc = c.request("disconnect", json!({}));
+    c.read_response(dc, deadline);
+
+    c.close_stdin();
+    let _ = std::fs::remove_file(&program);
+    let _ = std::fs::remove_file(&trace);
+}
+
+/// REPLAY §5 — `run --inspect --replay <trace> <program>` end-to-end: the run-path
+/// route reaches a replay DAP session that advertises stepBack and stops at entry.
+#[test]
+fn dap_run_inspect_replay_starts_replay_session() {
+    let _serial = dap_serial();
+    let deadline = Instant::now() + Duration::from_secs(180);
+    let program = temp_program("inspect_replay", REC_PROGRAM);
+    let trace = record_trace(&program);
+    let mut c = DapClient::spawn_inspect_replay(&program, &trace);
+
+    let init = c.request("initialize", json!({}));
+    let resp = c.read_response(init, deadline);
+    assert_eq!(
+        resp["body"]["supportsStepBack"], json!(true),
+        "run --inspect --replay routes to a replay session: {resp}"
+    );
+    c.read_event("initialized", deadline);
+    let launch = c.request("launch", json!({}));
+    c.read_response(launch, deadline);
+    let stopped = c.read_event("stopped", deadline);
+    assert_eq!(stopped["body"]["reason"], json!("entry"), "{stopped}");
+
+    let cd = c.request("configurationDone", json!({}));
+    c.read_response(cd, deadline);
+    let output = c.drain_output_until_terminated(deadline);
+    assert!(output.contains("6"), "replay produces the recorded output: {output:?}");
+
+    c.close_stdin();
+    let _ = std::fs::remove_file(&program);
+    let _ = std::fs::remove_file(&trace);
+}
+
+/// REPLAY §5.2 — a stepBack STORM: from the 3rd breakpoint hit, stepBack three times,
+/// visiting hit 2 (n=2), hit 1 (n=1), then the entry. The variable value is identical at
+/// each visit — the determinism proof (every re-execution reaches byte-identical state).
+#[test]
+fn dap_replay_step_back_storm_identical_each_visit() {
+    let _serial = dap_serial();
+    let deadline = Instant::now() + Duration::from_secs(300);
+    let program = temp_program("replay_storm", REC_PROGRAM);
+    let trace = record_trace(&program);
+    let mut c = DapClient::spawn_dap_replay(&trace);
+
+    let init = c.request("initialize", json!({}));
+    c.read_response(init, deadline);
+    c.read_event("initialized", deadline);
+    let launch = c.request("launch", json!({}));
+    c.read_response(launch, deadline);
+    c.read_event("stopped", deadline); // entry
+
+    let sb = c.request(
+        "setBreakpoints",
+        json!({
+            "source": { "path": program.to_string_lossy() },
+            "breakpoints": [ { "line": 3 }, { "line": 7 }, { "line": 11 } ],
+        }),
+    );
+    c.read_response(sb, deadline);
+    c.read_event("breakpoint", deadline);
+    let cd = c.request("configurationDone", json!({}));
+    c.read_response(cd, deadline);
+
+    // Forward to hit 3 (n=3), caching each forward value.
+    c.read_event("stopped", deadline); // hit 1
+    assert_eq!(step_var_at_stop(&mut c, deadline, "n").as_deref(), Some("1"));
+    let cont1 = c.request("continue", json!({ "threadId": 1 }));
+    c.read_response(cont1, deadline);
+    c.read_event("stopped", deadline); // hit 2
+    assert_eq!(step_var_at_stop(&mut c, deadline, "n").as_deref(), Some("2"));
+    let cont2 = c.request("continue", json!({ "threadId": 1 }));
+    c.read_response(cont2, deadline);
+    c.read_event("stopped", deadline); // hit 3
+    assert_eq!(step_var_at_stop(&mut c, deadline, "n").as_deref(), Some("3"));
+
+    // Backstep 1 → hit 2 (n=2).
+    let b1 = c.request("stepBack", json!({ "threadId": 1 }));
+    assert_eq!(c.read_response(b1, deadline)["success"], json!(true));
+    c.read_event("stopped", deadline);
+    assert_eq!(
+        step_var_at_stop(&mut c, deadline, "n").as_deref(), Some("2"),
+        "backstep 1 → n=2 (identical)"
+    );
+
+    // Backstep 2 → hit 1 (n=1).
+    let b2 = c.request("stepBack", json!({ "threadId": 1 }));
+    assert_eq!(c.read_response(b2, deadline)["success"], json!(true));
+    c.read_event("stopped", deadline);
+    assert_eq!(
+        step_var_at_stop(&mut c, deadline, "n").as_deref(), Some("1"),
+        "backstep 2 → n=1 (identical)"
+    );
+
+    // Backstep 3 → the entry stop (reason "step"); no `step` frame `n`, so just assert it
+    // landed and is a clean stop.
+    let b3 = c.request("stepBack", json!({ "threadId": 1 }));
+    assert_eq!(c.read_response(b3, deadline)["success"], json!(true));
+    let entry_back = c.read_event("stopped", deadline);
+    assert_eq!(entry_back["body"]["reason"], json!("step"), "{entry_back}");
+
+    c.close_stdin();
+    let _ = std::fs::remove_file(&program);
+    let _ = std::fs::remove_file(&trace);
 }

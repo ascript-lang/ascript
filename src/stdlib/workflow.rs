@@ -340,6 +340,18 @@ fn event_to_json(seq: usize, ev: &DetEvent) -> serde_json::Value {
                     .collect::<Vec<_>>(),
             })
         }
+        // REPLAY §2.3/§2.5: `StdlibCall`/`NativeCall` are CLI-trace-only events (the
+        // `ASTRC` binary trace, a separate REPLAY artifact). They are NEVER installed in
+        // a `std/workflow` determinism context, so the workflow newline-JSON log codec
+        // never encodes them in practice. A defensive marker keeps the match exhaustive
+        // without inventing a JSON projection of the airlock bytes the workflow log can't
+        // carry (`log_to_events` likewise never parses these kinds).
+        DetEvent::StdlibCall { module, func, .. } => json!({
+            "seq": seq, "kind": "StdlibCall", "module": module, "func": func,
+        }),
+        DetEvent::NativeCall { vid, method, .. } => json!({
+            "seq": seq, "kind": "NativeCall", "vid": vid, "method": method,
+        }),
     }
 }
 

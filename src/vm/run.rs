@@ -1910,6 +1910,15 @@ impl Vm {
         args: Vec<Value>,
         span: Span,
     ) -> Result<Value, Control> {
+        // REPLAY §6: refuse dispatching a worker fn isolate under a trace context, with a
+        // descriptive `what` matching the tree-walker `call_function` site (the backstop in
+        // `dispatch_worker` would also catch it, but with a generic message).
+        let what = if callee.proto.owning_class.is_some() {
+            "calling a static worker fn"
+        } else {
+            "calling a worker fn"
+        };
+        self.interp.refuse_worker_under_trace(what, span)?;
         let entry_name = callee.proto.chunk.name.as_deref().ok_or_else(|| {
             Control::Panic(crate::error::AsError::at(
                 "worker fn has no name (internal invariant)".to_string(),
@@ -8019,7 +8028,31 @@ impl Vm {
 
         // (4) Evaluate on the tree-walker. Render the value via `Display`; a thrown panic
         // / propagation becomes a `(false, message)` result.
-        match self.interp().eval_expr(&expr, &env).await {
+        //
+        // REPLAY §5.2 — in a strict REPLAY session the determinism context is LIVE during
+        // the evaluate. An expression that calls a Recorded fn (e.g. `time.now()` /
+        // `fs.read(...)`) would CONSUME a trace event, advancing the cursor and desyncing
+        // the replay for the rest of the session. We snapshot the context before the
+        // eval; if the cursor advanced, the eval touched the trace → REFUSE it and RESTORE
+        // the snapshot (un-doing the consumption), keeping the session usable. Pure-value
+        // inspection (the overwhelmingly common case) never advances the cursor and is
+        // unaffected. Outside a replay session `snapshot` is `None` → byte-identical.
+        let snapshot = self.interp().det_replay_snapshot();
+        let result = self.interp().eval_expr(&expr, &env).await;
+        if let Some((before, saved)) = snapshot {
+            if self.interp().det_replay_cursor() != Some(before) {
+                // The eval consumed a trace event — restore the pre-eval context and
+                // refuse (the value would be a one-off real/desynced result, never sound).
+                self.interp().set_determinism(Some(saved));
+                return (
+                    false,
+                    "<evaluate refused: this expression calls a recorded function \
+                     (it would consume a trace event and desync the replay)>"
+                        .to_string(),
+                );
+            }
+        }
+        match result {
             Ok(v) => (true, format!("{v}")),
             Err(Control::Panic(e)) => (false, e.message),
             Err(_) => (false, "<propagated>".to_string()),

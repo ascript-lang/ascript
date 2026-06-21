@@ -21,6 +21,10 @@ pub enum TestFilter {
     /// `/regex/`: a test matches if the compiled regex finds a match in its name.
     #[cfg(any(feature = "data", feature = "sys"))]
     Regex(regex::Regex),
+    /// REPLAY §4.3: an EXACT-name filter (`name == s`). Not parsed from a CLI string —
+    /// constructed by `test --replay` to run exactly the one recorded test (no regex
+    /// dependency, so it works under `--no-default-features`).
+    Exact(String),
 }
 
 impl TestFilter {
@@ -47,12 +51,20 @@ impl TestFilter {
         Ok(TestFilter::Substring(raw.to_string()))
     }
 
-    /// Does `name` match this filter? Substring → `name.contains`; regex → `is_match`.
+    /// REPLAY §4.3 — an EXACT-name filter for `test --replay` (run exactly one
+    /// recorded test). No regex dependency.
+    pub fn exact(name: &str) -> TestFilter {
+        TestFilter::Exact(name.to_string())
+    }
+
+    /// Does `name` match this filter? Substring → `name.contains`; regex →
+    /// `is_match`; exact → `name == s`.
     pub fn matches(&self, name: &str) -> bool {
         match self {
             TestFilter::Substring(s) => name.contains(s.as_str()),
             #[cfg(any(feature = "data", feature = "sys"))]
             TestFilter::Regex(re) => re.is_match(name),
+            TestFilter::Exact(s) => name == s.as_str(),
         }
     }
 }
@@ -104,6 +116,7 @@ mod tests {
             TestFilter::Substring(s) => assert_eq!(s, "/"),
             #[cfg(any(feature = "data", feature = "sys"))]
             TestFilter::Regex(_) => panic!("a lone '/' must be a substring, not a regex"),
+            TestFilter::Exact(_) => panic!("a lone '/' must be a substring, not exact"),
         }
     }
 }

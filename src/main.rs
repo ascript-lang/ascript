@@ -362,6 +362,9 @@ async fn real_main() -> ExitCode {
             profile_hz,
             profile_format,
             no_cache,
+            record,
+            replay,
+            seed,
             file,
             args,
         } => {
@@ -379,16 +382,55 @@ async fn real_main() -> ExitCode {
                     return ExitCode::from(1);
                 }
             };
+            // REPLAY §4.1: resolve the record/replay mode (clap enforces
+            // `--record`/`--replay` mutual exclusion + `--seed` requires `--record`).
+            let trace_mode = match (record, replay) {
+                (Some(p), None) => ascript::TraceMode::Record {
+                    path: std::path::PathBuf::from(p),
+                    seed,
+                },
+                (None, Some(p)) => ascript::TraceMode::Replay {
+                    path: std::path::PathBuf::from(p),
+                },
+                _ => ascript::TraceMode::Off,
+            };
+            let tracing = !matches!(trace_mode, ascript::TraceMode::Off);
+            // REPLAY §5/§4.1 composition rules (clean errors, not silent precedence):
+            // `--inspect --replay` IS supported — it routes to the DAP server's replay
+            // path (time-travel debugging). `--inspect --record` is NOT (record-debugging
+            // is untested matrix; record by running normally, then `dap --replay`).
+            // `--profile --record|--replay` is a v2 untested matrix.
+            let inspect_replay_path = match &trace_mode {
+                ascript::TraceMode::Replay { path } if inspect => Some(path.clone()),
+                _ => None,
+            };
+            if inspect && matches!(trace_mode, ascript::TraceMode::Record { .. }) {
+                eprintln!(
+                    "error: --inspect with --record is not supported; record by running normally, then debug with `ascript run --inspect --replay <trace> <file>`"
+                );
+                return ExitCode::from(1);
+            }
+            if profile.is_some() && tracing {
+                eprintln!("error: --profile cannot be combined with --record/--replay (v2)");
+                return ExitCode::from(1);
+            }
             // DBG: `--inspect` routes the program to the DAP server (break-on-entry,
             // editor-driven) instead of running it normally. Computed AFTER `compose_caps`
             // so the SAME capability set is enforced under the debugger (review F2 /
             // Gate-0 — no privilege escalation vs a normal run). The `dap` feature owns
             // this; without it, report a clean rebuild hint rather than silently running.
+            // REPLAY §5: under `--replay` the same DAP server runs every debuggee
+            // generation in the strict Replay context + enables `stepBack`.
             if inspect {
                 #[cfg(feature = "dap")]
                 {
                     let program = std::path::PathBuf::from(&file);
-                    return match ascript::dap::run_server(Some(program), args, caps) {
+                    return match ascript::dap::run_server(
+                        Some(program),
+                        args,
+                        caps,
+                        inspect_replay_path,
+                    ) {
                         Ok(code) => ExitCode::from(code as u8),
                         Err(e) => {
                             eprintln!("dap error: {e}");
@@ -398,7 +440,7 @@ async fn real_main() -> ExitCode {
                 }
                 #[cfg(not(feature = "dap"))]
                 {
-                    let _ = (&args, &caps);
+                    let _ = (&args, &caps, &inspect_replay_path);
                     eprintln!(
                         "error: `--inspect` requires the `dap` feature; rebuild with it enabled (it is on by default)"
                     );
@@ -525,15 +567,19 @@ async fn real_main() -> ExitCode {
             // would compile DIFFERENT bytes, but `elide` is a v1-constant cache flag, so
             // routing an elided run through the cache would either stale-hit a non-elided
             // artifact or never hit. Cleanest: an explicit-elide run is uncached.
+            // REPLAY §4.1: record/replay never use the compile cache (the trace context is
+            // installed on a freshly-compiled run, like `--inspect`/`--profile`/`--elide`).
             let no_compile_cache = no_cache
                 || std::env::var("ASCRIPT_NO_COMPILE_CACHE").as_deref() == Ok("1")
-                || elide;
+                || elide
+                || tracing;
             let result = if is_aso {
-                ascript::run_aso_file(path, &args, caps).await
+                ascript::run_aso_file(path, &args, caps, trace_mode).await
             } else if use_tree_walker {
-                ascript::run_file_with_packages(path, &args, packages, caps, elide).await
+                ascript::run_file_with_packages(path, &args, packages, caps, elide, trace_mode).await
             } else if no_compile_cache {
-                ascript::run_file_on_vm_with_packages(path, &args, packages, caps, elide).await
+                ascript::run_file_on_vm_with_packages(path, &args, packages, caps, elide, trace_mode)
+                    .await
             } else {
                 ascript::run_file_on_vm_cached(path, &args, packages, caps, false).await
             };
@@ -861,7 +907,35 @@ async fn real_main() -> ExitCode {
             coverage,
             seed,
             frozen_time,
+            record,
+            replay,
         } => {
+            // REPLAY §4.3: resolve + validate the record/replay composition rules up
+            // front (clean CLI errors, never a panic). `--record`/`--replay` are clap-
+            // exclusive; `--record` additionally refuses `--parallel`/`--watch` (v1).
+            let test_trace = match (record, replay.as_ref()) {
+                (true, _) => {
+                    if parallel.is_some() {
+                        eprintln!(
+                            "error: --record cannot be combined with --parallel \
+                             (per-isolate trace contexts are not supported in v1)"
+                        );
+                        return ExitCode::from(1);
+                    }
+                    if watch {
+                        eprintln!(
+                            "error: --record cannot be combined with --watch \
+                             (unbounded trace accumulation; not supported in v1)"
+                        );
+                        return ExitCode::from(1);
+                    }
+                    ascript::TestTraceMode::Record { seed }
+                }
+                (false, Some(p)) => ascript::TestTraceMode::Replay {
+                    path: std::path::PathBuf::from(p),
+                },
+                (false, None) => ascript::TestTraceMode::Off,
+            };
             // ELIDE §4.6/§5: resolve the elision decision for the (serial) test path.
             // The PARALLEL path runs each file in a worker isolate, which never elides.
             let elide = ascript::elide_enabled(elide_flag, no_elide);
@@ -972,6 +1046,75 @@ async fn real_main() -> ExitCode {
                 None
             };
 
+            // REPLAY §4.3: the `--replay <trace>` path — re-run module load + the one
+            // recorded test under strict Replay, then print the normal pass/fail output.
+            // The trace carries the program path + test name (the CLI `files` are ignored
+            // for replay; a changed test file is a printed warning, not an error).
+            if let ascript::TestTraceMode::Replay { path } = &test_trace {
+                let rep = ascript::run_test_replay(path, packages, caps).await;
+                return match rep {
+                    Ok(summary) => {
+                        for (name, message) in &summary.failures {
+                            println!("FAIL {}: {}{}", name, message, suffix_for(message));
+                        }
+                        summary.print_tally();
+                        if summary.failed > 0 {
+                            ExitCode::from(1)
+                        } else {
+                            ExitCode::SUCCESS
+                        }
+                    }
+                    Err(e) => {
+                        ascript::diagnostics::report(&e);
+                        ExitCode::from(1)
+                    }
+                };
+            }
+            // REPLAY §4.3: the `--record` path — run each FILE under one CliTrace Record
+            // context, slice per-test, auto-save a `P ⧺ S_k` trace for each FAILED test
+            // under `.ascript-traces/`. `--coverage` is ALLOWED (the record path runs on
+            // the tree-walker; coverage is observation-only — recorded effects are the
+            // same), `--parallel`/`--watch` were refused above.
+            if let ascript::TestTraceMode::Record { seed } = test_trace {
+                let rec = ascript::run_tests_record(
+                    &files,
+                    packages,
+                    caps,
+                    update_snapshots,
+                    filter_raw,
+                    seed,
+                )
+                .await;
+                return match rec {
+                    Ok((summary, saved)) => {
+                        for (name, message) in &summary.failures {
+                            println!("FAIL {}: {}{}", name, message, suffix_for(message));
+                        }
+                        summary.print_tally();
+                        for trace in &saved {
+                            println!(
+                                "  trace saved: {} (replay: ascript test --replay {})",
+                                trace.display(),
+                                trace.display()
+                            );
+                        }
+                        if summary.failed > 0 {
+                            ExitCode::from(1)
+                        } else {
+                            ExitCode::SUCCESS
+                        }
+                    }
+                    Err(e) => {
+                        // A module-load failure still wrote its file-level trace inside
+                        // the runner (printed below is the load error). Surface a hint if
+                        // any trace was saved before the error — but the runner returns
+                        // the error without the saved list, so report the error cleanly.
+                        ascript::diagnostics::report(&e);
+                        ExitCode::from(1)
+                    }
+                };
+            }
+
             // DX D2 Task 10: `--watch` re-runs the affected tests on file change (sys-gated,
             // import-graph-scoped). The loop never terminates, so it owns its own printing +
             // exit. `--no-default-features` (no `sys`) reports a clean rebuild hint.
@@ -1069,13 +1212,16 @@ async fn real_main() -> ExitCode {
             ExitCode::SUCCESS
         }
         #[cfg(feature = "dap")]
-        Command::Dap { .. } => {
+        Command::Dap { replay, .. } => {
             // The DAP server is fully synchronous (it spawns the debuggee on its own
-            // thread + runtime); the program comes from the `launch` request. Caps are
-            // `None` (all-granted) here — `ascript dap` takes no CLI sandbox flags; a
-            // sandboxed debug session uses `ascript run --inspect --sandbox <file>`,
-            // which threads its composed CapSet through (review F2).
-            match ascript::dap::run_server(None, Vec::new(), None) {
+            // thread + runtime); the program comes from the `launch` request (or, for
+            // `--replay`, from the trace itself). Caps are `None` (all-granted) here —
+            // `ascript dap` takes no CLI sandbox flags; a sandboxed debug session uses
+            // `ascript run --inspect --sandbox <file>`, which threads its composed CapSet
+            // through (review F2). REPLAY §5: `--replay <trace>` runs every debuggee
+            // generation under the strict Replay context and advertises `supportsStepBack`.
+            let replay = replay.map(std::path::PathBuf::from);
+            match ascript::dap::run_server(None, Vec::new(), None, replay) {
                 Ok(code) => ExitCode::from(code as u8),
                 Err(e) => {
                     eprintln!("dap error: {e}");

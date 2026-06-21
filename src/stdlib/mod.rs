@@ -523,6 +523,181 @@ pub fn required_cap(module: &str, func: &str) -> caps::CapReq {
     }
 }
 
+/// REPLAY §2.5 — the shape of a `Recorded` call's result, telling the trace hook how
+/// to virtualize it. `Plain` (the v1 common case) records the result Value at the
+/// boundary as airlock bytes. `HttpResponse` is the Task-4 handle virtualization (a
+/// recorded HTTP response whose accessor methods are themselves recorded) — defined
+/// here so the `replay_class` table is forward-stable, but the actual handle
+/// virtualization lands in Task 4; in Task 3 an `HttpResponse`-shaped Recorded result
+/// is encoded like any other (a live `HttpResponse` handle is non-sendable, so it hits
+/// the airlock field-path refusal at record time — the documented Task-3 behavior that
+/// Task 4 replaces with real virtualization).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HandleShape {
+    /// Plain-data result — recorded/replayed as airlock-encoded `Value` bytes.
+    Plain,
+    /// REPLAY §2.5 (Task 4) — a virtualized `HttpResponse` handle. Pre-Task-4 this is
+    /// treated as `Plain` by the hook (the live handle fails the airlock check_sendable
+    /// → a loud record-time field-path refusal).
+    HttpResponse,
+}
+
+/// REPLAY §2.2/§8 — the record/replay classification of a stdlib `(module, func)` call.
+/// The trace hook (`call_stdlib`, gated on `trace_active()`) branches on this:
+/// `Recorded` routes through `trace_stdlib_call`; `Refused` is a LOUD Tier-2 in both
+/// record AND replay; `Seamed`/`Harmless` fall through to real dispatch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReplayClass {
+    /// Already routed through the determinism context (clock/RNG/timer/ffi seams);
+    /// events flow WITHOUT the hook. Falls through to dispatch.
+    Seamed,
+    /// Result-boundary record/replay via `DetEvent::StdlibCall` (+ `NativeCall` for the
+    /// §2.5 virtualized handles). The `HandleShape` selects plain-data vs handle
+    /// virtualization.
+    Recorded(HandleShape),
+    /// No determinism seam (live handles / streams / sockets / servers / workers) —
+    /// a LOUD Tier-2 refusal in BOTH record and replay, so a successfully-recorded trace
+    /// is replayable by construction (the user never discovers non-replayability at
+    /// replay time; the FFI pointer-refusal precedent).
+    Refused,
+    /// Pure given inputs (math, string, json, collection ops, …). Runs for real in both
+    /// modes; falls through to dispatch.
+    Harmless,
+}
+
+/// REPLAY §2.2/§8 — the **complete, central** record/replay classification table,
+/// keyed at the `call_stdlib` dispatch root by the dispatch-site `(module, func)`
+/// (e.g. `"net_http"`, NOT `"std/net/http"`). Feature-INDEPENDENT pure data (the
+/// `required_cap` shape), enforced complete by `classification_is_complete`
+/// (`tests/record_replay.rs`): every `STD_MODULES` entry must yield a class, and a new
+/// module trips the test until classified (§8).
+///
+/// **Seamed vs Harmless is cosmetic** — both fall through to real dispatch (the hook
+/// does nothing). What matters for CORRECTNESS is getting `Recorded` and `Refused`
+/// exactly right. Modules whose RNG/clock routes through the det seams (`math.random`,
+/// `uuid`, `crypto` random, `time`/`date` clock, `ffi.call`) are classified at the
+/// coarsest safe granularity — the seam events flow regardless of the hook, so the
+/// whole module is `Seamed`/`Harmless` and the per-function RNG-vs-pure split is
+/// invisible to record/replay.
+pub fn replay_class(module: &str, func: &str) -> ReplayClass {
+    use HandleShape::{HttpResponse, Plain};
+    use ReplayClass::{Harmless, Recorded, Refused, Seamed};
+    match module {
+        // ---- Recorded: effectful, plain-data results recorded at the boundary ---- //
+        // Whole-file fs operations (read/write/stat/readDir/walk/grep/exists/mkdir/
+        // remove/append) return plain data; `os.*` reads (cpuCount/memory/…); env
+        // get/set/all; io stdin reads; net DNS lookups — all plain.
+        "fs" | "env" | "io" | "os" => Recorded(Plain),
+        // net.lookup/lookupOne (DNS) is Recorded plain; net.* has no other dispatch
+        // funcs reaching here that aren't DNS (connect/bind live in net_tcp/udp/ws).
+        "net" => Recorded(Plain),
+        // `process.run` runs to completion → plain `{stdout,stderr,code}`; `process.spawn`
+        // yields a live child handle → Refused (§2.2 per-func).
+        "process" => match func {
+            "spawn" => Refused,
+            _ => Recorded(Plain),
+        },
+        // net_http BUFFERED requests (get/post/put/patch/delete/head/options/request)
+        // are Recorded with the `HttpResponse` shape — their live response handle is
+        // VIRTUALIZED (Task 4): a trace-scoped vid + materialized fields, with accessor
+        // calls recorded as `NativeCall` events. The streaming surfaces are v2 and
+        // Refused (no determinism seam): `sse` mints a live `SseStream`, `cancelToken`
+        // mints a live `CancelHandle` raced against an in-flight request. `{stream:true}`
+        // on an otherwise-Recorded verb is refused at OPTION PARSE inside `call_http_send`
+        // (an EXTRA guard the class table can't express — it's an option, not a func).
+        "net_http" => match func {
+            "sse" | "cancelToken" => Refused,
+            _ => Recorded(HttpResponse),
+        },
+        // workflow.run/resume — JSON-plain result by construction (`is_serializable`).
+        // Its own internal events go to the WORKFLOW log under the workflow-installed
+        // (prev) context; the CLI trace records exactly ONE StdlibCall at the boundary.
+        #[cfg(feature = "workflow")]
+        "workflow" => match func {
+            "run" | "resume" => Recorded(Plain),
+            _ => Harmless,
+        },
+        // archive (BATT B1) is PER-FUNC (Task 9 audit, §8): the DISK funcs
+        // (`tarExtractTo`/`zipExtractTo` WRITE extracted files; `tarCreateFromDir` READS
+        // a directory tree) are fs-shaped — their result is plain data, so they Record
+        // like `fs` and replay WITHOUT touching the disk. The in-memory builders
+        // (`tarWriter`/`tarEntries`/`tarAppend`/gzip/zip-in-memory) are pure → Harmless.
+        #[cfg(feature = "archive")]
+        "archive" => match func {
+            "tarExtractTo" | "zipExtractTo" | "tarCreateFromDir" => Recorded(Plain),
+            _ => Harmless,
+        },
+
+        // ---- Seamed: routed through the determinism context already ---- //
+        // `time.sleep` consumes a recorded `TimerSet` + skips the delay (§0.5);
+        // `time.now`/`monotonic` route through the virtual clock. `date.now` is the
+        // clock seam. But the TIMER funcs `interval`/`debounce`/`throttle` mint a LIVE
+        // `tokio::time::Interval`/sleep-backed handle that BYPASSES the clock seam — under
+        // replay they would real-sleep and the live handle can't be reproduced (Task 9
+        // audit, §8). No virtual-tick seam ships in v1 → Refused (the fs/socket precedent:
+        // a successfully-recorded trace is replayable by construction; a timer-using
+        // program discovers non-replayability AT RECORD, not at replay).
+        "time" => match func {
+            "interval" | "debounce" | "throttle" => Refused,
+            _ => Seamed,
+        },
+        #[cfg(feature = "datetime")]
+        "date" => Seamed,
+        #[cfg(feature = "ffi")]
+        "ffi" => Seamed,
+
+        // ---- Refused: no determinism seam (live handles / streams / sockets) ---- //
+        #[cfg(feature = "net")]
+        "net_tcp" | "net_udp" | "net_ws" | "http_server" => Refused,
+        #[cfg(feature = "net")]
+        "net_unix" => Refused,
+        #[cfg(feature = "sql")]
+        "sqlite" => Refused,
+        #[cfg(feature = "postgres")]
+        "postgres" => Refused,
+        #[cfg(feature = "redis")]
+        "redis" => Refused,
+        #[cfg(feature = "tui")]
+        "tui" => Refused,
+        #[cfg(feature = "ai")]
+        "ai" => Refused,
+        #[cfg(feature = "telemetry")]
+        "telemetry" => Refused,
+        #[cfg(feature = "docker")]
+        "docker" => Refused,
+        #[cfg(feature = "email")]
+        // The SMTP client (send/connect) opens a live socket → Refused; the pure message
+        // builders (message/validateAddress) are Harmless.
+        "email" => match func {
+            "send" | "connect" => Refused,
+            _ => Harmless,
+        },
+        #[cfg(feature = "blob")]
+        "blob" => Refused,
+        #[cfg(feature = "auth")]
+        // oauth drives live token endpoints → Refused; jwt is pure crypto except `jwks`
+        // (a live network fetch) → that one func Refused.
+        "oauth" => Refused,
+        #[cfg(feature = "auth")]
+        "jwt" => match func {
+            "jwks" => Refused,
+            _ => Harmless,
+        },
+        // `caps` reads are Harmless; the IRREVERSIBLE `drop`/`dropAll` mutate cap state
+        // the trace can't see at replay → Refused (the pooled-worker precedent, §2.2).
+        "caps" => match func {
+            "drop" | "dropAll" => Refused,
+            _ => Harmless,
+        },
+
+        // ---- Harmless: pure given inputs; run for real in both modes ---- //
+        // math (RNG routes through the det seam, not the hook), string, json, regex,
+        // schema, sync, lru, events, stream combinators, shared, collections, and every
+        // other pure transform.
+        _ => Harmless,
+    }
+}
+
 impl Interp {
     /// Dispatch a qualified stdlib builtin (`module` = "math", `func` = "abs").
     pub(crate) async fn call_stdlib(
@@ -643,6 +818,61 @@ impl Interp {
                 }
             }
         }
+        // REPLAY §2.2 — the trace hook. Gate-12: `trace_active()` is a `Cell<bool>`
+        // snapshot (mirroring `caps_bits().all_granted()` above) kept in sync by the
+        // single `set_determinism` chokepoint — ONE predictably-not-taken branch on the
+        // default path; no `RefCell` borrow when off. It sits AFTER the cap gate, so a
+        // denied capability under --record/--replay still errors with the CAP message,
+        // never a recorded event.
+        if self.trace_active() {
+            match replay_class(module, func) {
+                ReplayClass::Recorded(shape) => {
+                    return self.trace_stdlib_call(module, func, args, shape, span).await;
+                }
+                ReplayClass::Refused => {
+                    return Err(AsError::at(
+                        format!(
+                            "{}.{} is not supported under --record/--replay (no determinism \
+                             seam; sockets/servers/streams/workers are v2) — see \
+                             docs/tooling/record-replay",
+                            module, func
+                        ),
+                        span,
+                    )
+                    .into());
+                }
+                // Seamed: events flow through the det seams WITHOUT the hook; Harmless:
+                // pure given inputs. Both fall through to real dispatch. After the
+                // dispatch a Seamed call may have set a strict-replay divergence at one of
+                // the det seams (clock/RNG/timer) — raised by `check_divergence` below.
+                ReplayClass::Seamed | ReplayClass::Harmless => {}
+            }
+        }
+        let result = self.dispatch_stdlib(module, func, args, span).await;
+        // REPLAY §7 — raise any strict-replay divergence a Seamed dispatch set at a det
+        // seam (the RAISE Task 1 deferred). Cheap no-op when nothing is pending; only
+        // reached when `trace_active()` (the default path never enters this block — the
+        // branch above already returned for the non-Seamed classes, and a non-trace run
+        // skips the whole hook).
+        if self.trace_active() {
+            self.check_divergence(span)?;
+        }
+        result
+    }
+
+    /// The post-hook stdlib dispatch root: route a qualified `(module, func)` builtin
+    /// call to its native implementation. Extracted from [`Self::call_stdlib`] so BOTH
+    /// the normal fall-through AND the REPLAY trace hook's Record arm
+    /// ([`Self::trace_stdlib_call`]) reach the SAME dispatch (byte-identical behavior; no
+    /// re-spelled logic). The caps gate + the typed-parse pre-passes + the trace hook all
+    /// run in `call_stdlib` BEFORE this is reached.
+    pub(crate) async fn dispatch_stdlib(
+        &self,
+        module: &str,
+        func: &str,
+        args: &[Value],
+        span: Span,
+    ) -> Result<Value, Control> {
         match module {
             #[cfg(feature = "ai")]
             "ai" => self.call_ai(func, args, span).await,
@@ -1025,11 +1255,53 @@ impl Interp {
             // SP9 §3: in deterministic mode do NOT sleep real time — advance the
             // virtual clock by `ms` and record a durable timer; replay/resume then
             // fast-forwards with no real delay. Default mode sleeps for real.
+            //
+            // REPLAY §0.5 (bug fix): in REPLAY mode a bare `time.sleep` must CONSUME the
+            // recorded `TimerSet` at the cursor (advance + `set_now`), mirroring the
+            // `std/workflow` `ctx.sleep` arm — NOT unconditionally APPEND a fresh one.
+            // Appending desynced replay: the recorded `TimerSet` stayed at the cursor, so
+            // the next `ctx.call`/seam read found a non-activity event there and raised a
+            // FALSE "non-determinism" error. On a non-`TimerSet` event at the cursor:
+            //   - Workflow origin keeps today's lenient behavior (crash-point: switch to
+            //     Record + append), so a bare-sleep workflow body is behavior-compatible;
+            //   - strict CliTrace sets a pending divergence (LOUD, raised at the Interp
+            //     chokepoint) and does NOT mutate the clock or the stream.
             if self
                 .with_determinism_mut(|ctx| {
+                    use crate::det::{DetEvent, Mode, Origin};
+                    if ctx.mode == Mode::Replay {
+                        match ctx.events.get(ctx.cursor).cloned() {
+                            Some(DetEvent::TimerSet { wake }) => {
+                                // Consume the recorded durable timer + fast-forward.
+                                ctx.cursor += 1;
+                                ctx.clock.set_now(wake);
+                                return;
+                            }
+                            other => {
+                                if ctx.origin == Origin::CliTrace && ctx.strict {
+                                    // A wrong-kind event (or exhaustion) at the cursor is
+                                    // a strict divergence — record it, leave the stream
+                                    // and clock untouched.
+                                    let at = ctx.cursor;
+                                    match other {
+                                        Some(ev) => ctx.set_divergence_public(
+                                            at,
+                                            "TimerSet",
+                                            crate::det::DeterminismContext::kind_name(&ev),
+                                        ),
+                                        None => ctx.set_exhausted_public(at, "TimerSet"),
+                                    }
+                                    return;
+                                }
+                                // Workflow crash-point: nothing (or a different kind)
+                                // recorded here → switch to Record and append below.
+                                ctx.mode = Mode::Record;
+                            }
+                        }
+                    }
                     ctx.clock.advance(ms);
                     let wake = ctx.clock.now_ms();
-                    let _ = ctx.record_event(crate::det::DetEvent::TimerSet { wake });
+                    let _ = ctx.record_event(DetEvent::TimerSet { wake });
                 })
                 .is_some()
             {

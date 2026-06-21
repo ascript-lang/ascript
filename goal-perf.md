@@ -345,6 +345,18 @@ stated, results are measured.
   I/O at the `call_stdlib` chokepoint (http/fs/process results) vs documenting the seamed
   subset (clock/RNG/FFI) as v1. Zero-cost-when-off inherited from det's INERT default.
   - Spec: `superpowers/specs/2026-06-12-record-replay-design.md` · Plan: `superpowers/plans/2026-06-12-record-replay.md`
+  - **[Task 11 DRAFT — flip 🔒 → ✅ at Task 12 merge, fill `<sha>`]** ✅ **REPLAY — record/replay as a
+    user-facing flagship. MERGED to `main` (`--no-ff`, `<sha>`).** SP9's INERT determinism plumbing made a
+    headline: `run --record/--replay/--seed`, `test --record/--replay` (failed tests auto-save a trace under
+    `.ascript-traces/`), and DAP time-travel (`stepBack`/`reverseContinue` by deterministic re-execution, the
+    rr model). Extended `DetEvent` recording to effectful stdlib at the `call_stdlib` chokepoint behind a
+    `trace_active()` `Cell` (zero-cost-when-off), the answer to the core design question: a complete
+    `replay_class` table (Seamed/Recorded/Refused/Harmless) with a completeness test, airlock outcome encoding
+    (NOT JSON — NUM fidelity), HttpResponse-only handle virtualization, strict CliTrace replay, worker refusal,
+    the hostile-safe `ASTRC` trace format + fuzz target. No grammar/`Value`/opcode change, `ASO_FORMAT_VERSION`
+    29 unchanged, `vm_differential` flag-gated-untouched. Headline: plain→record `sleep_heavy` **56.0×** (real
+    sleeps become virtual), replay skips all real OS effects; spec/tw geomean 3.78× ≥ 2×; `dbg_zero_cost_gate`
+    0.969×.
 
 - ✅ **BATT — backend batteries (T1+T2). MERGED to `main` in 4 phases (`--no-ff`): A auth `fc21c1f`,
   B data `bf13fb3`, C testing `a1c92cf`, D toolbelt `72d5977`. See EXECUTION LOG.** One multi-unit stdlib spec, phased like the
