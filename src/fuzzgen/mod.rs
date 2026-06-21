@@ -56,10 +56,19 @@
 //! map literal (`HashLBrace` was uncounted) or in a LATER statement's real ternary (the scan
 //! didn't stop at a statement keyword).
 //!
+//! EXEC §6.2 ADDED: **async fns + await + `task.gather` + un-awaited cancel-on-drop** (the
+//! scheduling axis). Each `async fn` prints its int param at the top of its body then returns
+//! it; the async statement productions await / gather / drop them. Because BOTH the default
+//! bespoke per-isolate executor AND tokio current-thread drain strictly FIFO, spawn-order
+//! prints are byte-identical across ALL nine engine modes (incl. the tree-walker and the
+//! executor=tokio projection) — the determinism contract holds (NO clock/RNG/race;
+//! `task.race` is deliberately NOT generated, its winner being scheduling-order-sensitive).
+//! This is what makes the executor=tokio differential axis actually exercise scheduling.
+//!
 //! STILL NOT EMITTED (the next breadth follow-up; the differential cannot fuzz what it never
-//! generates): interfaces + structural-`instanceof`; async/await/spawn/workers (deferred —
-//! nondeterministic scheduling, see spec §6); try/recover (the `recover(fn(){…})` carry-forward
-//! bug); generators `fn*`/`yield`.
+//! generates): interfaces + structural-`instanceof`; spawn/workers (cross-isolate
+//! nondeterminism); `task.race` (scheduling-order-sensitive winner, see spec §6); try/recover
+//! (the `recover(fn(){…})` carry-forward bug); generators `fn*`/`yield`.
 //!
 //! SHAPE (Task 5.2) ADDED: **object spread**, **`object.delete` + member-read**, **rest
 //! destructuring** (arrow IIFE), and a **loop-built wide-object** (the demotion driver: inserting
@@ -181,6 +190,13 @@ struct Gen<'a, 'b> {
     scopes: Vec<Scope>,
     /// Top-level functions declared so far (callable from anywhere below).
     fns: Vec<FnSig>,
+    /// EXEC §6.2 — top-level ASYNC functions declared so far. Each prints its first
+    /// argument (an int) at the TOP of its body, then returns it. Calling one returns a
+    /// `future<int>`; the async statement productions `await`/`task.gather` them in a
+    /// FIFO-deterministic way (both the bespoke executor and tokio current-thread are
+    /// strictly FIFO, so spawn-order prints are identical across all engine modes incl.
+    /// the tree-walker). The differential proves bespoke == tokio == every other mode.
+    async_fns: Vec<FnSig>,
     /// Top-level classes declared so far (constructible / `instanceof`-checkable below).
     classes: Vec<ClassSig>,
     /// Top-level enums declared so far (constructible + matchable below).
@@ -207,6 +223,7 @@ impl<'a, 'b> Gen<'a, 'b> {
             out: String::new(),
             scopes: vec![Scope { vars: Vec::new() }],
             fns: Vec::new(),
+            async_fns: Vec::new(),
             classes: Vec::new(),
             enums: Vec::new(),
             counter: 0,
@@ -282,6 +299,8 @@ impl<'a, 'b> Gen<'a, 'b> {
             ("map", "std/map"),
             ("set", "std/set"),
             ("object", "std/object"),
+            // EXEC §6.2 — `task.gather` for the async-fan-out productions.
+            ("task", "std/task"),
         ] {
             let _ = writeln!(self.out, "import * as {alias} from \"{module}\"");
             let _ = alias;
@@ -322,6 +341,22 @@ impl<'a, 'b> Gen<'a, 'b> {
         for _ in 0..n {
             self.stmt(0);
         }
+        // EXEC §6.2 — the async scheduling axis. Emitted AFTER the regular statement loop (and
+        // as dedicated top-level loops, NOT threaded through `stmt()`) so the existing
+        // statement-generation byte consumption — and therefore the committed defer/wide-object
+        // corpus seeds + their coverage tests — are byte-for-byte UNDISTURBED. Async fns are
+        // declared first (so the async statements can await/gather them), then the async
+        // statements. Each async fn prints its int param then returns it → spawn-order prints
+        // are FIFO-deterministic, byte-identical across all nine engine modes. (`task.race` is
+        // never generated — its winner is scheduling-order-sensitive; see the module docs.)
+        let n_async = 1 + self.choice(3); // 1..3 async fns (always ≥1 so the axis fires)
+        for _ in 0..n_async {
+            self.async_fn_decl();
+        }
+        let n_async_stmts = 1 + self.choice(3); // 1..3 async statements (always ≥1)
+        for _ in 0..n_async_stmts {
+            self.async_stmt(0);
+        }
         // Always end with a deterministic print of a fresh expression so EVERY program
         // produces observable output (an empty program would make the differential vacuous).
         let e = self.expr(0);
@@ -361,6 +396,120 @@ impl<'a, 'b> Gen<'a, 'b> {
         // Register AFTER the body so a fn cannot (yet) call itself — keeps recursion
         // bounded by construction (no unbounded self-recursion in generated programs).
         self.fns.push(FnSig { name, arity, prints_arg: false });
+    }
+
+    /// EXEC §6.2 — emit a top-level ASYNC fn `async fn name(p) { print(p); ...; return p }`.
+    ///
+    /// The body is DELIBERATELY simple + deterministic: it prints its single int param at the
+    /// TOP (a scheduling-OBSERVABLE side effect — the print fires in spawn/await order), then
+    /// returns it. A subset (~half) also `await`s a PREVIOUSLY-declared async fn first (the
+    /// nested-spawn-in-spawn shape, §6.2), threading its result into the return so the value
+    /// is still a deterministic int. NO clock/RNG/race — the only observable is the print +
+    /// the returned int, both pure functions of the (FIFO) call order. Both the bespoke
+    /// executor and tokio current-thread drain FIFO, so every engine mode agrees by
+    /// construction.
+    fn async_fn_decl(&mut self) {
+        let name = self.fresh("af");
+        let param = self.fresh("p");
+        let _ = writeln!(self.out, "async fn {name}({param}) {{");
+        self.push_scope();
+        let prev_fn = self.in_fn;
+        let prev_loop = self.in_loop;
+        self.in_fn = true;
+        self.in_loop = false;
+        self.declare(&param, false);
+        // Scheduling-observable: print the param at the top of the body.
+        let _ = writeln!(self.out, "    print({param})");
+        // ~half the time, await a previously-declared async fn (nested spawn-in-spawn). The
+        // callee is registered BEFORE this one (we register at the end), so no self-recursion.
+        let ret = if !self.async_fns.is_empty() && self.flag() {
+            let idx = self.choice(self.async_fns.len() as u32) as usize;
+            let callee = self.async_fns[idx].clone();
+            // Every registered async fn has arity 1 (the single printed int param).
+            let inner_arg = self.int_literal();
+            let v = self.fresh("av");
+            let _ = writeln!(self.out, "    let {v} = await {}({inner_arg})", callee.name);
+            format!("{param} + {v}")
+        } else {
+            param.clone()
+        };
+        let _ = writeln!(self.out, "    return {ret}");
+        self.in_fn = prev_fn;
+        self.in_loop = prev_loop;
+        self.pop_scope();
+        self.out.push_str("}\n");
+        // Register AFTER the body (no self-recursion; only earlier async fns are awaitable).
+        // arity is always 1 (the single printed int param).
+        self.async_fns.push(FnSig {
+            name,
+            arity: 1,
+            prints_arg: true,
+        });
+    }
+
+    /// EXEC §6.2 — an async STATEMENT: one of three FIFO-deterministic scheduling shapes over
+    /// the declared async fns. Each is scheduling-OBSERVABLE (the awaited bodies print in
+    /// spawn order) yet output-DETERMINISTIC (FIFO on both the bespoke executor and tokio
+    /// current-thread → byte-identical across all engine modes incl. the tree-walker).
+    ///
+    /// Shapes:
+    ///   0: sequential `let v = await af(k)` — eager schedule + await; the body's print
+    ///      fires, then the bound int is observable.
+    ///   1: fan-out `let r = await task.gather([af(a), af(b), ...])` — the bodies print in
+    ///      INPUT order (FIFO), the results array is input-ordered; we print `len(r)`
+    ///      (a deterministic int — never the array contents, which are ints anyway).
+    ///   2: un-awaited call (cancel-on-drop) — `af(k)` whose future handle is immediately
+    ///      dropped. The body's print fires BEFORE the first suspension point (these bodies
+    ///      have no suspension before the top print), so the print is deterministically
+    ///      observed; the handle drop cancels nothing observable. A following `print` proves
+    ///      the program continued.
+    fn async_stmt(&mut self, depth: u32) {
+        if self.async_fns.is_empty() {
+            self.print_stmt(depth);
+            return;
+        }
+        match self.choice(3) {
+            // Sequential await.
+            0 => {
+                let idx = self.choice(self.async_fns.len() as u32) as usize;
+                let callee = self.async_fns[idx].clone();
+                let arg = self.int_literal();
+                let v = self.fresh("aw");
+                self.indent(depth);
+                let _ = writeln!(self.out, "let {v} = await {}({})", callee.name, arg);
+                self.declare(&v, true);
+                self.indent(depth);
+                let _ = writeln!(self.out, "print({v})");
+            }
+            // Fan-out gather (input-order deterministic).
+            1 => {
+                let n = 2 + self.choice(3); // 2..4 concurrent calls
+                let mut calls = Vec::new();
+                for _ in 0..n {
+                    let idx = self.choice(self.async_fns.len() as u32) as usize;
+                    let callee = self.async_fns[idx].clone();
+                    let arg = self.int_literal();
+                    calls.push(format!("{}({})", callee.name, arg));
+                }
+                let r = self.fresh("gat");
+                self.indent(depth);
+                let _ = writeln!(self.out, "let {r} = await task.gather([{}])", calls.join(", "));
+                self.declare(&r, true);
+                self.indent(depth);
+                let _ = writeln!(self.out, "print(len({r}))");
+            }
+            // Un-awaited call (cancel-on-drop). The body prints before any suspension, so the
+            // print is deterministically observed; the dropped handle cancels nothing visible.
+            _ => {
+                let idx = self.choice(self.async_fns.len() as u32) as usize;
+                let callee = self.async_fns[idx].clone();
+                let arg = self.int_literal();
+                self.indent(depth);
+                let _ = writeln!(self.out, "{}({})", callee.name, arg);
+                self.indent(depth);
+                let _ = writeln!(self.out, "print({arg})");
+            }
+        }
     }
 
     /// FUZZ Unit 2 — emit a top-level class declaration. The class has one required int

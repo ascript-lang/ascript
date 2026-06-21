@@ -1,13 +1,14 @@
 //! FUZZ Task 7 — the differential program fuzzer (the headline target).
 //!
 //! `arbitrary` bytes → the grammar-aware generator (`ascript::fuzzgen`) → a VALID,
-//! deterministic, run-to-completion AScript program → run on ALL SEVEN engine modes and assert
+//! deterministic, run-to-completion AScript program → run on ALL engine modes and assert
 //! they agree on the deterministic projection. This is the SAME N-way differential
 //! `tests/vm_differential.rs` enforces over a fixed corpus, turned into a continuous
 //! generator-driven oracle:
 //!
 //!   `run(tree-walker, P) == run(specialized-VM, P) == run(generic-VM, P) == run(lane-off, P)
-//!    == run(no-call-fast, P) == run(decoded-forced, P) == run(no-decode, P)`
+//!    == run(no-call-fast, P) == run(decoded-forced, P) == run(no-decode, P)
+//!    == run(executor=tokio, P)`
 //!
 //! compared on `(captured stdout, exit code)` on success or the Tier-2 panic MESSAGE on
 //! failure (the SP1 caret-column offset between front-ends is excluded — message only). ANY
@@ -17,7 +18,9 @@
 //!
 //! LANE §6.1: the lane-off projection (`vm_run_source_no_sync_lane`) is the fourth axis
 //! added by Gate 15 — it proves that the sync-lane burst driver produces byte-identical
-//! results across the entire fuzz input space.
+//! results across the entire fuzz input space. EXEC §6.2: the executor=tokio projection
+//! (`vm_run_source_tokio_exec`) adds the scheduling-identity axis — the bespoke per-isolate
+//! executor (default) must match stock tokio FIFO over every generated async program.
 //!
 //! The generator is reached via `ascript::fuzzgen` — the `fuzz/` crate enables the
 //! `fuzzgen` feature on its `ascript` dep, which exposes `pub mod fuzzgen` (the SAME single
@@ -74,12 +77,13 @@ fuzz_target!(|data: &[u8]| {
     let prog = ascript::fuzzgen::gen_program_from_bytes(data);
     let src = prog.source;
 
-    // Run all seven engine modes on the 512 MB worker stack and project each outcome. The
+    // Run all engine modes on the 512 MB worker stack and project each outcome. The
     // owned `String` is moved into the `Send` closure (no borrow of the libFuzzer buffer
     // crosses). LANE §6.1: the lane-off projection is the fourth axis (Gate 15).
     // CALL §8.1: the no-call-fast projection is the fifth axis (Gate 15).
     // DECODE §8.3: the decoded-forced + no-decode projections are the sixth + seventh axes (Gate 15).
-    // ELIDE §6.2 (Gate 15): the eighth axis. The elide-ON modes recompute the
+    // EXEC §6.2 (Gate 15): the executor=tokio projection is the eighth axis (scheduling identity).
+    // ELIDE §6.2 (Gate 15): the ninth axis. The elide-ON modes recompute the
     // ElisionSet from THIS generated source (`elision_proofs`), compile+run with
     // proven contract checks removed, and must stay byte-identical to the
     // elide-OFF modes — the cross-axis soundness proof. A divergence is a Phase-1
@@ -96,7 +100,7 @@ fuzz_target!(|data: &[u8]| {
     let junk: Vec<u8> = data.iter().rev().copied().collect();
 
     #[allow(clippy::type_complexity)]
-    let (tw, vm, gen, nolane, nocf, decfwd, nodec, spec_elided, gen_elided, tw_elided, seeded) =
+    let (tw, vm, gen, nolane, nocf, decfwd, nodec, tokexec, spec_elided, gen_elided, tw_elided, seeded) =
         ascript::run_on_worker_stack({
             let src = src.clone();
             let junk = junk.clone();
@@ -111,6 +115,10 @@ fuzz_target!(|data: &[u8]| {
                 // DECODE §8.3: decoded-forced (threshold 0) + no-decode must be byte-identical.
                 let decfwd = project(ascript::vm_run_source_decoded_forced(&src).await);
                 let nodec = project(ascript::vm_run_source_no_decode(&src).await);
+                // EXEC §6.2: executor=tokio (bespoke driver OFF) must be byte-identical —
+                // the bespoke executor must match stock tokio FIFO over the generated async
+                // constructs (a scheduling-identity bug surfaces as a divergence here).
+                let tokexec = project(ascript::vm_run_source_tokio_exec(&src).await);
                 // ELIDE §6.2: elide-on axis (spec-VM, generic-VM, tree-walker-marked).
                 let spec_elided = project(ascript::vm_run_source_elided(&src).await);
                 let gen_elided = project(ascript::vm_run_source_elided_generic(&src).await);
@@ -124,13 +132,13 @@ fuzz_target!(|data: &[u8]| {
                 let seeded =
                     project(ascript::pgo_adversarial_run_from_source(&src, &junk).await);
                 (
-                    tw, vm, gen, nolane, nocf, decfwd, nodec, spec_elided, gen_elided, tw_elided,
-                    seeded,
+                    tw, vm, gen, nolane, nocf, decfwd, nodec, tokexec, spec_elided, gen_elided,
+                    tw_elided, seeded,
                 )
             }
         });
 
-    // THE ORACLE: all seven must agree. A panic here is a libFuzzer crash carrying a ready
+    // THE ORACLE: all modes must agree. A panic here is a libFuzzer crash carrying a ready
     // reproducer. Fix the ENGINE, never relax this assertion (Gate 0).
     assert_eq!(
         tw, vm,
@@ -159,6 +167,13 @@ fuzz_target!(|data: &[u8]| {
     assert_eq!(
         tw, nodec,
         "no-decode VM diverged from tree-walker\n--- program ---\n{src}\n--- tw: {tw:?}\n--- nodec: {nodec:?}"
+    );
+    // EXEC §6.2 / Gate 15: executor=tokio must be byte-identical to tree-walker — the
+    // bespoke executor must match stock tokio FIFO over the entire fuzz input space (incl.
+    // the async constructs the generator now emits). A divergence is a scheduling-identity bug.
+    assert_eq!(
+        tw, tokexec,
+        "executor=tokio VM diverged from tree-walker (a scheduling-identity bug)\n--- program ---\n{src}\n--- tw: {tw:?}\n--- tokexec: {tokexec:?}"
     );
     // ELIDE §6.2 / Gate 15 — the elide axis + cross-axis soundness proof.
     //   (1) WITHIN-AXIS (elide-on): spec-elided == generic-elided, and the

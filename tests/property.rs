@@ -42,12 +42,14 @@ fn project(r: Result<(String, Option<i32>), ascript::error::AsError>) -> Outcome
     }
 }
 
-/// The eight engine projections for one program: tree-walker, specialized-VM (lane-on),
+/// The nine engine projections for one program: tree-walker, specialized-VM (lane-on),
 /// generic-VM, `.aso` round-trip, specialized-VM (lane-off), specialized-VM
-/// (no-call-fast), specialized-VM (decoded-forced), and specialized-VM (no-decode).
+/// (no-call-fast), specialized-VM (decoded-forced), specialized-VM (no-decode), and
+/// specialized-VM (executor=tokio).
 /// LANE §6.1 adds the lane-off axis; CALL §8.1 adds the no-call-fast axis; DECODE §8.3
-/// (Gate 15) adds the decoded-forced + no-decode axes so the proptest properties
-/// exercise all eight modes on every generated program.
+/// (Gate 15) adds the decoded-forced + no-decode axes; EXEC §6.2 (Gate 15) adds the
+/// executor=tokio axis so the proptest properties exercise all nine modes on every
+/// generated program (incl. the async constructs the fuzzgen now emits).
 ///
 /// (Type name kept as `FourWay` for minimal diff; the tuple has grown with each spec.)
 type FourWay = (
@@ -59,18 +61,19 @@ type FourWay = (
     Outcome,
     Outcome,
     Outcome,
+    Outcome,
 );
 
-/// Run `src` on all eight engines (+ the `.aso` round-trip + lane-off + no-call-fast +
-/// decoded-forced + no-decode) on the worker stack and return their projected outcomes.
-/// Spawns ONE 512 MB worker thread per call — fine for a single program; for many
-/// programs prefer [`run_all_engines_batch`] to amortize the spawn.
+/// Run `src` on all nine engines (+ the `.aso` round-trip + lane-off + no-call-fast +
+/// decoded-forced + no-decode + executor=tokio) on the worker stack and return their
+/// projected outcomes. Spawns ONE 512 MB worker thread per call — fine for a single
+/// program; for many programs prefer [`run_all_engines_batch`] to amortize the spawn.
 fn run_all_engines(src: &str) -> FourWay {
     let src = src.to_string();
     ascript::run_on_worker_stack(move || async move { run_four_way(&src).await })
 }
 
-/// The async core: run `src` on all eight modes and project each outcome. Must be called
+/// The async core: run `src` on all nine modes and project each outcome. Must be called
 /// on the worker stack (the engines are `!Send` current-thread tokio with deep recursion).
 async fn run_four_way(src: &str) -> FourWay {
     let tw = project(ascript::run_source_exit(src).await);
@@ -85,7 +88,11 @@ async fn run_four_way(src: &str) -> FourWay {
     // byte-identical to all other modes — generated programs are checked decoded==byte.
     let decfwd = project(ascript::vm_run_source_decoded_forced(src).await);
     let nodec = project(ascript::vm_run_source_no_decode(src).await);
-    (tw, vm, gen, aso, nolane, nocf, decfwd, nodec)
+    // EXEC §6.2 (Gate 15): executor=tokio (bespoke driver OFF) must be byte-identical
+    // — proves the bespoke executor matches stock tokio FIFO over the async constructs
+    // the generator now emits.
+    let tokexec = project(ascript::vm_run_source_tokio_exec(src).await);
+    (tw, vm, gen, aso, nolane, nocf, decfwd, nodec, tokexec)
 }
 
 /// Run a BATCH of programs through all five modes inside a SINGLE worker-stack thread,
@@ -140,7 +147,7 @@ proptest! {
     #[test]
     fn three_way_differential_over_generated_programs(bytes in prop::collection::vec(any::<u8>(), 64..768)) {
         let prog = fuzzgen::gen_program_from_bytes(&bytes);
-        let (tw, vm, gen, aso, nolane, nocf, decfwd, nodec) = run_all_engines(&prog.source);
+        let (tw, vm, gen, aso, nolane, nocf, decfwd, nodec, tokexec) = run_all_engines(&prog.source);
         prop_assert_eq!(
             &tw, &vm,
             "specialized-VM diverged from tree-walker\n--- program ---\n{}\n--- tw: {:?}\n--- vm: {:?}",
@@ -179,6 +186,14 @@ proptest! {
             "no-decode VM diverged from tree-walker\n--- program ---\n{}\n--- tw: {:?}\n--- nodec: {:?}",
             prog.source, tw, nodec
         );
+        // EXEC §6.2 (Gate 15): executor=tokio must be byte-identical to all other modes
+        // — proves the bespoke executor matches stock tokio FIFO over the generated async
+        // constructs (a real scheduling-identity bug surfaces here).
+        prop_assert_eq!(
+            &tw, &tokexec,
+            "executor=tokio VM diverged from tree-walker (a scheduling-identity bug)\n--- program ---\n{}\n--- tw: {:?}\n--- tokexec: {:?}",
+            prog.source, tw, tokexec
+        );
     }
 
     /// Expression-granularity differential: `print(<generated expr>)` agrees seven-way
@@ -189,7 +204,7 @@ proptest! {
     fn three_way_differential_over_generated_expressions(bytes in prop::collection::vec(any::<u8>(), 32..512)) {
         let mut u = arbitrary_unstructured(&bytes);
         let prog = fuzzgen::gen_expr_program(&mut u);
-        let (tw, vm, gen, _aso, nolane, nocf, decfwd, nodec) = run_all_engines(&prog.source);
+        let (tw, vm, gen, _aso, nolane, nocf, decfwd, nodec, tokexec) = run_all_engines(&prog.source);
         prop_assert_eq!(&tw, &vm, "expr specialized-VM divergence\n{}\ntw {:?}\nvm {:?}", prog.source, tw, vm);
         prop_assert_eq!(&tw, &gen, "expr generic-VM divergence\n{}\ntw {:?}\ngen {:?}", prog.source, tw, gen);
         // LANE §6.1: lane-off must be byte-identical.
@@ -199,6 +214,8 @@ proptest! {
         // DECODE §8.3 (Gate 15): decoded-forced + no-decode must be byte-identical.
         prop_assert_eq!(&tw, &decfwd, "expr decoded-forced divergence (DECODE bug)\n{}\ntw {:?}\ndecfwd {:?}", prog.source, tw, decfwd);
         prop_assert_eq!(&tw, &nodec, "expr no-decode divergence\n{}\ntw {:?}\nnodec {:?}", prog.source, tw, nodec);
+        // EXEC §6.2 (Gate 15): executor=tokio must be byte-identical.
+        prop_assert_eq!(&tw, &tokexec, "expr executor=tokio divergence\n{}\ntw {:?}\ntokexec {:?}", prog.source, tw, tokexec);
     }
 }
 
@@ -375,7 +392,7 @@ fn three_way_differential_fixed_seed_battery() {
         })
         .collect();
     let results = run_all_engines_batch(progs.clone());
-    for (seed, ((tw, vm, gen, aso, nolane, nocf, decfwd, nodec), src)) in
+    for (seed, ((tw, vm, gen, aso, nolane, nocf, decfwd, nodec, tokexec), src)) in
         results.iter().zip(progs.iter()).enumerate()
     {
         assert_eq!(
@@ -408,6 +425,11 @@ fn three_way_differential_fixed_seed_battery() {
         assert_eq!(
             tw, nodec,
             "FIXED-seed {seed}: no-decode divergence\n--- program ---\n{src}"
+        );
+        // EXEC §6.2 (Gate 15): executor=tokio must be byte-identical.
+        assert_eq!(
+            tw, tokexec,
+            "FIXED-seed {seed}: executor=tokio divergence (a scheduling-identity bug)\n--- program ---\n{src}"
         );
     }
 }
@@ -442,7 +464,7 @@ fn defer_coverage_assertion_gate15() {
     let results = run_all_engines_batch(progs.clone());
     // Confirm no divergences (the defer axis must not introduce a bug; also checks
     // lane-off/nocf/decoded-forced/no-decode).
-    for (seed, ((tw, vm, gen, aso, nolane, nocf, decfwd, nodec), src)) in
+    for (seed, ((tw, vm, gen, aso, nolane, nocf, decfwd, nodec, tokexec), src)) in
         results.iter().zip(progs.iter()).enumerate()
     {
         assert_eq!(
@@ -475,6 +497,11 @@ fn defer_coverage_assertion_gate15() {
         assert_eq!(
             tw, nodec,
             "Gate15 seed {seed}: no-decode divergence\n--- program ---\n{src}"
+        );
+        // EXEC §6.2 (Gate 15): executor=tokio must be byte-identical.
+        assert_eq!(
+            tw, tokexec,
+            "Gate15 seed {seed}: executor=tokio divergence (a scheduling-identity bug)\n--- program ---\n{src}"
         );
     }
 
@@ -596,7 +623,7 @@ fn stress_differential_many_seeds() {
             })
             .collect();
         let results = run_all_engines_batch(progs.clone());
-        for (i, ((tw, vm, gen, aso, nolane, nocf, decfwd, nodec), src)) in
+        for (i, ((tw, vm, gen, aso, nolane, nocf, decfwd, nodec, tokexec), src)) in
             results.iter().zip(progs.iter()).enumerate()
         {
             let seed = start + i as u64;
@@ -631,10 +658,15 @@ fn stress_differential_many_seeds() {
                 diverged += 1;
                 eprintln!("DIVERGENCE seed {seed} no-decode\ntw {tw:?}\nnodec {nodec:?}\n--- src ---\n{src}\n");
             }
+            // EXEC §6.2 (Gate 15): executor=tokio must be byte-identical.
+            if tw != tokexec {
+                diverged += 1;
+                eprintln!("DIVERGENCE seed {seed} executor=tokio (scheduling-identity bug)\ntw {tw:?}\ntokexec {tokexec:?}\n--- src ---\n{src}\n");
+            }
         }
         start = end;
     }
-    assert_eq!(diverged, 0, "{diverged} eight-way divergences over {n} seeds (see stderr)");
+    assert_eq!(diverged, 0, "{diverged} nine-way divergences over {n} seeds (see stderr)");
 }
 
 // ===========================================================================
@@ -659,11 +691,12 @@ print(a * b)
 
 #[test]
 fn decimal_multiply_overflow_is_recoverable_not_a_process_abort() {
-    // All eight engine modes must agree AND must produce a clean Tier-2 panic
+    // All nine engine modes must agree AND must produce a clean Tier-2 panic
     // (an `Outcome::Panic`, projected from `AsError`) — NOT abort the worker.
     // Before the fix this test never returns: the rust_decimal `panic!` unwinds
     // the worker thread and aborts the run.
-    let (tw, vm, gen, aso, nolane, nocf, decfwd, nodec) = run_all_engines(DECIMAL_OVERFLOW_SRC);
+    let (tw, vm, gen, aso, nolane, nocf, decfwd, nodec, tokexec) =
+        run_all_engines(DECIMAL_OVERFLOW_SRC);
     for (label, out) in [
         ("tree-walker", &tw),
         ("specialized-VM", &vm),
@@ -673,6 +706,7 @@ fn decimal_multiply_overflow_is_recoverable_not_a_process_abort() {
         ("no-call-fast", &nocf),
         ("decoded-forced", &decfwd),
         ("no-decode", &nodec),
+        ("executor=tokio", &tokexec),
     ] {
         match out {
             Outcome::Panic { message } => assert!(
@@ -692,6 +726,7 @@ fn decimal_multiply_overflow_is_recoverable_not_a_process_abort() {
     assert_eq!(tw, nocf, "decimal overflow: tree-walker vs no-call-fast");
     assert_eq!(tw, decfwd, "decimal overflow: tree-walker vs decoded-forced");
     assert_eq!(tw, nodec, "decimal overflow: tree-walker vs no-decode");
+    assert_eq!(tw, tokexec, "decimal overflow: tree-walker vs executor=tokio");
 }
 
 // ===========================================================================
@@ -728,13 +763,14 @@ fn saboteur_self_test_harness_can_fail() {
     let prog = fuzzgen::gen_program_from_bytes(&bytes);
 
     // OFF (default): the real engines agree — the harness reports NO divergence.
-    let (tw, vm, gen, _aso, nolane, nocf, decfwd, nodec) = run_all_engines(&prog.source);
+    let (tw, vm, gen, _aso, nolane, nocf, decfwd, nodec, tokexec) = run_all_engines(&prog.source);
     assert_eq!(tw, vm, "saboteur OFF: real engines must agree (else a real bug)");
     assert_eq!(tw, gen, "saboteur OFF: real engines must agree (else a real bug)");
     assert_eq!(tw, nolane, "saboteur OFF: lane-off must agree with tree-walker (else a real bug)");
     assert_eq!(tw, nocf, "saboteur OFF: no-call-fast must agree with tree-walker (else a real bug)");
     assert_eq!(tw, decfwd, "saboteur OFF: decoded-forced must agree with tree-walker (else a real bug)");
     assert_eq!(tw, nodec, "saboteur OFF: no-decode must agree with tree-walker (else a real bug)");
+    assert_eq!(tw, tokexec, "saboteur OFF: executor=tokio must agree with tree-walker (else a real bug)");
 
     // ON: the saboteur engine MUST be flagged as divergent by the same comparison the
     // differential uses. If this assertion ever fails, the harness's divergence detection
@@ -1733,6 +1769,50 @@ fn differential_defer_in_branch_seed_is_present_and_current() {
         nested_defer,
         "ex_defer_in_branch must still generate a NESTED (in-branch/loop) defer — \
          the verifier-stressing shape (generator drift?)"
+    );
+}
+
+// ===========================================================================
+// EXEC §6.2 — the async-generation coverage assertion (anti-false-green)
+// ===========================================================================
+
+/// The executor=tokio differential axis only exercises SCHEDULING if the generator
+/// actually EMITS async constructs. A generator that silently stopped emitting `async fn` /
+/// `await` / `task.gather` would make the executor axis vacuous (every program is sync, so
+/// the bespoke executor never drives a task) while every byte-identity check still passes.
+/// This test sweeps a batch of seeds and asserts the async constructs appear with
+/// non-trivial frequency — so a regression that drops async generation trips HERE, not
+/// silently. Mirrors the SHAPE slab/dict/demote and DEFER push/drain coverage assertions.
+#[test]
+fn fuzzgen_actually_emits_async_constructs() {
+    let mut async_fn = 0usize;
+    let mut awaited = 0usize;
+    let mut gathered = 0usize;
+    let mut n = 0usize;
+    for seed in 0..200u64 {
+        let bytes = seed_bytes(seed.wrapping_mul(0x9E3779B97F4A7C15), 512);
+        let src = fuzzgen::gen_program_from_bytes(&bytes).source;
+        if src.contains("async fn ") {
+            async_fn += 1;
+        }
+        if src.contains("await ") {
+            awaited += 1;
+        }
+        if src.contains("task.gather(") {
+            gathered += 1;
+        }
+        n += 1;
+    }
+    println!(
+        "fuzzgen async coverage over {n} seeds: async_fn={async_fn} awaited={awaited} gathered={gathered}"
+    );
+    // Every program emits ≥1 async fn (the generator always declares ≥1) and ≥1 async
+    // statement; at least SOME exercise await and a gather fan-out.
+    assert!(async_fn > 0, "the generator never emitted an `async fn` — the EXEC async axis is dark");
+    assert!(awaited > 0, "the generator never emitted an `await` — the executor axis is vacuous");
+    assert!(
+        gathered > 0,
+        "the generator never emitted a `task.gather` fan-out — the FIFO fan-out shape is dark"
     );
 }
 

@@ -287,7 +287,9 @@ dependencies = [
  "clap",
  "cstree",
  "gcmodule",
+ "getrandom 0.2.17",
  "indexmap",
+ "js-sys",
  "num_cpus",
  "rust_decimal",
  "rustc-hash",
@@ -298,6 +300,8 @@ dependencies = [
  "tokio",
  "toml",
  "ungrammar",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
 ]
 
 [[package]]

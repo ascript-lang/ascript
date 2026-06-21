@@ -244,6 +244,16 @@ async fn assert_vm_run_matches_treewalker(src: &str) {
         tw, lane_off_out,
         "lane-off VM diverged from tree-walker for `{src}`\n  tree-walker:  {tw:?}\n  lane-off vm: {lane_off_out:?}"
     );
+    // EXEC §6.2 (Gate 15): the bespoke executor (default, lane-on `vm_out`) must be
+    // byte-identical to the SAME program driven on stock tokio (`ASCRIPT_EXECUTOR=tokio`
+    // projection). A divergence is a real scheduling-identity bug in the bespoke executor.
+    let (tokexec_out, tokexec_code) =
+        ascript::vm_run_source_tokio_exec(src).await.expect("executor=tokio ok");
+    assert_eq!(tokexec_code, None, "no exit code expected (executor=tokio) for `{src}`");
+    assert_eq!(
+        vm_out, tokexec_out,
+        "executor=tokio VM diverged from bespoke executor for `{src}`\n  bespoke:        {vm_out:?}\n  executor=tokio: {tokexec_out:?}"
+    );
 }
 
 #[tokio::test]
@@ -1347,6 +1357,19 @@ async fn vm_run_whole_corpus_matches_treewalker() {
             "no-decode VM diverged from tree-walker for example `{rel}`\n  tree-walker: {tw:?}\n  no-decode:   {nodec:?}"
         );
 
+        // EXEC §6.2 (Gate 15): the executor=tokio projection. The SAME program with
+        // the bespoke executor FORCED OFF (driven on stock tokio) must be byte-identical
+        // to the tree-walker (and thereby to the bespoke `vm` above). A divergence is a
+        // real scheduling-identity bug — the bespoke executor must observably match tokio
+        // current-thread (both FIFO) over the whole corpus.
+        let tokexec = ascript::vm_run_source_tokio_exec(&src)
+            .await
+            .unwrap_or_else(|e| panic!("executor=tokio VM failed on non-skipped {rel}: {e:?}"));
+        assert_eq!(
+            tw, tokexec,
+            "executor=tokio VM diverged from tree-walker for example `{rel}` — a scheduling-identity bug\n  tree-walker:    {tw:?}\n  executor=tokio: {tokexec:?}"
+        );
+
         // WARM B §5-B(a) (Gate 15): the SEEDED PGO mode. Build a single-module archive
         // from this corpus program, record a profile by running it once (training), then
         // re-load SEEDED (the side tables pre-warmed behind their existing guards) and run.
@@ -1431,10 +1454,187 @@ async fn vm_run_whole_corpus_matches_treewalker() {
     );
     eprintln!(
         "whole-corpus gate: {ran} examples byte-identical (all also verified lane-off + \
-         decoded-forced + no-decode + seeded-PGO + ELIDE elide-on three-mode + \
+         decoded-forced + no-decode + executor=tokio + seeded-PGO + ELIDE elide-on three-mode + \
          elide-on==elide-off cross-axis), {skipped} skipped, {feature_skipped} \
          feature-skipped (modules unavailable in this build)"
     );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  EXEC §6.2 (Gate 15) — THE SCHEDULING-SENSITIVE BATTERY.
+//
+//  The bespoke per-isolate executor (the default task driver) and stock tokio
+//  current-thread are BOTH strictly FIFO, so a program whose output is determined
+//  by spawn/await ORDER must observe the SAME interleaving on both — and on the
+//  tree-walker (which shares the same M17 eager-schedule + structured-concurrency
+//  model). Each program below prints in a scheduling-OBSERVABLE way and is
+//  DETERMINISTIC by construction (no clock/RNG/race-winner nondeterminism). All
+//  three projections — bespoke (`vm_run_source`), executor=tokio
+//  (`vm_run_source_tokio_exec`), tree-walker (`run_source_exit`) — must agree.
+//
+//  A divergence here is a REAL executor scheduling bug (the bespoke driver does not
+//  match tokio's FIFO order, or a spawn site was missed) — STOP and fix the
+//  executor, NEVER weaken this test.
+// ─────────────────────────────────────────────────────────────────────────────
+#[tokio::test]
+async fn executor_scheduling_battery() {
+    // Each program: deterministic, scheduling-observable, FIFO-stable.
+    let programs: &[&str] = &[
+        // (1) spawn-order prints: three async fns each print their id; awaited in
+        // order via task.gather. FIFO ⇒ "run 1 / run 2 / run 3" then the result.
+        "import * as task from \"std/task\"\n\
+         async fn a(id) { print(`run ${id}`); return id }\n\
+         let r = await task.gather([a(1), a(2), a(3)])\n\
+         print(r)",
+        // (2) un-awaited side effect (cancel-on-drop): the body runs to its print
+        // (eager schedule) before the handle is dropped; "after" follows. The body
+        // ran-to-print deterministically (no suspension before the print).
+        "async fn side(id) { print(`side ${id}`); return id }\n\
+         side(7)\n\
+         print(\"after\")",
+        // (3) await-after-spawn: eager-scheduled body, an intervening print, then
+        // await. Observe the body ran and the value is the awaited result.
+        "async fn body(x) { print(`body ${x}`); return x + 1 }\n\
+         let h = body(10)\n\
+         print(\"between\")\n\
+         print(await h)",
+        // (4) nested spawn-in-spawn: an async fn awaiting another async fn.
+        "async fn inner(x) { return x * 2 }\n\
+         async fn outer(x) { let v = await inner(x); return v + 1 }\n\
+         print(await outer(5))",
+        // (5) gather over mixed return types → input-ORDER results array.
+        "import * as task from \"std/task\"\n\
+         async fn f1() { return \"a\" }\n\
+         async fn f2() { return 2 }\n\
+         async fn f3() { return true }\n\
+         print(await task.gather([f1(), f2(), f3()]))",
+        // (6) async method + static async method (the engine's method spawn sites).
+        "class Box {\n\
+           v: int\n\
+           fn init(v) { self.v = v }\n\
+           async fn get() { return self.v * 2 }\n\
+           static async fn make(n) { return n + 100 }\n\
+         }\n\
+         let b = Box(5)\n\
+         print(await b.get())\n\
+         print(await Box.make(7))",
+        // (7) a generator (fn*). S9: generators are consumer-driven and NEVER touch
+        // the executor — they must still match across all three projections.
+        "fn* squares(n) { for (i in range(0, n)) { yield i * i } }\n\
+         let total = 0\n\
+         for await (x in squares(5)) { total = total + x }\n\
+         print(total)\n\
+         print(squares(3).next())",
+        // (8) chained awaits + a gather of awaited results — a longer FIFO chain
+        // mixing sequential `await` and a fan-out gather (all spawn-order prints).
+        "import * as task from \"std/task\"\n\
+         async fn step(label, n) { print(`step ${label}`); return n }\n\
+         let r1 = await step(\"one\", 1)\n\
+         let r2 = await step(\"two\", 2)\n\
+         let both = await task.gather([step(\"three\", 3), step(\"four\", 4)])\n\
+         print([r1, r2])\n\
+         print(both)",
+        // (Deliberately OMITTED: a `task.race` case. The winner over a pending-vs-
+        // resolved pair could differ across drivers if either is not strictly FIFO
+        // — a flaky test is worse than no test. Race is covered indirectly by the
+        // whole-corpus gate over `concurrency.as`, whose margins are 100×-wide.)
+    ];
+    for src in programs {
+        let bespoke = ascript::vm_run_source(src).await.expect("bespoke executor ok");
+        let tokexec = ascript::vm_run_source_tokio_exec(src)
+            .await
+            .expect("executor=tokio ok");
+        let tw = ascript::run_source_exit(src).await.expect("tree-walker ok");
+        assert_eq!(
+            bespoke, tokexec,
+            "scheduling battery: bespoke executor diverged from executor=tokio\n  src: {src}\n  bespoke: {bespoke:?}\n  tokio:   {tokexec:?}"
+        );
+        assert_eq!(
+            bespoke, tw,
+            "scheduling battery: bespoke executor diverged from tree-walker\n  src: {src}\n  bespoke:     {bespoke:?}\n  tree-walker: {tw:?}"
+        );
+    }
+    eprintln!(
+        "executor scheduling battery: {} deterministic order-observing programs, \
+         bespoke == executor=tokio == tree-walker on all",
+        programs.len()
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  EXEC §6.5 (Gate 15) — THE EXECUTOR COVERAGE ASSERTION (anti-false-green).
+//
+//  The executor=tokio axis only proves something if the bespoke executor ACTUALLY
+//  DROVE tasks on the default path — a default path that silently fell through to
+//  tokio would pass every byte-identity check (tokio == tokio) while the bespoke
+//  `Core` never spun. `vm_run_source_exec_stats` returns the bespoke
+//  `Core::spawned_total()` captured after the drain; this test asserts it is
+//  non-trivial over async programs (and ≥ 10k on a focused stress program), so a
+//  regression that dark-fails the executor trips here even though the differential
+//  still holds. The executor=tokio side is proven to genuinely switch drivers by
+//  the scheduling battery above (identical OUTPUT, NOT a tokio spawned_total).
+// ─────────────────────────────────────────────────────────────────────────────
+#[tokio::test]
+async fn executor_coverage_assertion() {
+    // Aggregate spawned_total over a few representative async programs. Each spawns
+    // ≥1 bespoke task (the async-fn body), so the sum is strictly positive — a
+    // dark executor (fell through to tokio) would read 0 here.
+    let async_programs: &[&str] = &[
+        "import * as task from \"std/task\"\n\
+         async fn f(x) { return x + 1 }\n\
+         print(await task.gather([f(1), f(2), f(3)]))",
+        "async fn g(x) { return x * 2 }\n\
+         print(await g(21))",
+        "async fn inner(x) { return x }\n\
+         async fn outer(x) { return await inner(x) }\n\
+         print(await outer(9))",
+    ];
+    let mut total: u64 = 0;
+    for src in async_programs {
+        let (_out, _exit, spawned) = ascript::vm_run_source_exec_stats(src)
+            .await
+            .expect("bespoke exec-stats ok");
+        total += spawned;
+    }
+    println!("executor coverage: bespoke Core spawned_total over async programs = {total}");
+    assert!(
+        total > 0,
+        "the bespoke executor spawned 0 tasks across async programs — the default \
+         path is dark (silently fell through to tokio? the seam is unwired?)"
+    );
+
+    // A focused stress program: gather over 10_000 async calls in one shot. Each
+    // call is a bespoke task, so spawned_total must clear the 10k floor. (Awaiting a
+    // gather of 10k handles is the densest spawn shape; the loop body is trivial so
+    // the program stays fast.)
+    let stress = "import * as task from \"std/task\"\n\
+         import * as array from \"std/array\"\n\
+         async fn unit(i) { return i }\n\
+         let handles = []\n\
+         for (i in range(0, 10000)) { array.push(handles, unit(i)) }\n\
+         let r = await task.gather(handles)\n\
+         print(len(r))";
+    let (out, _exit, spawned) = ascript::vm_run_source_exec_stats(stress)
+        .await
+        .expect("bespoke 10k stress ok");
+    println!("executor coverage: 10k-gather spawned_total = {spawned} (output {out:?})");
+    assert_eq!(out, "10000\n", "10k-gather produced the wrong result count");
+    assert!(
+        spawned >= 10_000,
+        "the bespoke executor spawned only {spawned} tasks for a 10k-gather — expected >= 10000"
+    );
+
+    // The executor=tokio side genuinely switches drivers (no bespoke Core installed,
+    // so there is no spawned_total to read). Prove the switch is real by asserting
+    // identical OUTPUT on the same programs (the driver swap is byte-invisible).
+    for src in async_programs {
+        let (bespoke_out, _, _) = ascript::vm_run_source_exec_stats(src).await.expect("bespoke ok");
+        let (tok_out, _) = ascript::vm_run_source_tokio_exec(src).await.expect("tokio ok");
+        assert_eq!(
+            bespoke_out, tok_out,
+            "executor=tokio output diverged from bespoke for an async program\n  src: {src}"
+        );
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
