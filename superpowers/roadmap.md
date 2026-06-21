@@ -861,6 +861,34 @@ Spec `superpowers/specs/2026-06-12-lsp-stdlib-signatures-design.md`, plan
   Examples: stdlib completions, hover, and signature help verified via `tests/lsp.rs` JSON-RPC
   harness. Gate: `tests/std_sigs_docs.rs` + `tests/docs_drift.rs` green (both drift directions).
 
+## EXEC — bespoke single-thread executor ⚖️ BUILT, then PARKED at the ship gate (the FINAL campaign spec — 21/21)
+
+- Spec `superpowers/specs/2026-06-12-vm-executor-design.md`; plan `…/plans/2026-06-12-vm-executor.md`.
+  The campaign's last item and its second honored evidence-park (after REGION's NO-GO).
+- **Build gate OPENED** (Task 0): fresh same-day post-LANE re-profile measured `async_inline`'s
+  async-runtime share at **90.7% ≥ 15%** (`kevent`/reactor-park 88%; `bench/EXEC_GATE.md`) → GO to build.
+- **Built honestly** (Tasks 1–9, subagent-implemented + independently opus-reviewed + controller-verified):
+  `src/exec/` = a `!Send` per-isolate generational-slab + FIFO executor; a Send-safe `std::task::Wake`
+  waker (same-thread fast path via `CURRENT_EXEC` + lock-free mpsc injection, zero `unsafe`, Miri-clean);
+  `JoinHandle`/`AbortHandle` parity with deferred-drop abort (the mid-poll-UB guard); `run_until`/`drain`
+  inside the unchanged `LocalSet` (**Architecture B**) with a tick budget + lost-wakeup re-check; the
+  `exec::spawn_local` seam over EVERY spawn site (engine + worker + all stdlib incl. drifted
+  cron/process/resilience); the `ASCRIPT_EXECUTOR=tokio` permanent kill switch.
+- **Proven SOUND + byte-invisible:** `vm_differential` **448/0** BOTH configs (tree-walker == bespoke ==
+  tokio; the executor=tokio axis + an 8-program scheduling battery the reviewer SABOTEUR-proved catches a
+  FIFO→LIFO flip + a `spawned_total=10000` coverage assertion); property **35/0** both; async-weighted fuzz
+  0 divergences; **no per-spawn leak** (un-awaited-loop @ 1M = 14 MB ≈ tokio — the M17 bar).
+- **Ship gate (§7) → PARK:** requires a ≥10% async-corpus geomean win; measured **0.99x neutral** across 4
+  runs (controller + independent reviewer). Attribution: bespoke `async_inline` ~95% reactor-park, identical
+  to tokio's `kevent` 90.9% — **Architecture B can't eliminate the park** (the executor runs inside tokio's
+  `LocalSet` and returns `Pending` → tokio parks), and `SharedFuture`'s `tokio::sync::Notify` rendezvous was
+  frozen (§8). 11 commits frozen on **`feat/vm-executor`** (UNMERGED, kept like `spike/wasm-target`).
+- **v2-on-evidence** (spec §2.2, §8): Architecture A (own the outer park loop; reach the reactor only when
+  I/O can arrive) + a bespoke same-thread await rendezvous — both out of v1 scope, the substrate now banked.
+- Recorded non-blocking follow-ups: the property/fuzz async axis is weak on ready-queue ordering (the
+  deterministic battery is the effective scheduling-mutation catcher); the fuzzgen can emit a pathologically
+  expensive async unit (a `-timeout`/size bound is the fix). Evidence: `bench/EXEC_RESULTS.md`.
+
 ## WASM — wasm32 target + browser playground ✅ PHASE 3 (playground UI + docs) DONE
 
 - Spec `superpowers/specs/2026-06-12-wasm-target-design.md`; plan

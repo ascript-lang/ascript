@@ -1,11 +1,20 @@
 # AScript Bespoke Single-Thread VM Executor — Design (EXEC)
 
-- **Status:** Draft for review — **EVIDENCE-GATED, not scheduled. Do not implement until the
-  gate opens.** THE GATE: the post-LANE same-session re-profile (`bench/PROFILING_RESULTS.md`,
-  the dated post-LANE section LANE's plan Task 9 produces) shows the **async-runtime share
-  still ≥15% on the async corpus** (`goal-perf.md`, "Evidence-gated"). If the re-profile shows
+- **Status:** **BUILT, then PARKED at the ship gate (EVIDENCE-REJECTED on perf) — 2026-06-21.**
+  The build gate OPENED (post-LANE re-profile: `async_inline` 90.7% async-runtime share ≥ 15%,
+  `bench/EXEC_GATE.md`), so the full Architecture-B executor was built + proven byte-identical
+  (`vm_differential` 448/0 both configs), Miri-clean, and leak-free (Tasks 0–9). But the §7 ship
+  gate (a measured **≥10% async-corpus geomean win**) was NOT met: the A/B is **0.99x (neutral)** —
+  Architecture B parks via tokio's `kevent` exactly as before (~95% reactor-park, == tokio), so the
+  dominant cost is untouched. Per §7 a sub-10% win is a failed gate → PARK with evidence (the JIT/
+  REGION precedent). The 11-commit implementation is frozen on **`feat/vm-executor`** (UNMERGED) as
+  the substrate for the §2.2/§8 v2-on-evidence items (Architecture A + a bespoke `SharedFuture`
+  rendezvous). Verdict + numbers: `bench/EXEC_RESULTS.md`; campaign ledger: `goal-perf.md` EXECUTION
+  LOG. The original evidence-gate text is preserved below for the record.
+  - _(Original gate, now satisfied-then-superseded:)_ THE GATE: the post-LANE same-session re-profile
+  shows the **async-runtime share still ≥15% on the async corpus**. If the re-profile shows
   <15%, this spec is CLOSED with the evidence recorded — that is a legitimate, documented
-  outcome, exactly like the JIT's.
+  outcome, exactly like the JIT's. _(It showed 90.7% → built; the SHIP gate then parked it.)_
 - **Date:** 2026-06-12
 - **Code:** EXEC (the first evidence-gated spec of the PERF campaign — see `goal-perf.md`)
 - **Depends on (HARD gate):** **LANE merged** *and* **its re-profile run** *and* **the ≥15%
