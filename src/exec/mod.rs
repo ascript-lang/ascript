@@ -233,6 +233,19 @@ impl Wake for TaskWaker {
     }
 }
 
+/// The ENTIRE cross-thread soundness of the executor rests on the waker being
+/// `Send + Sync` (cross-thread wakes are real — spawn_blocking, worker channels,
+/// DNS; spec §3.2). `Waker::from(Arc<W>)` already requires `W: Send + Sync`, but
+/// pin it explicitly so a future `!Send`/`!Sync` field added to `TaskWaker` or
+/// `Shared` fails the BUILD here with a clear message rather than silently
+/// regressing the design.
+const _: fn() = || {
+    fn assert_send_sync<T: Send + Sync>() {}
+    assert_send_sync::<TaskWaker>();
+    assert_send_sync::<Shared>();
+    assert_send_sync::<Waker>();
+};
+
 struct TaskCell {
     future: Option<Pin<Box<dyn Future<Output = ()>>>>,
     /// Built once per task.
