@@ -2553,7 +2553,7 @@ impl Interp {
         // on ALL exit paths. Held alive: an owned `Rc<Interp>` so the driver can
         // touch `self.resilience` after the await.
         let interp = self.rc();
-        let driver = tokio::task::spawn_local(async move {
+        let driver = crate::exec::spawn_local(async move {
             // Invoke `fn`, driving a returned future to completion.
             let raw = interp.call_value(user_fn, vec![], span).await;
             let outcome: Result<Value, Control> = match raw {

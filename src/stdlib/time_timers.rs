@@ -32,8 +32,8 @@ use crate::error::AsError;
 use crate::interp::{Control, Interp, ResourceState};
 use crate::span::Span;
 use crate::value::{NativeKind, NativeMethod, OwnedKind, Value, ValueKind};
+use crate::exec::AbortHandle;
 use std::rc::Rc;
-use tokio::task::AbortHandle;
 
 // ── DebounceState ────────────────────────────────────────────────────────────
 
@@ -49,8 +49,8 @@ pub struct DebounceState {
     pub ms: u64,
     /// `AbortHandle` of the currently-pending delayed call, if any.
     ///
-    /// IMPORTANT: a `tokio::task::AbortHandle` does NOT abort on `Drop` — its
-    /// `Drop` is only a refcount decrement, never `remote_abort()`. To actually
+    /// IMPORTANT: a `crate::exec::AbortHandle` (like tokio's) does NOT abort on
+    /// `Drop` — its `Drop` never cancels the task. To actually
     /// cancel the pending task we must call `.abort()` explicitly: each new call
     /// does so before scheduling the next one, and the [`Drop`] impl below does
     /// so when the wrapper itself is dropped — preserving cancel-on-drop.
@@ -265,7 +265,7 @@ impl Interp {
         // call aborts this task via the stored AbortHandle (below), and
         // `DebounceState::Drop` aborts it if the wrapper itself is dropped before
         // the window expires (an AbortHandle's own Drop does NOT abort).
-        let jh = tokio::task::spawn_local(async move {
+        let jh = crate::exec::spawn_local(async move {
             // WASM §5.3.3: route the debounce delay through the platform sleep.
             crate::platform::sleep_ms(ms).await;
             // Calling an `async fn` returns Ok(Value::future(..)) WITHOUT running
@@ -378,7 +378,7 @@ mod tests {
                 let fired = Rc::new(Cell::new(false));
                 let fired_task = fired.clone();
 
-                let jh = tokio::task::spawn_local(async move {
+                let jh = crate::exec::spawn_local(async move {
                     tokio::time::sleep(std::time::Duration::from_millis(30)).await;
                     fired_task.set(true);
                 });

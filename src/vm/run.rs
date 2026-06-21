@@ -5315,7 +5315,7 @@ impl Vm {
                             let telem_parent = crate::interp::telemetry_capture_current();
                             // RESIL §5.1: inherit ambient locals (deadline/trace).
                             let locals_parent = crate::interp::task_locals_capture();
-                            let handle = tokio::task::spawn_local(async move {
+                            let handle = crate::exec::spawn_local(async move {
                                 let _g = guard;
                                 let body =
                                     vm.call_value(Value::closure(callee), args, call_span);
@@ -9900,7 +9900,7 @@ impl Vm {
             let telem_parent = crate::interp::telemetry_capture_current();
             // RESIL §5.1: inherit ambient locals (deadline/trace).
             let locals_parent = crate::interp::task_locals_capture();
-            let handle = tokio::task::spawn_local(async move {
+            let handle = crate::exec::spawn_local(async move {
                 let _g = guard;
                 let body = vm.call_value(Value::closure(closure), args, span);
                 #[cfg(feature = "telemetry")]
@@ -12819,7 +12819,7 @@ mod tests {
         let vm2 = vm.rc();
         let fut = crate::task::SharedFuture::new();
         let cell = fut.cell();
-        let handle = tokio::task::spawn_local(async move {
+        let handle = crate::exec::spawn_local(async move {
             let r = vm2.call_value(closure, args, s()).await;
             cell.resolve(r);
         });

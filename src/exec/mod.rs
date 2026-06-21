@@ -73,7 +73,6 @@
 //! send/recv + same-thread fast path + `Arc`/`AtomicBool` paths) and a native-only
 //! stress set (`cross_thread_wake_storm`, `#[cfg_attr(miri, ignore)]` — too
 //! real-thread-heavy for Miri).
-#![allow(dead_code)]
 
 use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
@@ -86,6 +85,8 @@ use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, Wake, Waker};
 
 /// Matches tokio's event interval; internal tunable, NOT user-visible.
+// P2 consumes this (the `Executor` driver installs + ticks the `Core`).
+#[allow(dead_code)]
 const EXEC_TICK_BUDGET: u32 = 61;
 
 thread_local! {
@@ -102,6 +103,8 @@ thread_local! {
 /// the SAME `Rc<Core>` (pointer-equal) is a harmless idempotent no-op.
 ///
 /// Prefer [`CurrentExecGuard`] (RAII) at call sites; this is the primitive.
+// P2 consumes this (the entry-point install of the per-isolate executor).
+#[allow(dead_code)]
 pub(crate) fn install_current(core: &Rc<Core>) {
     CURRENT_EXEC.with(|slot| {
         let mut slot = slot.borrow_mut();
@@ -117,6 +120,8 @@ pub(crate) fn install_current(core: &Rc<Core>) {
 
 /// Clear the current-thread executor registry. Idempotent (clearing an empty
 /// registry is a no-op).
+// P2 consumes this (via the `CurrentExecGuard` drop at entry-point teardown).
+#[allow(dead_code)]
 pub(crate) fn uninstall_current() {
     CURRENT_EXEC.with(|slot| {
         *slot.borrow_mut() = None;
@@ -125,9 +130,13 @@ pub(crate) fn uninstall_current() {
 
 /// RAII guard: installs `core` on construction, uninstalls on drop. The entry
 /// points (Task 4/5) hold one of these for the lifetime of a `run_until`.
+// P2 consumes this (the entry-point RAII install of the per-isolate executor).
+#[allow(dead_code)]
 pub(crate) struct CurrentExecGuard;
 
 impl CurrentExecGuard {
+    // P2 consumes this (the entry-point RAII install).
+    #[allow(dead_code)]
     pub(crate) fn install(core: &Rc<Core>) -> Self {
         install_current(core);
         CurrentExecGuard
@@ -150,6 +159,8 @@ pub(crate) struct TaskId {
 
 /// Injection variants drained at tick start. `Abort` is wired fully in Task 3;
 /// in Task 1 it only marks the task's `aborted` cell.
+// P2 consumes the payloads (drained only by the installed `Core` tick loop).
+#[allow(dead_code)]
 enum Inject {
     Wake(TaskId),
     Abort(TaskId),
@@ -251,6 +262,8 @@ const _: fn() = || {
     assert_send_sync::<Waker>();
 };
 
+// P2 consumes these fields (read by the installed `Core::poll_one` tick path).
+#[allow(dead_code)]
 struct TaskCell {
     future: Option<Pin<Box<dyn Future<Output = ()>>>>,
     /// Built once per task.
@@ -271,6 +284,8 @@ pub(crate) struct Core {
     tasks: RefCell<Vec<Slot>>,
     free: RefCell<Vec<u32>>,
     ready: RefCell<VecDeque<TaskId>>,
+    // P2 consumes this (drained by the installed `Core::drain_injected` tick path).
+    #[allow(dead_code)]
     injected_rx: Receiver<Inject>,
     shared: Arc<Shared>,
     running: Cell<Option<TaskId>>,
@@ -279,6 +294,8 @@ pub(crate) struct Core {
 }
 
 /// The verdict of one budgeted [`Core::poll_tick`].
+// P2 consumes this (the `Executor` driver branches on it).
+#[allow(dead_code)]
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum TickOutcome {
     /// Ready queue drained but `live > 0`: tasks are parked Pending awaiting an
@@ -293,6 +310,8 @@ pub(crate) enum TickOutcome {
 
 impl Core {
     /// Build the channel pair + `Shared` keyed to the current thread.
+    // P2 consumes this (the installed `Core` tick-driver path).
+    #[allow(dead_code)]
     pub(crate) fn new() -> Rc<Core> {
         let (injected_tx, injected_rx) = std::sync::mpsc::channel();
         let shared = Arc::new(Shared {
@@ -400,6 +419,8 @@ impl Core {
     /// slot's gen matches and its cell is live; `Abort(id)` → mark `aborted` AND
     /// enqueue (gen-checked) so `poll_one` dequeues + `retire`s (drops) it — its
     /// drop guard then resolves the join to `Err(Aborted)` (Task 3).
+    // P2 consumes this (the installed `Core` tick-driver path).
+    #[allow(dead_code)]
     pub(crate) fn drain_injected(&self) {
         while let Ok(msg) = self.injected_rx.try_recv() {
             match msg {
@@ -437,6 +458,8 @@ impl Core {
     }
 
     /// True iff `id` names a live (gen-matching, cell-present) slot.
+    // P2 consumes this (the installed `Core` tick-driver path).
+    #[allow(dead_code)]
     fn slot_is_live(&self, id: TaskId) -> bool {
         let tasks = self.tasks.borrow();
         matches!(tasks.get(id.index as usize), Some(s) if s.gen == id.gen && s.cell.is_some())
@@ -444,6 +467,8 @@ impl Core {
 
     /// Free a slot: drop its cell, bump `gen` (wrapping — this is what makes a
     /// stale `TaskId` fail the dequeue gen-check), push the index on the free list.
+    // P2 consumes this (the installed `Core` tick-driver path).
+    #[allow(dead_code)]
     fn free_slot(&self, index: u32) {
         let mut tasks = self.tasks.borrow_mut();
         if let Some(slot) = tasks.get_mut(index as usize) {
@@ -460,6 +485,8 @@ impl Core {
     /// this call (so [`Core::poll_tick`] counts it against the budget); `false`
     /// for a no-op — an empty queue, or a stale/forged/completed id that the
     /// gen-check silently skipped.
+    // P2 consumes this (the installed `Core` tick-driver path).
+    #[allow(dead_code)]
     fn poll_one(&self) -> bool {
         let id = match self.ready.borrow_mut().pop_front() {
             Some(id) => id,
@@ -561,6 +588,8 @@ impl Core {
     }
 
     /// Drop a live task and reclaim its slot: `live -= 1`, then `free_slot`.
+    // P2 consumes this (the installed `Core` tick-driver path).
+    #[allow(dead_code)]
     fn retire(&self, index: u32) {
         if self.live.get() > 0 {
             self.live.set(self.live.get() - 1);
@@ -570,6 +599,8 @@ impl Core {
 
     /// Drain injected wakes, then poll up to `budget` ready tasks. See
     /// [`TickOutcome`] for the verdict semantics.
+    // P2 consumes this (the installed `Core` tick-driver path).
+    #[allow(dead_code)]
     pub(crate) fn poll_tick(&self, budget: u32) -> TickOutcome {
         self.drain_injected();
 
@@ -594,6 +625,8 @@ impl Core {
     }
 
     /// Total tasks ever inserted (for the later coverage assertion).
+    // P2 consumes this (the installed `Core` tick-driver path).
+    #[allow(dead_code)]
     pub(crate) fn spawned_total(&self) -> u64 {
         self.spawned_total.get()
     }
@@ -626,7 +659,7 @@ impl Core {
 /// or cancel-on-drop). Unit type — the bespoke analogue of tokio's cancelled
 /// `JoinError`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct Aborted;
+pub struct Aborted;
 
 /// Per-task join channel: the output slot + the parked joiner's waker + a
 /// finished flag (for `is_finished()`). `Rc` — every join site is same-thread
@@ -667,7 +700,7 @@ impl<T> JoinState<T> {
 /// The await/abort surface for a spawned task. `!Send` (every call site is
 /// same-thread; spec §5.2). Dropping a `JoinHandle` does NOT abort the task
 /// (tokio parity — cancel-on-drop lives at the higher SharedFuture layer).
-pub(crate) struct JoinHandle<T> {
+pub struct JoinHandle<T> {
     inner: JoinInner<T>,
 }
 
@@ -683,7 +716,7 @@ enum JoinInner<T> {
 
 impl<T> JoinHandle<T> {
     /// A cheap, `Send + Sync` handle that can abort this task from any thread.
-    pub(crate) fn abort_handle(&self) -> AbortHandle {
+    pub fn abort_handle(&self) -> AbortHandle {
         match &self.inner {
             JoinInner::Bespoke { id, shared, .. } => AbortHandle {
                 inner: AbortInner::Bespoke {
@@ -698,12 +731,12 @@ impl<T> JoinHandle<T> {
     }
 
     /// Abort the task (deferred-drop; never drops the future synchronously).
-    pub(crate) fn abort(&self) {
+    pub fn abort(&self) {
         self.abort_handle().abort();
     }
 
     /// True once the task has finished (completed OR resolved as aborted).
-    pub(crate) fn is_finished(&self) -> bool {
+    pub fn is_finished(&self) -> bool {
         match &self.inner {
             JoinInner::Bespoke { state, .. } => state.finished.get(),
             JoinInner::Tokio(h) => h.is_finished(),
@@ -727,9 +760,18 @@ impl<T> Future for JoinHandle<T> {
             }
             JoinInner::Tokio(h) => match Pin::new(h).poll(cx) {
                 Poll::Ready(Ok(v)) => Poll::Ready(Ok(v)),
-                // A cancelled/panicked tokio task maps to `Aborted` (the bespoke
-                // surface has no panic-carrying variant).
-                Poll::Ready(Err(_)) => Poll::Ready(Err(Aborted)),
+                Poll::Ready(Err(err)) => {
+                    // Preserve today's tokio `JoinHandle` await semantics exactly:
+                    // a CANCELLED task → `Err(Aborted)` (the bespoke analogue), but
+                    // a PANICKED task RE-PROPAGATES the panic on join (tokio
+                    // resumes the captured panic). Silently swallowing a task panic
+                    // as `Aborted` would hide a real bug and diverge from the
+                    // pre-seam behavior at any site that awaits a JoinHandle.
+                    if err.is_panic() {
+                        std::panic::resume_unwind(err.into_panic());
+                    }
+                    Poll::Ready(Err(Aborted))
+                }
                 Poll::Pending => Poll::Pending,
             },
         }
@@ -739,7 +781,7 @@ impl<T> Future for JoinHandle<T> {
 /// A cheap, clonable abort handle. MUST stay `Send + Sync` (tokio's is) — a
 /// cross-thread abort lands via the injection channel.
 #[derive(Clone)]
-pub(crate) struct AbortHandle {
+pub struct AbortHandle {
     inner: AbortInner,
 }
 
@@ -758,7 +800,7 @@ impl AbortHandle {
     /// * Cross-thread → inject `Abort(id)`; `drain_injected` marks + enqueues.
     /// * Stale/forged/completed id → gen-checked silent no-op (double-abort /
     ///   abort-after-complete idempotency).
-    pub(crate) fn abort(&self) {
+    pub fn abort(&self) {
         match &self.inner {
             AbortInner::Bespoke { id, shared } => {
                 // Same-thread fast path: route through the installed `Core` so we
@@ -826,6 +868,30 @@ where
     }
 }
 
+/// THE SPAWN SEAM (spec §5.2). Every `spawn_local` in the engine + stdlib routes
+/// through here so all isolate tasks share ONE queue once the executor is
+/// installed (P2). Route to the bespoke executor installed on THIS thread (via
+/// [`CURRENT_EXEC`]) if one is present; otherwise fall back to real tokio
+/// `spawn_local`.
+///
+/// In P1 NO executor is installed anywhere (P2 does the entry-point installs), so
+/// this ALWAYS takes the Tokio branch → behavior byte-identical to the pre-seam
+/// world. The Bespoke branch is exercised by the unit tests (which install a
+/// `Core`) and goes live at the call sites the moment P2 installs an executor.
+pub fn spawn_local<F>(fut: F) -> JoinHandle<F::Output>
+where
+    F: Future + 'static,
+    F::Output: 'static,
+{
+    if let Some(core) = CURRENT_EXEC.with(|c| c.borrow().clone()) {
+        spawn_local_on(&core, fut)
+    } else {
+        JoinHandle {
+            inner: JoinInner::Tokio(tokio::task::spawn_local(fut)),
+        }
+    }
+}
+
 /// The wrapper future stored in the slab. Drives the user future; on completion
 /// resolves the join `Ok` and disarms the guard; on ANY drop while still armed
 /// the guard resolves the join `Err(Aborted)`.
@@ -885,10 +951,14 @@ impl<T> Future for JoinWrapper<T> {
 /// The bespoke per-isolate executor: a thin `Rc<Core>` wrapper that an entry
 /// point drives via [`exec_run_until`] inside the unchanged
 /// `local.run_until(...)`. `!Send` like everything in the isolate.
+// P2 consumes this (the entry points construct + drive the executor).
+#[allow(dead_code)]
 pub(crate) struct Executor {
     core: Rc<Core>,
 }
 
+// P2 consumes these (the entry-point install + run_until/drain driver).
+#[allow(dead_code)]
 impl Executor {
     pub(crate) fn new() -> Self {
         Executor { core: Core::new() }
@@ -993,6 +1063,8 @@ impl Executor {
 /// executor runs its OWN budget (`EXEC_TICK_BUDGET` + the `MoreWork`
 /// self-yield), which is the driver-liveness mechanism here. Task 5's entry
 /// points call THIS, not `run_until` directly.
+// P2 consumes this (the entry points call it to drive the executor).
+#[allow(dead_code)]
 pub(crate) fn exec_run_until<'a, F: Future + 'a>(
     exec: &'a Executor,
     root: F,
@@ -1000,6 +1072,8 @@ pub(crate) fn exec_run_until<'a, F: Future + 'a>(
     tokio::task::unconstrained(exec.run_until(root))
 }
 
+// P2 consumes these (the `Executor` run_until/drain driver parks the `Core`).
+#[allow(dead_code)]
 impl Core {
     /// Take + drop the executor's parked tokio waker (we are running, not
     /// parked). Idempotent; poisoning never occurs on this uncontended slot but

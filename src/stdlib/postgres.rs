@@ -88,7 +88,7 @@ impl Interp {
                 Err(e) => return Ok(err_pair(format!("postgres.connect failed: {}", e))),
             };
         // Drive the protocol on its own local task; abort it on close/drop.
-        let join = tokio::task::spawn_local(async move {
+        let join = crate::exec::spawn_local(async move {
             // If the connection errors (server closed, etc.), the future resolves;
             // the error is observed by the next client call as a Tier-1 error.
             let _ = connection.await;

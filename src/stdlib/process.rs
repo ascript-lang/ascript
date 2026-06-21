@@ -550,7 +550,7 @@ impl Interp {
         // the owning `Rc<Interp>` via the self-`Weak` (the exact `task.spawn` shape) so
         // the task can `self.call_value(...)` without crossing a `Send` boundary.
         let interp_rc = self.rc();
-        let handle = tokio::task::spawn_local(async move {
+        let handle = crate::exec::spawn_local(async move {
             loop {
                 if stream.recv().await.is_none() {
                     // Stream closed (interp/runtime teardown): stop listening.
@@ -636,7 +636,7 @@ impl Interp {
             }
         }
         let interp_rc = self.rc();
-        let handle = tokio::task::spawn_local(async move {
+        let handle = crate::exec::spawn_local(async move {
             loop {
                 if tokio::signal::ctrl_c().await.is_err() {
                     break;

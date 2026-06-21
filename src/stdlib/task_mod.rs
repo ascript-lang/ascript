@@ -21,7 +21,7 @@ use crate::worker::isolate::{ChunkJob, ChunkKind};
 /// Aborts a `spawn_local` task when dropped. Used by `race` to cancel the resolver
 /// tasks (and thereby the losing futures) once a winner is decided, and by CNTR §6's
 /// signal-handler registry to abort each listener task on `Interp` teardown.
-pub(crate) struct AbortOnDrop(pub(crate) tokio::task::AbortHandle);
+pub(crate) struct AbortOnDrop(pub(crate) crate::exec::AbortHandle);
 
 impl Drop for AbortOnDrop {
     fn drop(&mut self) {
@@ -556,7 +556,7 @@ impl Interp {
                     unreachable!()
                 };
                 let w = winner.clone();
-                let jh = tokio::task::spawn_local(async move {
+                let jh = crate::exec::spawn_local(async move {
                     let r = f.get().await;
                     w.resolve(r);
                 });
@@ -922,7 +922,7 @@ impl Interp {
         // the remaining futures cancels queued chunks (§3.5).
         let fut = SharedFuture::new();
         let cell = fut.cell();
-        let handle = tokio::task::spawn_local(async move {
+        let handle = crate::exec::spawn_local(async move {
             let mut merged: Vec<Value> = Vec::new();
             let mut futs = chunk_futs.into_iter();
             let result = loop {
@@ -993,7 +993,7 @@ impl Interp {
 
         let fut = SharedFuture::new();
         let cell = fut.cell();
-        let handle = tokio::task::spawn_local(async move {
+        let handle = crate::exec::spawn_local(async move {
             let result = par_inline_run(&vm, &entry, &data, &plan, kind, final_init, span).await;
             cell.resolve(result);
         });
@@ -1079,7 +1079,7 @@ impl Interp {
         // Orchestrator: collect partials IN CHUNK ORDER, then dispatch ONE final combine.
         let fut = SharedFuture::new();
         let cell = fut.cell();
-        let handle = tokio::task::spawn_local(async move {
+        let handle = crate::exec::spawn_local(async move {
             // Phase A: collect all per-chunk partials in input (chunk) order.
             // Dropping the remaining futures cancels queued chunks on error (§3.5).
             let mut partials: Vec<Value> = Vec::with_capacity(chunk_futs.len());

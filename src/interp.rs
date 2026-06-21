@@ -596,7 +596,7 @@ pub(crate) enum ResourceState {
     #[cfg(feature = "postgres")]
     PostgresConnection {
         client: tokio_postgres::Client,
-        conn_task: tokio::task::AbortHandle,
+        conn_task: crate::exec::AbortHandle,
     },
     // SP5 §6 std/redis: a multiplexed async connection. Its command methods take
     // `&mut self`; taken out across the await per the borrow discipline. Boxed to
@@ -3711,7 +3711,7 @@ impl Interp {
         let fut = crate::task::SharedFuture::new();
         let cell = fut.cell();
         let native_for_task = native.clone();
-        let bridge = tokio::task::spawn_local(async move {
+        let bridge = crate::exec::spawn_local(async move {
             let result = match init_reply_rx.await {
                 Ok(crate::worker::actor::ActorReply::Ok(..)) => Ok(native_for_task),
                 Ok(crate::worker::actor::ActorReply::Panic(msg)) => {
@@ -3810,7 +3810,7 @@ impl Interp {
         let method_owned = method.to_string();
         let fut = crate::task::SharedFuture::new();
         let cell = fut.cell();
-        let bridge = tokio::task::spawn_local(async move {
+        let bridge = crate::exec::spawn_local(async move {
             let reply = reply_rx.await;
             // SP9 determinism (Task 12) — RECORD: if a Record-mode context is active,
             // event-source the boundary OUTCOME (the encoded reply bytes / panic) so a
@@ -7555,7 +7555,7 @@ impl Interp {
             // RESIL §5.1: capture THIS task's ambient locals (deadline/trace) so the
             // spawned body inherits them — COW-isolated from the parent's later scopes.
             let locals_parent = crate::interp::task_locals_capture();
-            let handle = tokio::task::spawn_local(async move {
+            let handle = crate::exec::spawn_local(async move {
                 let _g = guard;
                 // The owned `func`/`call_env`/`what` live in `run_function_body`'s
                 // frame, so the `BodySpec` borrow never escapes this `'static` task.
@@ -8143,7 +8143,7 @@ impl Interp {
             let telem_parent = crate::interp::telemetry_capture_current();
             // RESIL §5.1: inherit the spawning task's ambient locals (deadline/trace).
             let locals_parent = crate::interp::task_locals_capture();
-            let handle = tokio::task::spawn_local(async move {
+            let handle = crate::exec::spawn_local(async move {
                 let _g = guard;
                 // Owned `method`/`call_env`/`name` keep the `BodySpec` borrow inside
                 // `run_method_body`'s frame, so nothing escapes the `'static` task.
@@ -8218,7 +8218,7 @@ impl Interp {
             let telem_parent = crate::interp::telemetry_capture_current();
             // RESIL §5.1: inherit the spawning task's ambient locals (deadline/trace).
             let locals_parent = crate::interp::task_locals_capture();
-            let handle = tokio::task::spawn_local(async move {
+            let handle = crate::exec::spawn_local(async move {
                 let _g = guard;
                 let body = vm.run_method_body(m, args, call_env, span, what);
                 #[cfg(feature = "telemetry")]

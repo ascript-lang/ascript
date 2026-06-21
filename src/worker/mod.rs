@@ -243,7 +243,7 @@ pub(crate) fn dispatch_worker_job(
 
     // --- Caller-thread bridge: await the reply, decode, resolve the future. ---
     let interp_rc = interp.rc();
-    let handle = tokio::task::spawn_local(async move {
+    let handle = crate::exec::spawn_local(async move {
         // `abort_tx` lives in this task; if the task is aborted (future dropped), it
         // is dropped, signalling the isolate to cancel.
         let _abort_tx = abort_tx;
@@ -313,7 +313,7 @@ pub fn dispatch_worker_inline(
     // LocalSet — no cross-thread transport.
     let fut = crate::task::SharedFuture::new();
     let cell = fut.cell();
-    let handle = tokio::task::spawn_local(async move {
+    let handle = crate::exec::spawn_local(async move {
         let r = vm.call_value(entry, args, span).await;
         cell.resolve(r);
     });
@@ -383,7 +383,7 @@ fn run_slice_inline(
 
     let fut = crate::task::SharedFuture::new();
     let cell = fut.cell();
-    let handle = tokio::task::spawn_local(async move {
+    let handle = crate::exec::spawn_local(async move {
         // Task 1.6: install the bundled program's archive (if any) BEFORE the slice loads,
         // so this inline fallback re-runs imports from memory exactly like a pool isolate.
         if let Some(bytes) = archive_owned.as_deref() {
@@ -584,7 +584,7 @@ pub fn dispatch_worker_dedicated(
     let interp_rc = interp.rc();
     let fut = crate::task::SharedFuture::new();
     let cell = fut.cell();
-    let bridge = tokio::task::spawn_local(async move {
+    let bridge = crate::exec::spawn_local(async move {
         // Hold the handle alive across the blocking reply wait. The recv runs on a
         // blocking helper so the current-thread runtime is not stalled; on success the
         // result is decoded against the caller's interp.

@@ -677,7 +677,7 @@ impl Interp {
         // (the exact `process.on` / `task.spawn` shape).
         let interp_rc = self.rc();
         let callback_loop = callback;
-        let handle = tokio::task::spawn_local(async move {
+        let handle = crate::exec::spawn_local(async move {
             loop {
                 if !running_loop.get() {
                     break;

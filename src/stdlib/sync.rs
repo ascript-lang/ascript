@@ -746,7 +746,7 @@ impl Interp {
                     // Spawn a one-shot timer that notifies after the window resets.
                     // This wakes all parked acquirers so they each re-check.
                     let notify = rl.token_available.clone();
-                    tokio::task::spawn_local(async move {
+                    crate::exec::spawn_local(async move {
                         tokio::time::sleep(std::time::Duration::from_millis(sleep_ms)).await;
                         notify.notify_waiters();
                     });

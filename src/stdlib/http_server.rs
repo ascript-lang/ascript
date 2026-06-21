@@ -1919,7 +1919,7 @@ impl Interp {
         // UNBOUNDED `serve` from accumulating join handles forever, we REAP finished
         // handles per iteration (`is_finished()` swap-remove, bounded by
         // `max_concurrent` — at most that many can ever be live, the semaphore cap).
-        let mut inflight: Vec<tokio::task::JoinHandle<()>> = Vec::new();
+        let mut inflight: Vec<crate::exec::JoinHandle<()>> = Vec::new();
         loop {
             // Reap any finished handler tasks so an unbounded server's `inflight` vec
             // stays bounded (the live count never exceeds `max_concurrent`). Cheap: a
@@ -2052,7 +2052,7 @@ impl Interp {
             // `Conn::Plain(TcpStream)`. Both flow into the SAME generic `handle_connection`
             // (hyper-free hand-rolled HTTP/1 over any `AsyncRead+AsyncWrite+Unpin`) — the
             // per-request limits + dispatch are byte-identical regardless of transport.
-            let handle = tokio::task::spawn_local(async move {
+            let handle = crate::exec::spawn_local(async move {
                 let _permit = permit;
                 // RESIL §5.1/§6.4: each connection task gets a FRESH `ambient_root_scope`
                 // (None-seeded TASK_LOCALS — it does NOT inherit any serve-level deadline,
@@ -2123,7 +2123,7 @@ impl Interp {
     /// genuinely-live ones.
     async fn drain_inflight(
         &self,
-        inflight: Vec<tokio::task::JoinHandle<()>>,
+        inflight: Vec<crate::exec::JoinHandle<()>>,
         drain_timeout_ms: Option<u64>,
     ) {
         match drain_timeout_ms {
@@ -2339,7 +2339,7 @@ impl Interp {
         let onshutdown_watcher = on_shutdown.clone().map(|cb| {
             let shutdown = shutdown.clone();
             let me = self.rc();
-            tokio::task::spawn_local(async move {
+            crate::exec::spawn_local(async move {
                 // Register the waiter BEFORE re-checking `armed` (same lost-wakeup-safe
                 // sequence the accept loop uses): if shutdown was armed before serve, the
                 // re-check fires immediately; otherwise the registered waiter catches it.

@@ -1333,7 +1333,7 @@ async fn run_tests_parallel(
                 // aggregate is independent of `--parallel` (§7).
                 let filter = filter.map(str::to_string);
                 let path = std::path::PathBuf::from(file);
-                handles.push(tokio::task::spawn_local(async move {
+                handles.push(crate::exec::spawn_local(async move {
                     // A closed semaphore is unreachable here (we never close it); on the
                     // impossible error, treat the file as un-runnable rather than panic.
                     let _permit = match sem.acquire_owned().await {

@@ -23,10 +23,10 @@
 
 use crate::interp::Control;
 use crate::value::Value;
+use crate::exec::AbortHandle;
 use std::cell::RefCell;
 use std::rc::Rc;
 use tokio::sync::Notify;
-use tokio::task::AbortHandle;
 
 /// The completion slot shared between the spawned task (writer) and the handle
 /// (reader). Holds NO task lifetime — dropping it never cancels anything.
@@ -227,7 +227,7 @@ mod tests {
                 let ran2 = ran.clone();
                 let f = SharedFuture::new();
                 let cell = f.cell();
-                let jh = tokio::task::spawn_local(async move {
+                let jh = crate::exec::spawn_local(async move {
                     tokio::task::yield_now().await;
                     tokio::task::yield_now().await;
                     ran2.set(true);
@@ -281,7 +281,7 @@ mod tests {
         let local = tokio::task::LocalSet::new();
         local
             .run_until(async move {
-                tokio::task::spawn_local(async move {
+                crate::exec::spawn_local(async move {
                     tokio::task::yield_now().await;
                     cell.resolve(Ok(Value::float(99.0)));
                 });
@@ -312,7 +312,7 @@ mod tests {
                 let ran2 = ran.clone();
                 let f = SharedFuture::new();
                 let cell = f.cell();
-                let jh = tokio::task::spawn_local(async move {
+                let jh = crate::exec::spawn_local(async move {
                     // Two suspension points: the abort (issued before any poll)
                     // cancels the task before it can set the flag.
                     tokio::task::yield_now().await;
@@ -342,7 +342,7 @@ mod tests {
                 let ran2 = ran.clone();
                 let f = SharedFuture::new();
                 let cell = f.cell();
-                let jh = tokio::task::spawn_local(async move {
+                let jh = crate::exec::spawn_local(async move {
                     tokio::task::yield_now().await;
                     ran2.set(true);
                     cell.resolve(Ok(Value::float(7.0)));
