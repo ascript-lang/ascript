@@ -824,6 +824,10 @@ pub fn read_trace(bytes: &[u8]) -> Result<(TraceHeader, Vec<DetEvent>), TraceErr
 
 /// Write a full trace to `path` atomically (temp file + fsync + rename — the
 /// `workflow::write_log` pattern). The temp file is removed on a failed commit.
+// WASM §5.3: on wasm `std::fs::File` is a stub whose `Drop` is a no-op, so the
+// explicit `drop(f)` (a meaningful early fd-close-before-rename on native, esp.
+// Windows) trips `clippy::drop_non_drop`. Native behavior + lint are unchanged.
+#[cfg_attr(target_family = "wasm", allow(clippy::drop_non_drop))]
 pub fn write_trace(path: &Path, header: &TraceHeader, events: &[DetEvent]) -> Result<(), AsError> {
     use std::io::Write;
     let bytes = encode_trace(header, events);

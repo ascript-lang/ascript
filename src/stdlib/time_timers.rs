@@ -98,11 +98,11 @@ pub fn create_interval(interp: &Interp, args: &[Value], span: Span) -> Result<Va
     #[cfg(target_family = "wasm")]
     {
         let _ = (interp, args);
-        return Err(AsError::at(
+        Err(AsError::at(
             "time.interval is not available on this platform (wasm)",
             span,
         )
-        .into());
+        .into())
     }
     #[cfg(not(target_family = "wasm"))]
     {

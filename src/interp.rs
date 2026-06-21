@@ -3523,7 +3523,9 @@ impl Interp {
     }
 
     /// Is the captured output buffer empty? (REPL flush check.) Always true under
-    /// `Live`.
+    /// `Live`. WASM §5.3.2: REPL-only — the `repl` module is cfg'd out on wasm, so
+    /// this is dead there (native unchanged).
+    #[cfg_attr(target_family = "wasm", allow(dead_code))]
     pub(crate) fn output_is_empty(&self) -> bool {
         match &self.output {
             OutputSink::Capture(buf) => buf.borrow().is_empty(),
@@ -3532,7 +3534,8 @@ impl Interp {
     }
 
     /// Clear the captured output buffer (REPL flushes after each line). No-op
-    /// under `Live`.
+    /// under `Live`. WASM §5.3.2: REPL-only (dead on wasm; native unchanged).
+    #[cfg_attr(target_family = "wasm", allow(dead_code))]
     pub(crate) fn clear_output(&self) {
         if let OutputSink::Capture(buf) = &self.output {
             buf.borrow_mut().clear();
@@ -7382,6 +7385,8 @@ impl Interp {
     /// DEFER §5.1 REPL helper: drain a session-line defer list, reporting any
     /// resulting panic as a diagnostic (the REPL swallows errors to keep the loop
     /// alive). Folds panics via the same `run_defers` path so §3.6 merge rules hold.
+    /// WASM §5.3.2: REPL-only (dead on wasm; native unchanged).
+    #[cfg_attr(target_family = "wasm", allow(dead_code))]
     pub(crate) async fn drain_session_defers(
         &self,
         defer_list: &Rc<RefCell<Vec<DeferEntry>>>,

@@ -208,6 +208,21 @@ pub(crate) fn dispatch_worker_job(
         // thread). Engine-independent (works on the tree-walker caller, which has no
         // VM of its own); preserves shared-nothing semantics (a fresh slice run).
         Err(req) => {
+            // WASM §5.3.7: on wasm a pooled isolate can NEVER spawn (no threads — the
+            // `bootstrap` chokepoint refuses), so `pool::dispatch` always returns `Err`.
+            // The native inline-degradation would silently RUN the worker in-process,
+            // masking the platform gap; on wasm we instead surface the clean Tier-2
+            // platform error (never silent). `worker fn` / `task.pmap` / `task.preduce`
+            // (the pooled forms) all funnel here.
+            #[cfg(target_family = "wasm")]
+            {
+                let _ = req;
+                return Err(Control::Panic(crate::error::AsError::at(
+                    "workers are not available on this platform (wasm)",
+                    span,
+                )));
+            }
+            #[cfg(not(target_family = "wasm"))]
             return run_slice_inline(
                 req.slice_bytes.as_deref(),
                 req.archive_bytes.as_deref(),
@@ -327,6 +342,9 @@ pub fn dispatch_worker_inline(
 // payload, not an accidental pile; folding them behind a struct would only rename the same
 // fields. PAR added the 8th (`chunk`).
 #[allow(clippy::too_many_arguments)]
+// WASM §5.3.7: the pooled inline-degradation fallback is unreachable on wasm (the
+// pooled funnel refuses with a Tier-2 platform error instead), so this is dead there.
+#[cfg_attr(target_family = "wasm", allow(dead_code))]
 fn run_slice_inline(
     slice_bytes: Option<&[u8]>,
     archive_bytes: Option<&[u8]>,

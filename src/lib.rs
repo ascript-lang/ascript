@@ -1718,6 +1718,78 @@ pub async fn vm_run_source(src: &str) -> Result<(String, Option<i32>), AsError> 
 }
 
 #[cfg(not(ascript_rt))]
+/// WASM §5.4: the wasm playground wrapper's entry point. Compile + run `src` on the
+/// SPECIALIZED bytecode VM (the production engine) with the Capture output sink, an
+/// explicit [`CapSet`](crate::stdlib::caps::CapSet) applied at `Interp` construction
+/// (the playground passes all-five-denied). Returns the captured output plus the exit
+/// code requested by `exit(n)` (if any). It is `cfg`-FREE on purpose: native tests
+/// exercise the EXACT path the wasm wrapper ships, so the deny-all + capture behavior
+/// is on the tested path. `#[doc(hidden)]` — not a stable public API.
+///
+/// This mirrors [`vm_run_source`] (the VM mirror of [`run_source_exit`]) and threads
+/// `caps` through `Interp::set_caps` the same way the CLI `--deny`/`--sandbox` flags
+/// reach the runtime — there is no second caps path.
+#[doc(hidden)]
+pub async fn wasm_run_source(
+    src: &str,
+    caps: crate::stdlib::caps::CapSet,
+) -> Result<(String, Option<i32>), AsError> {
+    use crate::vm::chunk::FnProto;
+    use crate::vm::value_ext::{Closure, RunOutcome};
+    use crate::vm::Vm;
+
+    let src_info = Rc::new(SourceInfo {
+        path: "<input>".to_string(),
+        text: src.to_string(),
+    });
+    let chunk = crate::compile::compile_source(src)
+        .map_err(|e| AsError::at(e.message, e.span).with_source(src_info.clone()))?;
+    let proto = Rc::new(FnProto {
+        chunk,
+        arity: 0,
+        has_rest: false,
+        is_async: false,
+        is_generator: false,
+        is_worker: false,
+        owning_class: None,
+        params: Vec::new(),
+        ret: None,
+        local_names: Vec::new(),
+        debug_name: None,
+        name_span: None,
+    });
+    let closure = Closure::new(proto);
+
+    let interp = Rc::new(Interp::new());
+    interp.install_self();
+    // WASM §5.4: apply the caller's CapSet BEFORE running any program code — the same
+    // `set_caps` setter the CLI `--deny`/`--sandbox` path uses. The playground passes
+    // all-five-denied; a native test can pass `all_granted` to prove the entry adds
+    // nothing over `vm_run_source` on a pure-compute program.
+    interp.set_caps(caps);
+    // Workers Spec A: retain the source so a `worker fn` call can build its slice (on
+    // wasm the worker dispatch then refuses with the §5.3.7 platform error).
+    interp.set_worker_source(src);
+    let vm = Vm::new(interp.clone());
+    let mut fiber = crate::vm::fiber::Fiber::new(closure);
+
+    let local = tokio::task::LocalSet::new();
+    let result = local
+        .run_until(crate::interp::ambient_root_scope(vm.run(&mut fiber)))
+        .await;
+    interp.abort_signal_listeners();
+    local.await;
+    crate::gc::collect();
+    match result {
+        Ok(RunOutcome::Done(_)) => Ok((interp.output(), None)),
+        Ok(RunOutcome::Yielded(_)) => unreachable!("top-level program cannot yield"),
+        Err(crate::interp::Control::Panic(e)) => Err(e.with_source(src_info)),
+        Err(crate::interp::Control::Propagate(_)) => Ok((interp.output(), None)),
+        Err(crate::interp::Control::Exit(code)) => Ok((interp.output(), Some(code))),
+    }
+}
+
+#[cfg(not(ascript_rt))]
 /// REPLAY Task 0 (§10.2) — the VM-side mirror of [`run_source_deterministic`]: run
 /// `src` on the SPECIALIZED bytecode VM in DETERMINISTIC mode with `seed`. Installs a
 /// fresh [`crate::det::DeterminismContext`] (Record mode, seed-derived virtual clock)
