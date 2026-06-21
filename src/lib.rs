@@ -65,6 +65,9 @@ pub mod elide_mark;
 pub mod embed;
 pub mod env;
 pub mod error;
+// EXEC: the bespoke per-isolate task executor (spec
+// `superpowers/specs/2026-06-12-vm-executor-design.md`). Task 1 = the core.
+pub mod exec;
 #[cfg(not(ascript_rt))]
 pub mod fmt;
 // FUZZ: the grammar-aware source generator (the differential-fuzzing core asset).
