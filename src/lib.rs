@@ -92,7 +92,12 @@ pub mod parser;
 // reports a clean rebuild hint.
 #[cfg(feature = "profile")]
 pub mod profile;
-#[cfg(not(ascript_rt))]
+// WASM §5.3.2 / §2.2: `repl` pulls `rustyline` (→ `fd-lock`, a native file-lock crate
+// using `std::os::unix` that fails to build on `wasm32-unknown-unknown`). The wasm
+// entry is the wrapper crate (`ascript-wasm/`), never `main.rs`/the REPL, so gate the
+// module out of wasm builds. Native builds are unchanged (`not(target_family = "wasm")`
+// is always true off-wasm).
+#[cfg(all(not(ascript_rt), not(target_family = "wasm")))]
 pub mod repl;
 pub mod span;
 pub mod stdlib;

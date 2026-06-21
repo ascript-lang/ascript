@@ -21,14 +21,23 @@ fn main() {
         println!("cargo:rustc-env=TARGET={target}");
     }
 
-    if !ascript_rt {
+    // WASM §5.3.1 / §2.1: the compiled C tree-sitter parser's ONLY consumer is the
+    // native dev test `tests/treesitter_conformance.rs` (zero `src/` references), and
+    // `wasm32-unknown-unknown` has no C sysroot for `cc` to find. Skip the `cc` step
+    // for wasm targets (it is dev-test-only on native, unreachable on wasm). The
+    // `rerun-if-changed` line stays UNCONDITIONAL so dep-tracking is target-stable.
+    let target = std::env::var("TARGET").unwrap_or_default();
+    let is_wasm = target.starts_with("wasm32");
+    {
         let dir = "tree-sitter-ascript/src";
         println!("cargo:rerun-if-changed={}/parser.c", dir);
-        cc::Build::new()
-            .include(dir)
-            .file(format!("{}/parser.c", dir))
-            .warnings(false)
-            .compile("tree_sitter_ascript");
+        if !ascript_rt && !is_wasm {
+            cc::Build::new()
+                .include(dir)
+                .file(format!("{}/parser.c", dir))
+                .warnings(false)
+                .compile("tree_sitter_ascript");
+        }
     }
 
     generate_ast_nodes();
