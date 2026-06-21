@@ -2,37 +2,72 @@
 //! `superpowers/specs/2026-06-12-vm-executor-design.md`). Replaces tokio's task
 //! HARNESS (spawn/wake/yield) for AScript tasks; tokio remains the I/O + timer
 //! driver. `!Send` like the whole runtime; exactly one per isolate thread.
-//! Task 1 = the core (slab + FIFO queue + tick). The Send-safe cross-thread
-//! waker (same-thread fast path + lock-free injection) is Task 2; tokio
+//! Task 1 = the core (slab + FIFO queue + tick). Task 2 = the Send-safe
+//! cross-thread waker (same-thread fast path + lock-free injection); tokio
 //! run_until/drain integration is Task 4.
 //!
-//! ## Task-1 scope and shortcuts (flagged for later tasks)
+//! ## Waker design (Task 2, spec §3.2)
 //!
-//! * **Waker (Task 1 shortcut → Task 2).** A polled future needs a [`Waker`].
-//!   For Task 1 the per-task waker is built from a SAFE [`std::task::Wake`] impl
-//!   ([`TaskWaker`]) that, on wake, dedupes via its `queued` flag and then pushes
-//!   `Inject::Wake(id)` onto the executor's mpsc injection channel. The wake is
-//!   folded into the ready queue at the NEXT [`Core::drain_injected`] (tick
-//!   start). This is correct and `Send`, but it always routes a self-wake
-//!   through the channel rather than the same-thread fast path. Task 2 adds the
-//!   `CURRENT_EXEC` thread-local fast path (push straight onto `ready` when the
-//!   waking thread is the executor thread) + the lock-free cross-thread
-//!   injection + the dedupe-during-poll protocol. The `queued`/`Shared`/
-//!   `injected_tx`/`injected_rx`/`parked` fields are all in place now so Task 2/3/4
-//!   EXTEND rather than restructure.
+//! A polled future needs a [`Waker`]. The per-task waker is built from a SAFE
+//! [`std::task::Wake`] impl ([`TaskWaker`]) — zero `unsafe`, so there is nothing
+//! for Miri to find in the waker itself. The `Waker` MUST be `Send + Sync`
+//! because wakes genuinely arrive from OTHER threads here (`spawn_blocking`
+//! completions, worker-isolate channel sends, reqwest/hyper DNS on a blocking
+//! pool). The split that makes this safe: the `Send + Sync` [`Arc<TaskWaker>`]
+//! holds only `Arc<Shared>` (never the `!Send` `Rc<Core>`).
+//!
+//! On wake ([`TaskWaker::signal`]):
+//!
+//! 1. **Dedupe** via the `queued` flag (a flurry of wakes enqueues the task at
+//!    most once). `queued` is cleared by the executor in [`Core::poll_one`]
+//!    BEFORE it polls, so a wake DURING a poll re-queues the task.
+//! 2. **Same-thread fast path:** if the waking thread is the executor thread, we
+//!    clone the `Rc<Core>` out of the [`CURRENT_EXEC`] thread-local (dropping the
+//!    borrow immediately), confirm identity via `Arc::ptr_eq` on `shared`, and
+//!    push straight onto `core.ready` — no channel round-trip. If the registry is
+//!    empty or holds a DIFFERENT executor, we fall through to injection.
+//! 3. **Cross-thread (or late / no-registry) path:** `injected_tx.send(Wake(id))`
+//!    (folded into the ready queue at the next [`Core::drain_injected`]).
+//!
+//! Both paths then wake the executor's parked tokio waker ([`Shared::parked`]) if
+//! present (Task 4 parks it there; for Task 2 it is usually `None` → a no-op).
+//!
+//! ## Thread-local registry
+//!
+//! [`CURRENT_EXEC`] holds the (at most one) live executor on this isolate thread.
+//! One-executor-per-thread is an invariant, so the registry is never ambiguous;
+//! [`install_current`] asserts an install never stomps a different executor.
+//! Task 4/5 install it via [`CurrentExecGuard`] (RAII) at the entry points.
+//!
+//! ## Task-1 carry-forward shortcuts (flagged for later tasks)
+//!
 //! * **Abort (Task 1 partial → Task 3).** `Inject::Abort(id)` marks the task's
 //!   `aborted` cell (gen-checked). A marked task is dropped + freed at its next
 //!   dequeue in [`Core::poll_one`]. Task 3 wires immediate abort drop + the
 //!   abort handle plumbing.
-//! * **tokio integration (Task 4).** `Shared::parked` (the executor's parked
-//!   tokio waker) and `Shared::thread` are unused in Task 1; Task 4's
-//!   `run_until`/drain loop parks the tokio waker there and the cross-thread
-//!   injection path wakes it.
+//! * **tokio integration (Task 4).** [`Shared::parked`] (the executor's parked
+//!   tokio waker) is wired by [`TaskWaker::signal`] now but only ever holds `None`
+//!   until Task 4's `run_until`/drain loop parks a real tokio waker there.
 //!
-//! Task 1 ships the core in isolation — nothing OUTSIDE this module calls it yet
-//! (the seam + spawn-site migration are Tasks 5–7), so the public surface is
-//! `dead_code` until then. The blanket allow is REMOVED when Task 5 wires the
-//! first consumer; do not let it mask genuinely-unused code added later.
+//! Nothing OUTSIDE this module calls the core yet (the seam + spawn-site
+//! migration are Tasks 5–7), so the public surface is `dead_code` until then. The
+//! blanket allow is REMOVED when Task 5 wires the first consumer; do not let it
+//! mask genuinely-unused code added later.
+//!
+//! ## Miri (the soundness proof)
+//!
+//! The whole module is `unsafe`-free, so Miri's job is to prove the cross-thread
+//! `Arc`/`AtomicBool`/`mpsc` interactions are data-race-free. Verified clean with:
+//!
+//! ```text
+//! MIRIFLAGS="-Zmiri-disable-isolation" cargo +nightly miri test --lib exec::
+//! ```
+//!
+//! (`-Zmiri-disable-isolation` lets the real-thread tests query OS time/thread
+//! ids.) Tests split into a Miri-able set (covers the waker's cross-thread
+//! send/recv + same-thread fast path + `Arc`/`AtomicBool` paths) and a native-only
+//! stress set (`cross_thread_wake_storm`, `#[cfg_attr(miri, ignore)]` — too
+//! real-thread-heavy for Miri).
 #![allow(dead_code)]
 
 use std::cell::{Cell, RefCell};
@@ -47,6 +82,58 @@ use std::task::{Context, Poll, Wake, Waker};
 
 /// Matches tokio's event interval; internal tunable, NOT user-visible.
 const EXEC_TICK_BUDGET: u32 = 61;
+
+thread_local! {
+    /// The (at most one) live executor on this isolate thread. Installed by the
+    /// entry points via [`CurrentExecGuard`] (Task 4/5). One-executor-per-thread
+    /// is an invariant, so the registry is never ambiguous. The same-thread
+    /// waker fast path ([`TaskWaker::signal`]) clones the `Rc<Core>` out of here.
+    static CURRENT_EXEC: RefCell<Option<Rc<Core>>> = const { RefCell::new(None) };
+}
+
+/// Install `core` as the current-thread executor. By the one-per-thread
+/// invariant the registry must be empty; installing OVER a different live
+/// executor is a bug, so this asserts rather than silently stomping. Re-installing
+/// the SAME `Rc<Core>` (pointer-equal) is a harmless idempotent no-op.
+///
+/// Prefer [`CurrentExecGuard`] (RAII) at call sites; this is the primitive.
+pub(crate) fn install_current(core: &Rc<Core>) {
+    CURRENT_EXEC.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        match slot.as_ref() {
+            Some(existing) => assert!(
+                Rc::ptr_eq(existing, core),
+                "EXEC invariant: a different executor is already installed on this thread"
+            ),
+            None => *slot = Some(Rc::clone(core)),
+        }
+    });
+}
+
+/// Clear the current-thread executor registry. Idempotent (clearing an empty
+/// registry is a no-op).
+pub(crate) fn uninstall_current() {
+    CURRENT_EXEC.with(|slot| {
+        *slot.borrow_mut() = None;
+    });
+}
+
+/// RAII guard: installs `core` on construction, uninstalls on drop. The entry
+/// points (Task 4/5) hold one of these for the lifetime of a `run_until`.
+pub(crate) struct CurrentExecGuard;
+
+impl CurrentExecGuard {
+    pub(crate) fn install(core: &Rc<Core>) -> Self {
+        install_current(core);
+        CurrentExecGuard
+    }
+}
+
+impl Drop for CurrentExecGuard {
+    fn drop(&mut self) {
+        uninstall_current();
+    }
+}
 
 /// A slab handle: a slot `index` plus the `gen` it was minted at. A stale or
 /// forged `TaskId` fails the gen-check at dequeue/enqueue and is a SILENT skip.
@@ -63,14 +150,16 @@ enum Inject {
     Abort(TaskId),
 }
 
-/// The `Send + Sync` half shared with the (cross-thread, Task 2) waker.
+/// The `Send + Sync` half shared with the cross-thread waker. The waker holds
+/// ONLY `Arc<Shared>` — never the `!Send` `Rc<Core>` — which is what keeps the
+/// `Waker` `Send + Sync`.
 struct Shared {
-    /// The executor's home thread (Task 2's same-thread fast path keys on this).
-    #[allow(dead_code)]
+    /// The executor's home thread (the same-thread fast path keys on this).
     thread: std::thread::ThreadId,
     injected_tx: Sender<Inject>,
-    /// The executor's parked tokio waker (Task 4 uses it); uncontended std Mutex.
-    #[allow(dead_code)]
+    /// The executor's parked tokio waker (Task 4 parks it here; holds `None`
+    /// until then). Uncontended std `Mutex` — see the `lock` handling in
+    /// [`TaskWaker::wake_parked`].
     parked: Mutex<Option<Waker>>,
 }
 
@@ -85,14 +174,53 @@ struct TaskWaker {
 impl TaskWaker {
     fn signal(&self) {
         // Dedupe: if it was already queued, do nothing. `queued` is cleared by
-        // the executor BEFORE it polls the task, so a wake that arrives during a
-        // poll re-queues it (the swap returns false → we inject).
+        // the executor in `poll_one` BEFORE it polls the task, so a wake that
+        // arrives during a poll re-queues it (the swap returns false → we enqueue
+        // it below, same-thread or injected).
         if self.queued.swap(true, Ordering::AcqRel) {
             return;
         }
-        // A send only fails if the executor (and its Receiver) is gone; a
-        // wake-after-shutdown is a no-op by design.
+
+        // SAME-THREAD FAST PATH. If the waking thread is the executor's home
+        // thread, try to push straight onto `core.ready` — no channel round-trip.
+        if std::thread::current().id() == self.shared.thread {
+            // Clone the `Rc<Core>` OUT of the thread-local and drop the borrow
+            // immediately: the executor itself may borrow `CURRENT_EXEC` (or, more
+            // to the point, the `Core`'s interior cells) while a future re-enters
+            // and wakes — never hold this borrow across the `enqueue_local`.
+            let core = CURRENT_EXEC.with(|slot| slot.borrow().clone());
+            if let Some(core) = core {
+                // Confirm it is OUR executor before touching its queue: identity
+                // via `Arc::ptr_eq` on the shared half. A mismatch (a different
+                // executor is currently installed — shouldn't happen under the
+                // one-per-thread invariant, but never push onto the wrong queue)
+                // falls through to injection.
+                if Arc::ptr_eq(&core.shared, &self.shared) {
+                    core.enqueue_local(self.id);
+                    self.wake_parked();
+                    return;
+                }
+            }
+            // Registry empty or a different executor → fall through to inject.
+        }
+
+        // CROSS-THREAD (or late / no-registry) PATH. The injection send only
+        // fails if the executor (and its `Receiver`) is gone; a wake-after-
+        // shutdown is a silent no-op by design.
         let _ = self.shared.injected_tx.send(Inject::Wake(self.id));
+        self.wake_parked();
+    }
+
+    /// Wake the executor's parked tokio waker if one is parked there. Until Task 4
+    /// parks a real waker, this slot holds `None` → a no-op. Poisoning only
+    /// happens on a panic-while-held, which never occurs on this uncontended slot;
+    /// we still use `if let Ok(..)` to avoid any panic path on the wake.
+    fn wake_parked(&self) {
+        if let Ok(mut guard) = self.shared.parked.lock() {
+            if let Some(waker) = guard.take() {
+                waker.wake();
+            }
+        }
     }
 }
 
@@ -378,6 +506,24 @@ impl Core {
     pub(crate) fn spawned_total(&self) -> u64 {
         self.spawned_total.get()
     }
+
+    /// Test-only probe: current length of the ready FIFO (no drain).
+    #[cfg(test)]
+    fn ready_len(&self) -> usize {
+        self.ready.borrow().len()
+    }
+
+    /// Test-only probe: true iff the injection channel currently has NO pending
+    /// message. Used to prove the same-thread fast path bypassed injection.
+    /// Non-destructive: it cannot peek the mpsc channel without draining, so it
+    /// drains into `ready` exactly as `drain_injected` would and reports whether
+    /// anything was found. Call it ONLY when asserting "injection was empty".
+    #[cfg(test)]
+    fn drain_injected_was_empty(&self) -> bool {
+        let before = self.ready.borrow().len();
+        self.drain_injected();
+        self.ready.borrow().len() == before
+    }
 }
 
 #[cfg(test)]
@@ -540,5 +686,368 @@ mod tests {
         assert_eq!(out, TickOutcome::AllDone);
         assert!(!ran.get(), "aborted task must not run its body");
         assert!(core.free.borrow().contains(&id.index));
+    }
+
+    // ------------------------------------------------------------------------
+    // Task 2: the Send-safe waker (same-thread fast path + cross-thread inject).
+    // ------------------------------------------------------------------------
+
+    /// A future that is Pending until a shared `AtomicBool` flag is set, and then
+    /// Ready. It does NOT self-wake; it captures its waker out to a slot so a
+    /// foreign thread (or the same thread) can wake it. Used by the waker tests.
+    struct CapturingFut {
+        flag: Arc<AtomicBool>,
+        done: Rc<Cell<bool>>,
+        captured: Rc<StdRefCell<Option<Waker>>>,
+    }
+    impl Future for CapturingFut {
+        type Output = ();
+        fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+            let this = self.get_mut();
+            if this.flag.load(Ordering::Acquire) {
+                this.done.set(true);
+                Poll::Ready(())
+            } else {
+                *this.captured.borrow_mut() = Some(cx.waker().clone());
+                Poll::Pending
+            }
+        }
+    }
+
+    /// install/uninstall the thread-local registry; re-installing the SAME core
+    /// is idempotent.
+    #[test]
+    fn registry_install_uninstall() {
+        let core = Core::new();
+        install_current(&core);
+        CURRENT_EXEC.with(|s| assert!(s.borrow().is_some()));
+        // Idempotent re-install of the same core (must not panic).
+        install_current(&core);
+        uninstall_current();
+        CURRENT_EXEC.with(|s| assert!(s.borrow().is_none()));
+        // The RAII guard installs then uninstalls on drop.
+        {
+            let _g = CurrentExecGuard::install(&core);
+            CURRENT_EXEC.with(|s| assert!(s.borrow().is_some()));
+        }
+        CURRENT_EXEC.with(|s| assert!(s.borrow().is_none()));
+    }
+
+    /// Installing a DIFFERENT executor over a live one is an invariant violation.
+    #[test]
+    #[should_panic(expected = "a different executor is already installed")]
+    fn registry_double_install_different_panics() {
+        let a = Core::new();
+        let b = Core::new();
+        let _g = CurrentExecGuard::install(&a);
+        install_current(&b); // must panic
+    }
+
+    /// A same-thread wake (the executor installed in `CURRENT_EXEC`) pushes
+    /// STRAIGHT onto `ready` and does NOT go through the injection channel.
+    #[test]
+    fn same_thread_wake_pushes_local() {
+        let core = Core::new();
+        let _g = CurrentExecGuard::install(&core);
+
+        let flag = Arc::new(AtomicBool::new(false));
+        let done = Rc::new(Cell::new(false));
+        let captured: Rc<StdRefCell<Option<Waker>>> = Rc::new(StdRefCell::new(None));
+        core.insert(Box::pin(CapturingFut {
+            flag: Arc::clone(&flag),
+            done: Rc::clone(&done),
+            captured: Rc::clone(&captured),
+        }));
+
+        // First tick: the task polls Pending and captures its waker. `live > 0`,
+        // ready is now empty → Idle.
+        assert_eq!(core.poll_tick(EXEC_TICK_BUDGET), TickOutcome::Idle);
+        assert_eq!(core.ready_len(), 0);
+
+        // Wake it from the SAME thread (we ARE the executor thread, and the core
+        // is installed). The dedupe flag was cleared at poll, so this re-queues.
+        let waker = captured.borrow().clone().expect("waker captured");
+        flag.store(true, Ordering::Release);
+        waker.wake();
+
+        // PROOF the fast path was taken: the id is already on `ready` directly,
+        // AND the injection channel is empty (drain finds nothing).
+        assert_eq!(core.ready_len(), 1, "fast path pushed straight onto ready");
+        assert!(
+            core.drain_injected_was_empty(),
+            "same-thread wake must NOT use the injection channel"
+        );
+
+        // Re-poll completes the task.
+        assert_eq!(core.poll_tick(EXEC_TICK_BUDGET), TickOutcome::AllDone);
+        assert!(done.get());
+    }
+
+    /// With NO executor installed, a same-thread wake falls through to injection
+    /// (the registry is empty → cannot take the fast path).
+    #[test]
+    fn same_thread_wake_no_registry_injects() {
+        let core = Core::new();
+        // Deliberately do NOT install into CURRENT_EXEC.
+
+        let flag = Arc::new(AtomicBool::new(false));
+        let done = Rc::new(Cell::new(false));
+        let captured: Rc<StdRefCell<Option<Waker>>> = Rc::new(StdRefCell::new(None));
+        core.insert(Box::pin(CapturingFut {
+            flag: Arc::clone(&flag),
+            done: Rc::clone(&done),
+            captured: Rc::clone(&captured),
+        }));
+        assert_eq!(core.poll_tick(EXEC_TICK_BUDGET), TickOutcome::Idle);
+
+        let waker = captured.borrow().clone().expect("waker captured");
+        flag.store(true, Ordering::Release);
+        waker.wake();
+
+        // No registry → the wake went through injection; `ready` is still empty
+        // until the next drain.
+        assert_eq!(core.ready_len(), 0, "no fast path without a registry");
+        assert_eq!(core.poll_tick(EXEC_TICK_BUDGET), TickOutcome::AllDone);
+        assert!(done.get());
+    }
+
+    /// A wake from ANOTHER thread reaches the task via injection; a poll loop
+    /// that drains injected completes it. The thread is joined (no leak).
+    #[test]
+    fn cross_thread_wake_lands() {
+        let core = Core::new();
+        let _g = CurrentExecGuard::install(&core);
+
+        let flag = Arc::new(AtomicBool::new(false));
+        let done = Rc::new(Cell::new(false));
+        let captured: Rc<StdRefCell<Option<Waker>>> = Rc::new(StdRefCell::new(None));
+        core.insert(Box::pin(CapturingFut {
+            flag: Arc::clone(&flag),
+            done: Rc::clone(&done),
+            captured: Rc::clone(&captured),
+        }));
+        assert_eq!(core.poll_tick(EXEC_TICK_BUDGET), TickOutcome::Idle);
+
+        // Hand a CLONE of the waker to a foreign thread; it sets the flag + wakes.
+        let waker = captured.borrow().clone().expect("waker captured");
+        let f = Arc::clone(&flag);
+        let handle = std::thread::spawn(move || {
+            f.store(true, Ordering::Release);
+            waker.wake();
+        });
+        handle.join().expect("foreign thread joined");
+
+        // The cross-thread wake landed on the injection channel; a tick drains it.
+        assert_eq!(core.poll_tick(EXEC_TICK_BUDGET), TickOutcome::AllDone);
+        assert!(done.get(), "cross-thread wake completed the task");
+    }
+
+    /// A retained waker for a COMPLETED task: waking it must not panic, not
+    /// requeue, and not disturb a NEW task reusing the freed slot (gen check).
+    #[test]
+    fn wake_after_complete_is_noop() {
+        let core = Core::new();
+        let _g = CurrentExecGuard::install(&core);
+
+        let captured: Rc<StdRefCell<Option<Waker>>> = Rc::new(StdRefCell::new(None));
+        // A future that captures its waker on poll then completes immediately.
+        struct CaptureThenDone {
+            captured: Rc<StdRefCell<Option<Waker>>>,
+        }
+        impl Future for CaptureThenDone {
+            type Output = ();
+            fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+                *self.get_mut().captured.borrow_mut() = Some(cx.waker().clone());
+                Poll::Ready(())
+            }
+        }
+        let id = core.insert(Box::pin(CaptureThenDone {
+            captured: Rc::clone(&captured),
+        }));
+        assert_eq!(core.poll_tick(EXEC_TICK_BUDGET), TickOutcome::AllDone);
+
+        // The slot is now free; insert a NEW task that reuses index `id.index`.
+        let new_done = Rc::new(Cell::new(false));
+        let nd = Rc::clone(&new_done);
+        let new_id = core.insert(once(move || nd.set(true)));
+        assert_eq!(new_id.index, id.index, "slot reused");
+        assert_ne!(new_id.gen, id.gen, "gen bumped");
+
+        // Fire the STALE waker (gen mismatch). No panic, no requeue.
+        let stale = captured.borrow().clone().expect("waker captured");
+        stale.wake();
+        // The fast path's `enqueue_local` is gen-checked only at dequeue, so the
+        // stale id may sit on ready; the poll silently skips it. Either way the
+        // NEW task must still run exactly once and the run is undisturbed.
+        assert_eq!(core.poll_tick(EXEC_TICK_BUDGET), TickOutcome::AllDone);
+        assert!(new_done.get(), "the new task in the reused slot ran");
+    }
+
+    /// Two wakes before the next poll yield exactly ONE ready-queue entry.
+    #[test]
+    fn wake_dedupes() {
+        let core = Core::new();
+        let _g = CurrentExecGuard::install(&core);
+
+        let flag = Arc::new(AtomicBool::new(false));
+        let done = Rc::new(Cell::new(false));
+        let captured: Rc<StdRefCell<Option<Waker>>> = Rc::new(StdRefCell::new(None));
+        core.insert(Box::pin(CapturingFut {
+            flag: Arc::clone(&flag),
+            done: Rc::clone(&done),
+            captured: Rc::clone(&captured),
+        }));
+        assert_eq!(core.poll_tick(EXEC_TICK_BUDGET), TickOutcome::Idle);
+
+        let waker = captured.borrow().clone().expect("waker captured");
+        // Two wakes before the next drain/poll. Dedupe → at most one ready entry.
+        waker.wake_by_ref();
+        waker.wake_by_ref();
+        assert_eq!(core.ready_len(), 1, "two wakes dedupe to one ready entry");
+        assert!(core.drain_injected_was_empty());
+    }
+
+    /// A foreign-thread waker fired AND dropped AFTER the `Core` (and its
+    /// `Receiver`) is gone — the `send` error is swallowed, no panic.
+    #[test]
+    fn late_wake_after_executor_drop() {
+        // Build a core off-registry, capture a waker, then DROP the core.
+        let waker = {
+            let core = Core::new();
+            let flag = Arc::new(AtomicBool::new(false));
+            let done = Rc::new(Cell::new(false));
+            let captured: Rc<StdRefCell<Option<Waker>>> = Rc::new(StdRefCell::new(None));
+            core.insert(Box::pin(CapturingFut {
+                flag,
+                done,
+                captured: Rc::clone(&captured),
+            }));
+            assert_eq!(core.poll_tick(EXEC_TICK_BUDGET), TickOutcome::Idle);
+            let w = captured.borrow().clone().expect("waker captured");
+            w // core dropped at end of block (Receiver gone)
+        };
+        // Wake from a foreign thread after the executor is gone: must not panic.
+        let handle = std::thread::spawn(move || {
+            waker.wake(); // injected_tx.send fails silently; wake_parked no-op
+        });
+        handle.join().expect("late wake did not panic");
+    }
+
+    /// A task that wakes itself mid-poll (same thread, registry installed) and
+    /// returns Pending is re-queued and re-polled to completion.
+    #[test]
+    fn wake_during_poll_requeues() {
+        let core = Core::new();
+        let _g = CurrentExecGuard::install(&core);
+
+        struct SelfWakeOnce {
+            polls: u32,
+            done: Rc<Cell<bool>>,
+        }
+        impl Future for SelfWakeOnce {
+            type Output = ();
+            fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+                let this = self.get_mut();
+                this.polls += 1;
+                if this.polls == 1 {
+                    // Mid-poll self-wake: `queued` was cleared before this poll,
+                    // so the wake re-queues us via the same-thread fast path.
+                    cx.waker().wake_by_ref();
+                    Poll::Pending
+                } else {
+                    this.done.set(true);
+                    Poll::Ready(())
+                }
+            }
+        }
+        let done = Rc::new(Cell::new(false));
+        core.insert(Box::pin(SelfWakeOnce {
+            polls: 0,
+            done: Rc::clone(&done),
+        }));
+
+        // The mid-poll same-thread wake pushes the task back onto `ready` within
+        // the SAME tick, so one tick drives both polls to completion.
+        assert_eq!(core.poll_tick(EXEC_TICK_BUDGET), TickOutcome::AllDone);
+        assert!(done.get(), "the self-waking task re-polled and completed");
+    }
+
+    /// Native-only stress: 4 threads × ~10k wakes/aborts each against a churning
+    /// executor. Deterministic iteration count, no timing asserts. Too
+    /// real-thread-heavy for Miri.
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn cross_thread_wake_storm() {
+        const THREADS: usize = 4;
+        const PER_THREAD: usize = 10_000;
+
+        let core = Core::new();
+        let _g = CurrentExecGuard::install(&core);
+
+        // A pool of long-lived tasks that re-park (Pending) on each poll, each
+        // exposing its waker via a shared, thread-safe slot. Foreign threads pull
+        // a waker and fire it. The main thread churns: spawn/complete + drain.
+        let wakers: Arc<Mutex<Vec<Waker>>> = Arc::new(Mutex::new(Vec::new()));
+
+        // A future that re-registers its waker (into the shared pool) every poll
+        // and never completes on its own — driven purely by external wakes.
+        struct Parker {
+            pool: Arc<Mutex<Vec<Waker>>>,
+            polls: Arc<std::sync::atomic::AtomicUsize>,
+        }
+        impl Future for Parker {
+            type Output = ();
+            fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+                let this = self.get_mut();
+                this.polls.fetch_add(1, Ordering::Relaxed);
+                if let Ok(mut pool) = this.pool.lock() {
+                    pool.push(cx.waker().clone());
+                }
+                Poll::Pending
+            }
+        }
+
+        let poll_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        for _ in 0..THREADS {
+            core.insert(Box::pin(Parker {
+                pool: Arc::clone(&wakers),
+                polls: Arc::clone(&poll_count),
+            }));
+        }
+        // Prime: poll once so each Parker registers a waker.
+        let _ = core.poll_tick(EXEC_TICK_BUDGET);
+
+        // Foreign wakers.
+        let mut handles = Vec::new();
+        for _ in 0..THREADS {
+            let pool = Arc::clone(&wakers);
+            handles.push(std::thread::spawn(move || {
+                for _ in 0..PER_THREAD {
+                    // Pull whatever waker is available (may be none transiently);
+                    // wake it. Dedupe + gen checks make every wake safe.
+                    let w = pool.lock().ok().and_then(|mut p| p.pop());
+                    if let Some(w) = w {
+                        w.wake();
+                    }
+                }
+            }));
+        }
+
+        // Main thread churns: repeatedly drain + poll so Parkers re-register and
+        // the ready queue stays bounded. Fixed iteration count (deterministic).
+        for _ in 0..(THREADS * PER_THREAD) {
+            let _ = core.poll_tick(EXEC_TICK_BUDGET);
+            // Bound check: ready never exceeds the number of live tasks (a task
+            // is enqueued at most once thanks to dedupe).
+            assert!(core.ready_len() <= THREADS, "ready queue stayed bounded");
+        }
+
+        for h in handles {
+            h.join().expect("storm thread joined");
+        }
+        // Final drain — no panic, executor still consistent.
+        let _ = core.poll_tick(EXEC_TICK_BUDGET);
+        // The Parkers never complete; live count is still the original 4.
+        assert_eq!(core.live.get(), THREADS, "all parker tasks still live");
     }
 }
