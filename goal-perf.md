@@ -327,21 +327,32 @@ stated, results are measured.
   edge hosts.
   - Spec: `superpowers/specs/2026-06-12-embedding-api-design.md` · Plan: `superpowers/plans/2026-06-12-embedding-api.md`
 
-- 🟡 **WASM — wasm32 target + browser playground (spike-gated). Phase-0 spike = GO** (evidence on
-  `spike/wasm-target` `ae9d0f99`, kept). v1 = compile front-end + VM to wasm for an in-browser
-  playground on the docs site (compile+run, captured output, caps default-deny, wasm-compatible
-  stdlib subset); WASI/edge runtimes recorded as the evidence-gated follow-up.
-  - **SPIKE RESULT (GO, controller-verified):** the curated lib (`data,binary,log,shared` +
-    `crypto`+`datetime`) compiles for `wasm32-unknown-unknown` with three sanctioned probe patches
-    (build.rs cc-skip; tokio/rustyline target-dep split — `rt-multi-thread` is vestigial, `repl`
-    cfg-gated; `uuid`/`getrandom` `js` backend). The tokio executor cell PASSED end-to-end under
-    Node (`spawn_local` + `JoinHandle::abort` cancel-on-drop + `tokio::sync::mpsc` + await, NO
-    enter-guard needed); gcmodule cycle-collection + hello + async examples ran **byte-equal to
-    native** under Node (release 7/7; one debug-only `debug_assert` tail-padding caveat); `stacker`
-    needs NO patch; size **5.0 MB raw / 1.75 MB gzipped**, ~5.9 ms cold-instantiate. **NATIVE stayed
-    byte-identical** (`cargo tree` identical both configs, `vm_differential` 446/0, conformance
-    16/0+36/0 — the probe patches are native-transparent, re-verified by the controller). Phase 1
-    (the real implementation, re-done TDD off `main`) is pending.
+- ✅ **WASM — wasm32 target + browser playground (spike-gated). MERGED to `main` (`--no-ff`, `2120476d`).**
+  Spike-GATED → Phase-0 spike = GO (evidence kept on `spike/wasm-target` `ae9d0f99`, NOT merged), then
+  Phases 1-3 re-done TDD off `main`. The AScript front-end + async VM compile to
+  `wasm32-unknown-unknown` for an in-browser playground (compile+run, captured output, caps
+  default-DENY, wasm-compatible stdlib subset), with **ZERO native impact (Gate W-1: native
+  byte-identical)**. **Phase 1 (portability):** build.rs wasm cc-skip; `Cargo.toml` target-dep tables
+  (native row UNCHANGED — `cargo tree` byte-identical both configs; wasm row drops vestigial
+  `rt-multi-thread`, adds `wasm-bindgen`/`getrandom(js)`); `src/platform.rs` clock/entropy/sleep seam
+  BELOW the det seams (SP9 untouched); wasm recursion ceiling (`MAX_CALL_DEPTH` 1000 wasm/3000 native,
+  same panic message — a documented SP3-class platform asymmetry); workers fail with a clean Tier-2 on
+  wasm. **Phase 2 (wrapper):** `ascript-wasm/` (workspace-EXCLUDED, own `[workspace]`) — `run_program` →
+  `RunResult{ok,output,error,diagnostics,exitCode,durationMs}`, a Node test suite (13/13), a native↔wasm
+  **mini-differential 41/41 byte-equal**. **VENDORED gcmodule** (`vendor/gcmodule` via `[patch.crates-io]`,
+  `#[repr(C,align(8))]` on `GcHeader` — fixes a REAL wasm32 heap-corruption bug the spike had
+  mis-recorded as "debug-only"; a PROVEN no-op on 64-bit native where the 3-pointer header is already
+  24 B/8-aligned, re-verified by the holistic diff vs authentic 0.3.3 + `vm_differential` 446/0 + GC-stress)
+  + skip per-isolate `gc::collect()` on wasm. A `diagnostics::render_to_string(err,color)` reuse-refactor
+  (the CLI `report()` wraps it, native byte-identical). **Phase 3 (playground):** `docs/playground.html`
+  + a browser Web-Worker driver (Stop = terminate+respawn) + committed `pkg/` artifact +
+  `docs/content/tooling/playground.md` + NAV + index/reader/README links. **Invariants:** no new
+  engine/`Value`/opcode, `ASO_FORMAT_VERSION` 29 + `src/det.rs` + `src/vm/aso.rs` unchanged (0 diff vs
+  pre-WASM), `vm_differential` 446/0 BOTH configs, full native suite green both configs. Size 5.0 MB raw
+  / 1.75 MB gzipped, ~5.9 ms cold-instantiate. Each phase subagent-implemented + independently
+  opus-reviewed; the gcmodule vendoring (highest-risk root-graph GC change) got a dedicated upstream-diff
+  audit. WASI/edge runtimes + the Run▶-on-docs-code-blocks stretch recorded as v2 in `superpowers/roadmap.md`.
+  Now **20/21** (EXEC evidence-gated remains; JIT a recorded deferral).
   - Spec: `superpowers/specs/2026-06-12-wasm-target-design.md` · Plan: `superpowers/plans/2026-06-12-wasm-target.md`
 
 ### Flagship & ecosystem track
@@ -419,6 +430,34 @@ stated, results are measured.
   revisit inline short strings ONLY behind its measured-win gate.
 
 ## EXECUTION LOG (live)
+
+- **WASM** — ✅ MERGED to `main` (`--no-ff`, `2120476d`). wasm32 target + browser playground, SPIKE-GATED. The
+  Phase-0 feasibility spike (a fixed build/executor/size matrix) returned a **GO** with full evidence under Node
+  (curated lib compiles for `wasm32-unknown-unknown`, the tokio `spawn_local`+abort executor works, examples run
+  byte-equal to native, gcmodule collects) — kept on `spike/wasm-target` `ae9d0f99` (NOT merged; the JIT-spec
+  honored-spike posture, except here it GO'd). Phases 1-3 then re-done TDD off `main`, each subagent-implemented +
+  independently opus-reviewed + controller-verified. **The campaign bedrock — Gate W-1 (native byte-identical) —
+  held whole-branch:** `cargo tree -e normal` byte-identical to pre-WASM in BOTH feature configs (the ONLY change
+  is the gcmodule `[patch.crates-io]` path redirect + the 4 wasm target-deps); `vm_differential` 446/0 BOTH configs;
+  `src/det.rs` + `src/vm/aso.rs` 0-diff (`ASO_FORMAT_VERSION` 29). Portability is ALL `#[cfg(target_family="wasm")]` /
+  target-dep tables / build.rs TARGET checks — native code paths byte-for-byte unchanged (the `src/platform.rs`
+  clock/entropy/sleep seam sits BELOW the SP9 det seams; the native arms are the verbatim old inline bodies).
+  **The riskiest change — vendoring gcmodule** (the root-graph GC): a wasm32 `GcHeader` 3-pointer-header alignment
+  bug (12 B not 8-aligned → the `CcBox` value offset was 4 bytes short → heap corruption; the spike had
+  mis-recorded it as a "debug-only `debug_assert`" but it was real corruption release codegen sometimes hid) fixed
+  by `#[repr(C, align(8))]`, vendored. The Phase-2 AND holistic reviewers each **diffed the vendored copy against
+  the authentic published 0.3.3 crate** and confirmed the ONLY logic change is that one attribute (a proven no-op
+  on 64-bit native where the header is already 24 B/8-aligned) + dead-code removal — proven native-safe by 446/0 +
+  17/0 gc + 34/0 property GC-stress. **The wasm side genuinely works:** `wasm-pack test --node` 13/13 (incl.
+  heap-corruption regression guards, clean deep-recursion panic, deny-all cap denial, no-ANSI errors); a native↔wasm
+  **mini-differential 41/41 byte-equal** (the cross-platform byte-identity proof, the vm_differential analogue). The
+  `ascript-wasm/` wrapper is workspace-EXCLUDED (own `[workspace]`, absent from the root `cargo tree`, like `capi/`).
+  Browser playground shipped (`docs/playground.html` + Web-Worker driver + committed `pkg/` + `docs/content/tooling/
+  playground.md` + NAV). **One review finding fixed in-branch** (Phase 1): a flaky `entropy_seed` test asserting
+  per-call variance the nanos+stackaddr seed never guaranteed (~98% collision) — dropped the unsound assertion, prod
+  seed untouched. Size 5.0 MB raw / 1.75 MB gzipped, ~5.9 ms cold-instantiate. Recorded v2 (`superpowers/roadmap.md`):
+  WASI/edge runtimes, the Run▶-on-docs-code-blocks stretch, an upstream gcmodule align patch. Now **20/21** (EXEC
+  evidence-gated remains; JIT a recorded deferral).
 
 - **REPLAY** — ✅ MERGED to `main` (`--no-ff`, `e6229e68`). Record/replay as a user-facing flagship: 13 commits
   (Tasks 0-11), each subagent-implemented + independently opus-reviewed + controller-verified (vm_differential

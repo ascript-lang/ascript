@@ -1,10 +1,16 @@
 # AScript wasm32 Target + Browser Playground — Design (WASM)
 
-- **Status:** Draft for review — **SPIKE-GATED.** Phase 0 is a build-matrix feasibility spike
-  with a recorded GO/NO-GO; nothing past Phase 0 is implemented until the GO is recorded in
-  §10 (the evidence appendix) and `goal-perf.md`. A NO-GO — per-blocker, with failing output
-  committed — is an **honored outcome**, exactly the posture of
-  `superpowers/specs/2026-06-08-baseline-jit-design.md` §0.
+- **Status:** Implemented — MERGED to `main` (`--no-ff`, `2120476d`). The Phase-0 feasibility
+  spike (the gate) returned **GO** (evidence on `spike/wasm-target` `ae9d0f99`, kept unmerged;
+  §10 has the matrix); Phases 1-3 were then re-done TDD off `main`, native byte-identical (Gate
+  W-1, proven whole-branch in both feature configs). **Deltas from this draft, all owner-noted:**
+  (1) the spike recorded the gcmodule wasm32 issue as a "debug-only `debug_assert`" caveat, but
+  Phase 2 found it was a REAL heap-corruption bug (a `GcHeader` 3-pointer alignment defect) and
+  fixed it by VENDORING gcmodule with `#[repr(C, align(8))]` (a proven no-op on 64-bit native);
+  (2) `stacker` needed NO wasm patch (compiles + degrades `maybe_grow` to run-on-current-stack);
+  (3) the Run▶-on-docs-code-blocks stretch (§5.5/Task 3.3) was DEFERRED to v2 (roadmap-noted).
+  The original spike-gate posture (a NO-GO would have been an honored outcome, the
+  `superpowers/specs/2026-06-08-baseline-jit-design.md` §0 stance) is preserved in §0/§4.6.
 - **Date:** 2026-06-12
 - **Code:** WASM (the "Deployment & reach track" item of `goal-perf.md`)
 - **Depends on:** nothing in the engine waves (independent of LANE/CALL/SHAPE/NANB/DECODE).
