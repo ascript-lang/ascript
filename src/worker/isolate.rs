@@ -361,7 +361,7 @@ where
     let interp = Rc::new(crate::interp::Interp::new());
     interp.install_self();
     let vm = Vm::new(interp);
-    local.block_on(&rt, make_loop(vm));
+    local.block_on(&rt, crate::exec::run_scoped_root(make_loop(vm)));
 }
 
 /// The per-isolate request loop. A fresh `Interp`/`Vm` is created ONCE and reused for

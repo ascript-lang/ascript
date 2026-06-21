@@ -1069,7 +1069,7 @@ mod tests {
 
         let local = tokio::task::LocalSet::new();
         local
-            .run_until(async {
+            .run_until(crate::exec::run_scoped_root(async {
                 // Run the fragment top-level to define the closure globals.
                 let mut fiber = crate::vm::fiber::Fiber::new(closure);
                 match vm.run(&mut fiber).await? {
@@ -1081,7 +1081,7 @@ mod tests {
                     .user_global(entry_name)
                     .expect("entry global defined by the fragment");
                 vm.call_value(entry, args, Span::new(0, 0)).await
-            })
+            }))
             .await
     }
 

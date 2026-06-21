@@ -185,7 +185,7 @@ where
                 .build()
                 .expect("failed to build worker tokio runtime");
             let local = tokio::task::LocalSet::new();
-            local.block_on(&rt, make_fut())
+            local.block_on(&rt, crate::exec::run_scoped_root(make_fut()))
         })
         .expect("failed to spawn worker thread")
         .join()
@@ -505,13 +505,19 @@ pub async fn run_file_with_packages(
     // the cell in scope on the CLI tree-walker path — matching every other entry point
     // (run_source, the VM run paths). Without it the deadline/trace locals silently
     // no-op here, diverging from the VM on `ascript run file.as --tree-walker`.
+    // CNTR §6 exit-hang fix: abort daemon signal listeners (a `process.on` listener
+    // loops forever) AFTER the root completes but BEFORE the executor's survivor
+    // drain — else the bespoke `drain()` blocks forever on the live listener task.
     let result = local
-        .run_until(crate::interp::ambient_root_scope(interp.load_module(path)))
+        .run_until(crate::exec::run_scoped_root_then(
+            crate::interp::ambient_root_scope(interp.load_module(path)),
+            {
+                let interp = interp.clone();
+                move || interp.abort_signal_listeners()
+            },
+        ))
         .await;
-    // CNTR §6 exit-hang fix: abort daemon signal listeners so they don't block the
-    // task drain below (a `process.on` listener loops forever — see the helper doc).
-    interp.abort_signal_listeners();
-    local.await; // drain spawned tasks (structured join) — no-op until Phase 2
+    local.await; // drain residual LocalSet tokio tasks (structured join)
                  // End-of-program cycle collection (V13-T3): the tree-walker shares
                  // the same `Cc` value model, so a final sweep here reclaims any
                  // leftover cycles on clean shutdown. Output already streamed (Live).
@@ -740,7 +746,7 @@ async fn run_one_file_with_coverage(
     let local = tokio::task::LocalSet::new();
     let mut file_summary = TestSummary::default();
     let run_result: Result<(), AsError> = local
-        .run_until(crate::interp::ambient_root_scope(async {
+        .run_until(crate::exec::run_scoped_root(crate::interp::ambient_root_scope(async {
             // Run the module body (registers tests; coverage records its lines).
             match vm.run(&mut fiber).await {
                 Ok(RunOutcome::Done(_)) | Err(crate::interp::Control::Propagate(_)) => {}
@@ -766,7 +772,7 @@ async fn run_one_file_with_coverage(
                 Err(crate::interp::Control::Panic(e)) => Err(e.with_source(src_info.clone())),
                 Err(crate::interp::Control::Propagate(_)) => Ok(()),
             }
-        }))
+        })))
         .await;
     local.await;
     crate::gc::collect();
@@ -837,7 +843,7 @@ async fn run_tests_serial(
     interp.install_self();
     let local = tokio::task::LocalSet::new();
     let result: Result<TestSummary, AsError> = local
-        .run_until(crate::interp::ambient_root_scope(async {
+        .run_until(crate::exec::run_scoped_root(crate::interp::ambient_root_scope(async {
             for file in files {
                 match interp.load_module(Path::new(file)).await {
                     Ok(_) | Err(crate::interp::Control::Propagate(_)) => {}
@@ -860,7 +866,7 @@ async fn run_tests_serial(
                 Err(crate::interp::Control::Panic(e)) => Err(e),
                 Err(crate::interp::Control::Propagate(_)) => Ok(TestSummary::default()),
             }
-        }))
+        })))
         .await;
     local.await; // drain spawned tasks — no-op until Phase 2
 
@@ -1032,7 +1038,7 @@ pub async fn run_tests_record(
         }
 
         let run: FileRun = local
-            .run_until(crate::interp::ambient_root_scope(async {
+            .run_until(crate::exec::run_scoped_root(crate::interp::ambient_root_scope(async {
                 match interp.load_module(path).await {
                     Ok(_) | Err(crate::interp::Control::Propagate(_)) => {}
                     Err(crate::interp::Control::Panic(e)) => {
@@ -1062,7 +1068,7 @@ pub async fn run_tests_record(
                         summary: TestSummary::default(),
                     },
                 }
-            }))
+            })))
             .await;
         local.await;
 
@@ -1227,7 +1233,7 @@ pub async fn run_test_replay(
 
     let local = tokio::task::LocalSet::new();
     let result: Result<TestSummary, AsError> = local
-        .run_until(crate::interp::ambient_root_scope(async {
+        .run_until(crate::exec::run_scoped_root(crate::interp::ambient_root_scope(async {
             match interp.load_module(&prog).await {
                 Ok(_) | Err(crate::interp::Control::Propagate(_)) => {}
                 Err(crate::interp::Control::Panic(e)) => return Err(e),
@@ -1249,7 +1255,7 @@ pub async fn run_test_replay(
                 Err(crate::interp::Control::Panic(e)) => Err(e),
                 Err(crate::interp::Control::Propagate(_)) => Ok(TestSummary::default()),
             }
-        }))
+        })))
         .await;
     local.await;
     interp.set_determinism(None);
@@ -1319,7 +1325,7 @@ async fn run_tests_parallel(
 
     let local = tokio::task::LocalSet::new();
     let per_file: Vec<crate::worker::testrun::FileRunResult> = local
-        .run_until(crate::interp::ambient_root_scope(async {
+        .run_until(crate::exec::run_scoped_root(crate::interp::ambient_root_scope(async {
             // Spawn one local task per file; each acquires a permit (bounded concurrency)
             // then runs its file in an isolate. The task index pins the result slot, so
             // completion order is irrelevant to aggregation.
@@ -1369,7 +1375,7 @@ async fn run_tests_parallel(
                 results.push(r);
             }
             results
-        }))
+        })))
         .await;
     local.await;
 
@@ -1434,14 +1440,19 @@ pub async fn run_source_exit(src: &str) -> Result<(String, Option<i32>), AsError
     let local = tokio::task::LocalSet::new();
     // DEFER §2.3: use `exec_program` (installs + drains the top-level defer frame)
     // so top-level `defer` statements run at program end.
+    // CNTR §6 exit-hang fix: abort daemon signal listeners AFTER root, BEFORE the
+    // executor drain (see `run_scoped_root_then`'s doc — a `process.on` listener
+    // never retires, so it must be aborted before the bespoke `drain()`).
     let result = local
-        .run_until(crate::interp::ambient_root_scope(
-            interp.exec_program(&program, &env),
+        .run_until(crate::exec::run_scoped_root_then(
+            crate::interp::ambient_root_scope(interp.exec_program(&program, &env)),
+            {
+                let interp = interp.clone();
+                move || interp.abort_signal_listeners()
+            },
         ))
         .await;
-    // CNTR §6 exit-hang fix: abort daemon signal listeners (see helper doc).
-    interp.abort_signal_listeners();
-    local.await; // drain spawned tasks — no-op until Phase 2
+    local.await; // drain residual LocalSet tokio tasks
     match result {
         // Any `Ok(Flow)` is normal program completion. `exec_program` converts a
         // top-level `break`/`continue` into `Err(Control::Panic("… outside of a
@@ -1479,9 +1490,9 @@ pub async fn run_source_deterministic(src: &str, seed: u64) -> Result<String, As
     let local = tokio::task::LocalSet::new();
     // DEFER §2.3: exec_program installs the top-level defer frame.
     let result = local
-        .run_until(crate::interp::ambient_root_scope(
+        .run_until(crate::exec::run_scoped_root(crate::interp::ambient_root_scope(
             interp.exec_program(&program, &env),
-        ))
+        )))
         .await;
     local.await;
     match result {
@@ -1513,7 +1524,7 @@ pub async fn run_source_with_interp(src: &str) -> Result<(String, Rc<Interp>), A
     // `startSpan` parenting works (per-task isolation; spec §9.3).
     // DEFER §2.3: exec_program installs the top-level defer frame.
     let root = crate::interp::ambient_root_scope(interp.exec_program(&program, &env));
-    let result = local.run_until(root).await;
+    let result = local.run_until(crate::exec::run_scoped_root(root)).await;
     local.await;
     match result {
         Ok(_) => Ok((interp.output(), interp)),
@@ -1567,7 +1578,7 @@ pub async fn vm_run_source_with_interp(src: &str) -> Result<(String, Rc<Interp>)
     let mut fiber = crate::vm::fiber::Fiber::new(closure);
     let local = tokio::task::LocalSet::new();
     let result = local
-        .run_until(crate::interp::ambient_root_scope(vm.run(&mut fiber)))
+        .run_until(crate::exec::run_scoped_root(crate::interp::ambient_root_scope(vm.run(&mut fiber))))
         .await;
     local.await;
     crate::gc::collect();
@@ -1598,9 +1609,9 @@ pub async fn tw_run_stmts(
     let env = crate::interp::global_env().child();
     let local = tokio::task::LocalSet::new();
     let result = local
-        .run_until(crate::interp::ambient_root_scope(
+        .run_until(crate::exec::run_scoped_root(crate::interp::ambient_root_scope(
             interp.exec_program(&stmts, &env),
-        ))
+        )))
         .await;
     local.await;
     match result {
@@ -1640,9 +1651,9 @@ pub async fn tw_run_source_elided(src: &str) -> Result<(String, crate::elide_mar
     let env = crate::interp::global_env().child();
     let local = tokio::task::LocalSet::new();
     let result = local
-        .run_until(crate::interp::ambient_root_scope(
+        .run_until(crate::exec::run_scoped_root(crate::interp::ambient_root_scope(
             interp.exec_program(&program, &env),
-        ))
+        )))
         .await;
     local.await;
     match result {
@@ -1696,7 +1707,7 @@ pub async fn vm_eval_source(src: &str) -> Result<crate::value::Value, AsError> {
 
     let local = tokio::task::LocalSet::new();
     let outcome = local
-        .run_until(vm.run(&mut fiber))
+        .run_until(crate::exec::run_scoped_root(vm.run(&mut fiber)))
         .await
         .map_err(|c| control_to_aserror(c).with_source(src_info))?;
     match outcome {
@@ -1777,10 +1788,17 @@ pub async fn wasm_run_source(
     let mut fiber = crate::vm::fiber::Fiber::new(closure);
 
     let local = tokio::task::LocalSet::new();
+    // CNTR §6 exit-hang fix: abort daemon signal listeners after root, before the
+    // executor survivor drain (see `run_scoped_root_then`'s doc).
     let result = local
-        .run_until(crate::interp::ambient_root_scope(vm.run(&mut fiber)))
+        .run_until(crate::exec::run_scoped_root_then(
+            crate::interp::ambient_root_scope(vm.run(&mut fiber)),
+            {
+                let interp = interp.clone();
+                move || interp.abort_signal_listeners()
+            },
+        ))
         .await;
-    interp.abort_signal_listeners();
     local.await;
 
     // Snapshot the captured output and the return value, then drop the isolate's GC roots
@@ -1868,7 +1886,7 @@ pub async fn vm_run_source_deterministic(src: &str, seed: u64) -> Result<String,
 
     let local = tokio::task::LocalSet::new();
     let result = local
-        .run_until(crate::interp::ambient_root_scope(vm.run(&mut fiber)))
+        .run_until(crate::exec::run_scoped_root(crate::interp::ambient_root_scope(vm.run(&mut fiber))))
         .await;
     local.await;
     crate::gc::collect();
@@ -1907,7 +1925,7 @@ pub async fn run_source_with_trace(src: &str, replay: bool) -> Result<String, As
     let env = crate::interp::global_env().child();
     let local = tokio::task::LocalSet::new();
     let root = crate::interp::ambient_root_scope(interp.exec_program(&program, &env));
-    let result = local.run_until(root).await;
+    let result = local.run_until(crate::exec::run_scoped_root(root)).await;
     local.await;
     match result {
         Ok(_) => Ok(interp.output()),
@@ -1961,7 +1979,7 @@ pub async fn vm_run_source_with_trace(src: &str, replay: bool) -> Result<String,
     let mut fiber = crate::vm::fiber::Fiber::new(closure);
     let local = tokio::task::LocalSet::new();
     let result = local
-        .run_until(crate::interp::ambient_root_scope(vm.run(&mut fiber)))
+        .run_until(crate::exec::run_scoped_root(crate::interp::ambient_root_scope(vm.run(&mut fiber))))
         .await;
     local.await;
     crate::gc::collect();
@@ -2058,7 +2076,7 @@ pub async fn vm_run_source_call_fast_stats(
     let vm = Vm::with_flags(interp.clone(), true, true, true);
     let mut fiber = crate::vm::fiber::Fiber::new(closure);
     let local = tokio::task::LocalSet::new();
-    let result = local.run_until(vm.run(&mut fiber)).await;
+    let result = local.run_until(crate::exec::run_scoped_root(vm.run(&mut fiber))).await;
     local.await;
     crate::gc::collect();
     let stats = vm.call_fast_stats();
@@ -2116,7 +2134,7 @@ pub async fn vm_run_source_obj_mode_stats(
     let vm = Vm::with_flags(interp.clone(), true, true, true);
     let mut fiber = crate::vm::fiber::Fiber::new(closure);
     let local = tokio::task::LocalSet::new();
-    let result = local.run_until(vm.run(&mut fiber)).await;
+    let result = local.run_until(crate::exec::run_scoped_root(vm.run(&mut fiber))).await;
     local.await;
     crate::gc::collect();
     let mode_stats = vm.obj_mode_stats();
@@ -2272,7 +2290,7 @@ pub async fn vm_run_source_elided(src: &str) -> Result<(String, Option<i32>), As
     let vm = Vm::with_flags(interp.clone(), true, true, true);
     let mut fiber = crate::vm::fiber::Fiber::new(closure);
     let local = tokio::task::LocalSet::new();
-    let result = local.run_until(vm.run(&mut fiber)).await;
+    let result = local.run_until(crate::exec::run_scoped_root(vm.run(&mut fiber))).await;
     local.await;
     crate::gc::collect();
     match result {
@@ -2327,7 +2345,7 @@ pub async fn vm_run_source_elided_generic(src: &str) -> Result<(String, Option<i
     let vm = Vm::with_flags(interp.clone(), false, true, true);
     let mut fiber = crate::vm::fiber::Fiber::new(closure);
     let local = tokio::task::LocalSet::new();
-    let result = local.run_until(vm.run(&mut fiber)).await;
+    let result = local.run_until(crate::exec::run_scoped_root(vm.run(&mut fiber))).await;
     local.await;
     crate::gc::collect();
     match result {
@@ -2383,7 +2401,7 @@ pub async fn vm_run_source_paranoid(src: &str) -> Result<(String, Option<i32>), 
     let vm = Vm::with_flags(interp.clone(), true, true, true);
     let mut fiber = crate::vm::fiber::Fiber::new(closure);
     let local = tokio::task::LocalSet::new();
-    let result = local.run_until(vm.run(&mut fiber)).await;
+    let result = local.run_until(crate::exec::run_scoped_root(vm.run(&mut fiber))).await;
     local.await;
     crate::gc::collect();
     match result {
@@ -2465,7 +2483,7 @@ pub async fn vm_run_source_paranoid_with_fake_call_proof(src: &str) -> String {
     let vm = Vm::with_flags(interp.clone(), true, true, true);
     let mut fiber = crate::vm::fiber::Fiber::new(closure);
     let local = tokio::task::LocalSet::new();
-    let result = local.run_until(vm.run(&mut fiber)).await;
+    let result = local.run_until(crate::exec::run_scoped_root(vm.run(&mut fiber))).await;
     local.await;
     crate::gc::collect();
     match result {
@@ -2501,9 +2519,9 @@ pub async fn tw_run_source_paranoid(src: &str) -> Result<String, String> {
     let env = crate::interp::global_env().child();
     let local = tokio::task::LocalSet::new();
     let result = local
-        .run_until(crate::interp::ambient_root_scope(
+        .run_until(crate::exec::run_scoped_root(crate::interp::ambient_root_scope(
             interp.exec_program(&program, &env),
-        ))
+        )))
         .await;
     local.await;
     match result {
@@ -2543,9 +2561,9 @@ pub async fn tw_run_source_paranoid_with_fake_call_proof(src: &str) -> String {
     let env = crate::interp::global_env().child();
     let local = tokio::task::LocalSet::new();
     let result = local
-        .run_until(crate::interp::ambient_root_scope(
+        .run_until(crate::exec::run_scoped_root(crate::interp::ambient_root_scope(
             interp.exec_program(&program, &env),
-        ))
+        )))
         .await;
     local.await;
     match result {
@@ -2632,7 +2650,7 @@ pub async fn vm_run_source_census(
     vm.arm_census();
     let mut fiber = crate::vm::fiber::Fiber::new(closure);
     let local = tokio::task::LocalSet::new();
-    let result = local.run_until(vm.run(&mut fiber)).await;
+    let result = local.run_until(crate::exec::run_scoped_root(vm.run(&mut fiber))).await;
     local.await;
     crate::gc::collect();
     // Surface a program error so the harness can SKIP the file (e.g. a feature-
@@ -2690,7 +2708,7 @@ async fn vm_run_source_decode_cfg(
     let vm = Vm::with_all_flags(interp.clone(), true, true, true, decode, decode_inline, decode_tos, decode_threshold);
     let mut fiber = crate::vm::fiber::Fiber::new(closure);
     let local = tokio::task::LocalSet::new();
-    let result = local.run_until(vm.run(&mut fiber)).await;
+    let result = local.run_until(crate::exec::run_scoped_root(vm.run(&mut fiber))).await;
     local.await;
     crate::gc::collect();
     let pair = match result {
@@ -2745,7 +2763,7 @@ async fn vm_run_source_decode_stats_cfg(
     let vm = Vm::with_all_flags(interp.clone(), true, true, true, decode, decode_inline, decode_tos, decode_threshold);
     let mut fiber = crate::vm::fiber::Fiber::new(closure);
     let local = tokio::task::LocalSet::new();
-    let result = local.run_until(vm.run(&mut fiber)).await;
+    let result = local.run_until(crate::exec::run_scoped_root(vm.run(&mut fiber))).await;
     local.await;
     crate::gc::collect();
     // Read the DECODE stat counters before consuming result (they are already
@@ -2823,7 +2841,7 @@ pub async fn aso_roundtrip_run_source(src: &str) -> Result<(String, Option<i32>)
     let mut fiber = crate::vm::fiber::Fiber::new(closure);
 
     let local = tokio::task::LocalSet::new();
-    let result = local.run_until(vm.run(&mut fiber)).await;
+    let result = local.run_until(crate::exec::run_scoped_root(vm.run(&mut fiber))).await;
     local.await;
     crate::gc::collect();
     match result {
@@ -2885,7 +2903,7 @@ pub async fn aso_runnable_accept(bytes: &[u8]) {
     let local = tokio::task::LocalSet::new();
     // Discard the outcome: a clean `RunOutcome`/`Control` (including a script-level Tier-2
     // `Panic`) is fine — only a HOST panic, which propagates past this `.await`, is the finding.
-    let _ = local.run_until(vm.run(&mut fiber)).await;
+    let _ = local.run_until(crate::exec::run_scoped_root(vm.run(&mut fiber))).await;
     local.await;
     crate::gc::collect();
 }
@@ -3047,7 +3065,7 @@ pub async fn build_file_with_pgo(
         let local = tokio::task::LocalSet::new();
         // Absorb ALL outcomes (panic / propagate / exit) — a panicking training run
         // still produces a (possibly partial) PGO section (spec §3.4).
-        let _ = local.run_until(vm.run(&mut fiber)).await;
+        let _ = local.run_until(crate::exec::run_scoped_root(vm.run(&mut fiber))).await;
         local.await;
         crate::gc::collect();
     }
@@ -4764,10 +4782,16 @@ async fn run_entry_proto_to_exit(
 
     let local = tokio::task::LocalSet::new();
     let result = local
-        .run_until(crate::interp::ambient_root_scope(vm.run(&mut fiber)))
-        .await;
-    // CNTR §6 exit-hang fix: abort daemon signal listeners (see helper doc).
-    interp.abort_signal_listeners();
+        .run_until(crate::exec::run_scoped_root_then(
+            crate::interp::ambient_root_scope(vm.run(&mut fiber)),
+            {
+                let interp = interp.clone();
+                // CNTR §6 exit-hang fix: abort daemon signal listeners after
+                // root, before the executor drain (see helper doc).
+                move || interp.abort_signal_listeners()
+            },
+        ))
+            .await;
     // SP12: flush any buffered telemetry on the existing shutdown path (spec §2).
     local.run_until(interp.telemetry_flush_on_exit()).await;
     local.await; // drain spawned tasks
@@ -4997,11 +5021,16 @@ pub async fn run_file_on_vm_with_packages(
 
     let local = tokio::task::LocalSet::new();
     let result = local
-        .run_until(crate::interp::ambient_root_scope(vm.run(&mut fiber)))
-        .await;
-    // CNTR §6 exit-hang fix: abort daemon signal listeners so they don't block the
-    // task drain below (a `process.on` listener loops forever — see the helper doc).
-    interp.abort_signal_listeners();
+        .run_until(crate::exec::run_scoped_root_then(
+            crate::interp::ambient_root_scope(vm.run(&mut fiber)),
+            {
+                let interp = interp.clone();
+                // CNTR §6 exit-hang fix: abort daemon signal listeners after
+                // root, before the executor drain (see helper doc).
+                move || interp.abort_signal_listeners()
+            },
+        ))
+            .await;
     // SP12: flush any buffered telemetry on the existing shutdown path (spec §2).
     local.run_until(interp.telemetry_flush_on_exit()).await;
     local.await; // drain spawned tasks (structured join)
@@ -5498,10 +5527,16 @@ pub async fn run_file_decode_cfg(
 
     let local = tokio::task::LocalSet::new();
     let result = local
-        .run_until(crate::interp::ambient_root_scope(vm.run(&mut fiber)))
-        .await;
-    // CNTR §6 exit-hang fix: abort daemon signal listeners (see helper doc).
-    interp.abort_signal_listeners();
+        .run_until(crate::exec::run_scoped_root_then(
+            crate::interp::ambient_root_scope(vm.run(&mut fiber)),
+            {
+                let interp = interp.clone();
+                // CNTR §6 exit-hang fix: abort daemon signal listeners after
+                // root, before the executor drain (see helper doc).
+                move || interp.abort_signal_listeners()
+            },
+        ))
+            .await;
     local.run_until(interp.telemetry_flush_on_exit()).await;
     local.await;
     crate::gc::collect();
@@ -5625,10 +5660,16 @@ pub async fn run_file_on_vm_profiled(
 
     let local = tokio::task::LocalSet::new();
     let result = local
-        .run_until(crate::interp::ambient_root_scope(vm.run(&mut fiber)))
-        .await;
-    // CNTR §6 exit-hang fix: abort daemon signal listeners (see helper doc).
-    interp.abort_signal_listeners();
+        .run_until(crate::exec::run_scoped_root_then(
+            crate::interp::ambient_root_scope(vm.run(&mut fiber)),
+            {
+                let interp = interp.clone();
+                // CNTR §6 exit-hang fix: abort daemon signal listeners after
+                // root, before the executor drain (see helper doc).
+                move || interp.abort_signal_listeners()
+            },
+        ))
+            .await;
     local.run_until(interp.telemetry_flush_on_exit()).await;
     local.await;
     crate::gc::collect();
@@ -5740,7 +5781,8 @@ async fn vm_run_source_cfg_call_fast(
 
 #[cfg(not(ascript_rt))]
 /// Like [`vm_run_source_cfg`] but also returns the LANE counters (LANE §6.4):
-/// `(output, exit_code, lane_sync_ops, lane_bursts)`.
+/// `(output, exit_code, lane_sync_ops, lane_bursts)`. The program root runs on
+/// the bespoke executor (EXEC P2).
 async fn vm_run_source_cfg_stats(
     src: &str,
     specialize: bool,
@@ -5749,6 +5791,29 @@ async fn vm_run_source_cfg_stats(
     sync_lane: bool,
     call_fast: bool,
 ) -> Result<(String, Option<i32>, u64, u64), AsError> {
+    let (output, exit, sync_ops, bursts, _spawned) =
+        vm_run_source_cfg_stats_exec(src, specialize, armed, coverage, sync_lane, call_fast, true)
+            .await?;
+    Ok((output, exit, sync_ops, bursts))
+}
+
+#[cfg(not(ascript_rt))]
+/// The shared body for [`vm_run_source_cfg_stats`] and the EXEC test entries. The
+/// `use_executor` flag selects the task driver: `true` wraps the program root in
+/// [`crate::exec::run_scoped_root`] (the bespoke executor — the default path,
+/// EXEC P2); `false` drives the root on stock tokio (the tokio differential axis,
+/// Task 8). Also returns the bespoke `Core::spawned_total()` (0 on the tokio
+/// path) for the coverage assertion.
+#[allow(clippy::too_many_arguments)]
+async fn vm_run_source_cfg_stats_exec(
+    src: &str,
+    specialize: bool,
+    armed: bool,
+    coverage: bool,
+    sync_lane: bool,
+    call_fast: bool,
+    use_executor: bool,
+) -> Result<(String, Option<i32>, u64, u64, u64), AsError> {
     use crate::vm::chunk::FnProto;
     use crate::vm::value_ext::{Closure, RunOutcome};
     use crate::vm::Vm;
@@ -5802,14 +5867,23 @@ async fn vm_run_source_cfg_stats(
     let mut fiber = crate::vm::fiber::Fiber::new(closure);
 
     let local = tokio::task::LocalSet::new();
-    let result = local.run_until(vm.run(&mut fiber)).await;
-    local.await; // drain spawned tasks — no-op until later VM slices
+    // EXEC P2 task-driver selection. `use_executor` → the bespoke executor (the
+    // default path), captured via `run_scoped_root_stats` so we also read its
+    // `spawned_total`. `!use_executor` → stock tokio (the Task-8 tokio axis;
+    // `spawned == 0` since no bespoke `Core` is installed).
+    let (result, spawned) = if use_executor {
+        local
+            .run_until(crate::exec::run_scoped_root_stats(vm.run(&mut fiber)))
+            .await
+    } else {
+        (local.run_until(vm.run(&mut fiber)).await, 0)
+    };
+    local.await; // drain residual LocalSet tokio tasks (no-op in pure-bespoke)
                  // End-of-program cycle collection (V13-T3): see `run_aso_file`. The
                  // output is already captured on `interp`, so a final sweep of dead
                  // cycles is observably invisible.
     crate::gc::collect();
-    // LANE §6.4: read counters after the run completes (Task 4 wires these up;
-    // for now they are always 0).
+    // LANE §6.4: read counters after the run completes.
     let lane_sync_ops = vm.lane_sync_ops();
     let lane_bursts = vm.lane_bursts();
     let pair = match result {
@@ -5822,7 +5896,35 @@ async fn vm_run_source_cfg_stats(
         // exit(n) — return the captured output plus the exit code.
         Err(crate::interp::Control::Exit(code)) => Ok((interp.output(), Some(code))),
     }?;
-    Ok((pair.0, pair.1, lane_sync_ops, lane_bursts))
+    Ok((pair.0, pair.1, lane_sync_ops, lane_bursts, spawned))
+}
+
+#[cfg(not(ascript_rt))]
+/// **EXEC P2 test entry — the tokio differential axis (Task 8).** Identical to
+/// [`vm_run_source`] but FORCES the bespoke executor OFF: the program root is
+/// driven on stock tokio (`local.run_until(root).await; local.await;`), NOT
+/// wrapped in [`crate::exec::run_scoped_root`]. Pairs with the default (bespoke)
+/// entries so the differential can prove bespoke == tokio without touching the
+/// process-global `ASCRIPT_EXECUTOR` env var (parallel-test hygiene).
+#[doc(hidden)]
+pub async fn vm_run_source_tokio_exec(src: &str) -> Result<(String, Option<i32>), AsError> {
+    let (output, exit, _, _, _) =
+        vm_run_source_cfg_stats_exec(src, true, false, false, true, true, false).await?;
+    Ok((output, exit))
+}
+
+#[cfg(not(ascript_rt))]
+/// **EXEC P2 test entry — the coverage assertion (Task 8).** Like
+/// [`vm_run_source`] (bespoke executor) but ALSO returns the bespoke
+/// `Core::spawned_total()` captured after the drain, so a test can prove the
+/// executor actually drove tasks (not silently fell through to tokio).
+#[doc(hidden)]
+pub async fn vm_run_source_exec_stats(
+    src: &str,
+) -> Result<(String, Option<i32>, u64), AsError> {
+    let (output, exit, _, _, spawned) =
+        vm_run_source_cfg_stats_exec(src, true, false, false, true, true, true).await?;
+    Ok((output, exit, spawned))
 }
 
 #[cfg(not(ascript_rt))]
@@ -5877,7 +5979,7 @@ pub async fn vm_run_file_captured(entry: &Path) -> Result<(String, Option<i32>),
     let mut fiber = crate::vm::fiber::Fiber::new(closure);
 
     let local = tokio::task::LocalSet::new();
-    let result = local.run_until(vm.run(&mut fiber)).await;
+    let result = local.run_until(crate::exec::run_scoped_root(vm.run(&mut fiber))).await;
     local.await;
     crate::gc::collect();
     match result {
@@ -5958,7 +6060,7 @@ pub async fn run_archive(
     let mut fiber = crate::vm::fiber::Fiber::new(closure);
 
     let local = tokio::task::LocalSet::new();
-    let result = local.run_until(vm.run(&mut fiber)).await;
+    let result = local.run_until(crate::exec::run_scoped_root(vm.run(&mut fiber))).await;
     local.await;
     crate::gc::collect();
     match result {
@@ -6017,7 +6119,7 @@ impl PgoSeedHandle {
         let closure = Closure::new(Rc::clone(&self.entry_proto));
         let mut fiber = crate::vm::fiber::Fiber::new(closure);
         let local = tokio::task::LocalSet::new();
-        let result = local.run_until(self.vm.run(&mut fiber)).await;
+        let result = local.run_until(crate::exec::run_scoped_root(self.vm.run(&mut fiber))).await;
         local.await;
         crate::gc::collect();
         match result {
@@ -6037,7 +6139,7 @@ impl PgoSeedHandle {
         let closure = Closure::new(Rc::clone(&self.entry_proto));
         let mut fiber = crate::vm::fiber::Fiber::new(closure);
         let local = tokio::task::LocalSet::new();
-        let result = local.run_until(self.vm.run(&mut fiber)).await;
+        let result = local.run_until(crate::exec::run_scoped_root(self.vm.run(&mut fiber))).await;
         local.await;
         crate::gc::collect();
         match result {
@@ -6178,7 +6280,7 @@ pub async fn pgo_build_artifact_from_source(src: &str) -> Result<Vec<u8>, AsErro
             let mut fiber = crate::vm::fiber::Fiber::new(closure);
             let local = tokio::task::LocalSet::new();
             // Absorb ALL outcomes — a panicking training run still yields a (partial) section.
-            let _ = local.run_until(vm.run(&mut fiber)).await;
+            let _ = local.run_until(crate::exec::run_scoped_root(vm.run(&mut fiber))).await;
             local.await;
             crate::gc::collect();
         }
@@ -6436,7 +6538,7 @@ pub async fn pgo_adversarial_run_from_source(
     let closure = Closure::new(proto.clone());
     let mut fiber = crate::vm::fiber::Fiber::new(closure);
     let local = tokio::task::LocalSet::new();
-    let result = local.run_until(vm.run(&mut fiber)).await;
+    let result = local.run_until(crate::exec::run_scoped_root(vm.run(&mut fiber))).await;
     local.await;
     crate::gc::collect();
     match result {
