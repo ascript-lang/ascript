@@ -873,6 +873,166 @@ impl<T> Future for JoinWrapper<T> {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Task 4: the executor wired as ONE long-lived future driven by the existing
+// `LocalSet` (Architecture B). `run_until` is the bespoke analogue of
+// `LocalSet::run_until`, `drain` of the trailing `local.await`; both carry the
+// tick-budget driver-liveness yield (§2.3) and the lost-wakeup park re-check
+// (mirroring `ResultCell::get`, `src/task.rs`). tokio stays the I/O + timer
+// driver — the executor is just an ordinary future.
+// ---------------------------------------------------------------------------
+
+/// The bespoke per-isolate executor: a thin `Rc<Core>` wrapper that an entry
+/// point drives via [`exec_run_until`] inside the unchanged
+/// `local.run_until(...)`. `!Send` like everything in the isolate.
+pub(crate) struct Executor {
+    core: Rc<Core>,
+}
+
+impl Executor {
+    pub(crate) fn new() -> Self {
+        Executor { core: Core::new() }
+    }
+
+    /// The shared `Core` (the GC root / spawn target for Task 5's seam).
+    pub(crate) fn core(&self) -> &Rc<Core> {
+        &self.core
+    }
+
+    /// RAII-install this executor into [`CURRENT_EXEC`] for the isolate thread
+    /// (so same-thread wakes take the fast path). The guard uninstalls on drop.
+    pub(crate) fn install(&self) -> CurrentExecGuard {
+        CurrentExecGuard::install(&self.core)
+    }
+
+    /// Spawn `fut` onto THIS executor. (Task 5's `spawn_local` seam routes
+    /// through [`CURRENT_EXEC`]; this is the direct form used by tests + the
+    /// entry point that owns the `Executor`.)
+    pub(crate) fn spawn<F>(&self, fut: F) -> JoinHandle<F::Output>
+    where
+        F: Future + 'static,
+        F::Output: 'static,
+    {
+        spawn_local_on(&self.core, fut)
+    }
+
+    /// Drive `root` to completion while ticking the spawned-task FIFO — the
+    /// bespoke analogue of `LocalSet::run_until`. Returns the moment ROOT
+    /// completes; any still-live spawned tasks are left for [`drain`](Self::drain)
+    /// (exactly like `LocalSet::run_until` followed by `local.await`).
+    ///
+    /// On each executor poll (see the inline numbered steps): un-park, drain
+    /// injected wakes, poll `root` FIRST, then `poll_tick` the FIFO; `MoreWork`
+    /// self-yields so tokio's I/O + timer driver gets a turn (§2.3 driver
+    /// liveness), `Idle`/`AllDone`-with-root-pending parks with the lost-wakeup
+    /// re-check.
+    pub(crate) async fn run_until<F: Future>(&self, root: F) -> F::Output {
+        let core = Rc::clone(&self.core);
+        let mut root = Box::pin(root);
+        std::future::poll_fn(move |cx| {
+            // 1. Un-park: we are running, not parked. Clear any stale waker so a
+            //    wake that arrives WHILE we run re-queues (onto `ready`) rather
+            //    than firing a no-longer-parked waker.
+            core.clear_parked();
+            // 2. Fold cross-thread/late wakes into `ready`.
+            core.drain_injected();
+            // 3. Poll the root FIRST (the `run_until` shape: root is driven
+            //    before the FIFO on each wake).
+            if let Poll::Ready(out) = root.as_mut().poll(cx) {
+                return Poll::Ready(out);
+            }
+            // 4. Process spawned tasks under the budget.
+            match core.poll_tick(EXEC_TICK_BUDGET) {
+                // 5a. Budget exhausted, queue non-empty → self-yield so tokio
+                //     gives the I/O + timer driver a turn, then re-polls us.
+                TickOutcome::MoreWork => {
+                    cx.waker().wake_by_ref();
+                    Poll::Pending
+                }
+                // 5b. Idle (or AllDone but root still Pending) → park with the
+                //     lost-wakeup re-check.
+                TickOutcome::Idle | TickOutcome::AllDone => {
+                    core.park_with_recheck(cx);
+                    Poll::Pending
+                }
+            }
+        })
+        .await
+    }
+
+    /// Drive the spawned-task FIFO until every task has retired (`live == 0`) —
+    /// the bespoke analogue of the trailing `local.await`. Same loop as
+    /// [`run_until`](Self::run_until) WITHOUT a root: `AllDone` → ready,
+    /// `MoreWork` → self-yield, `Idle` → park with the lost-wakeup re-check.
+    pub(crate) async fn drain(&self) {
+        let core = Rc::clone(&self.core);
+        std::future::poll_fn(move |cx| {
+            core.clear_parked();
+            core.drain_injected();
+            match core.poll_tick(EXEC_TICK_BUDGET) {
+                TickOutcome::AllDone => Poll::Ready(()),
+                TickOutcome::MoreWork => {
+                    cx.waker().wake_by_ref();
+                    Poll::Pending
+                }
+                TickOutcome::Idle => {
+                    core.park_with_recheck(cx);
+                    Poll::Pending
+                }
+            }
+        })
+        .await
+    }
+}
+
+/// Caller-facing wrapper applying the coop opt-out (spec §2.3). tokio's
+/// cooperative-scheduling budget would, after ~128 ready-polls, force OUR
+/// `poll_fn` to return `Pending` (via the task budget) even when the executor
+/// has real work and root is unfinished — stalling the isolate until the next
+/// tokio tick. `unconstrained` opts the executor future out of that budget: the
+/// executor runs its OWN budget (`EXEC_TICK_BUDGET` + the `MoreWork`
+/// self-yield), which is the driver-liveness mechanism here. Task 5's entry
+/// points call THIS, not `run_until` directly.
+pub(crate) fn exec_run_until<'a, F: Future + 'a>(
+    exec: &'a Executor,
+    root: F,
+) -> impl Future<Output = F::Output> + 'a {
+    tokio::task::unconstrained(exec.run_until(root))
+}
+
+impl Core {
+    /// Take + drop the executor's parked tokio waker (we are running, not
+    /// parked). Idempotent; poisoning never occurs on this uncontended slot but
+    /// is handled without panicking regardless.
+    fn clear_parked(&self) {
+        if let Ok(mut guard) = self.shared.parked.lock() {
+            *guard = None;
+        }
+    }
+
+    /// Park the executor: store this poll's tokio waker into [`Shared::parked`],
+    /// THEN re-check for work that landed in the window between the last drain
+    /// and storing the waker (the lost-wakeup guard — mirrors `ResultCell::get`,
+    /// `src/task.rs`). If a wake DID land, don't truly park: self-wake + Pending
+    /// so tokio re-polls us immediately. Otherwise genuinely park (a future leaf
+    /// or cross-thread wake will [`TaskWaker::wake_parked`] → re-poll).
+    fn park_with_recheck(&self, cx: &mut Context<'_>) {
+        // Store the parking waker FIRST so any wake from here on can find it.
+        if let Ok(mut guard) = self.shared.parked.lock() {
+            *guard = Some(cx.waker().clone());
+        }
+        // Re-check: a same-thread wake may have pushed onto `ready`, or a
+        // cross-thread wake may sit on the injection channel, AFTER our last
+        // drain but BEFORE we stored the waker above. Fold injected in and look.
+        self.drain_injected();
+        if !self.ready.borrow().is_empty() {
+            // A wake landed in the window — we have work; don't truly park.
+            cx.waker().wake_by_ref();
+        }
+        // The caller returns `Poll::Pending`.
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1694,5 +1854,235 @@ mod tests {
         assert!(!ran.get(), "not run before a tick");
         assert_eq!(core.poll_tick(EXEC_TICK_BUDGET), TickOutcome::AllDone);
         assert!(ran.get(), "task ran despite the JoinHandle being dropped");
+    }
+
+    // ------------------------------------------------------------------------
+    // Task 4: run_until / drain inside the LocalSet — tick budget + lost-wakeup
+    // re-check. These need a REAL tokio runtime (timer wheel, blocking pool,
+    // cross-thread wakes), so they run under `#[tokio::test]` + a `LocalSet` and
+    // are `#[cfg_attr(miri, ignore)]` (Miri cannot drive the tokio runtime; the
+    // Task 1–3 core tests remain the Miri coverage).
+    // ------------------------------------------------------------------------
+
+    use std::time::Duration;
+
+    /// Drive `fut` to completion on a `LocalSet` over the ambient
+    /// `#[tokio::test]` current-thread runtime. The `LocalSet` is what makes the
+    /// `!Send` executor future (and any `spawn_local` inside) legal — mirrors the
+    /// Task 5 entry-point shape (`local.run_until(...).await`), so the tests
+    /// exercise the production driving path. NOT a nested runtime (that would
+    /// panic) — it borrows the test's runtime.
+    async fn on_local<F: Future>(fut: F) -> F::Output {
+        tokio::task::LocalSet::new().run_until(fut).await
+    }
+
+    /// `run_until` drives the root AND the spawned FIFO; the output is the root's,
+    /// and the spawned tasks ran (their side effects landed) before root returned
+    /// since root awaits a rendezvous each task resolves.
+    #[tokio::test]
+    #[cfg_attr(miri, ignore)]
+    async fn run_until_drives_root_and_tasks() {
+        let out = on_local(async {
+            let exec = Executor::new();
+            let _g = exec.install();
+
+            let log: Rc<StdRefCell<Vec<u32>>> = Rc::new(StdRefCell::new(Vec::new()));
+            // Each spawned task pushes its id then signals a per-task oneshot the
+            // root awaits — proving the root and the FIFO are co-driven.
+            let mut dones = Vec::new();
+            for n in 0..3u32 {
+                let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+                dones.push(rx);
+                let l = Rc::clone(&log);
+                exec.spawn(async move {
+                    l.borrow_mut().push(n);
+                    let _ = tx.send(());
+                });
+            }
+
+            let log_root = Rc::clone(&log);
+            let root = async move {
+                for rx in dones {
+                    let _ = rx.await;
+                }
+                log_root.borrow().clone()
+            };
+            exec_run_until(&exec, root).await
+        })
+        .await;
+        // All three tasks ran; order is insertion (FIFO).
+        assert_eq!(out, vec![0, 1, 2]);
+    }
+
+    /// S11: a detached / un-awaited task spawned by root completes during
+    /// `drain()` AFTER root returned (run_until leaves survivors for drain).
+    #[tokio::test]
+    #[cfg_attr(miri, ignore)]
+    async fn drain_runs_survivors() {
+        on_local(async {
+            let exec = Executor::new();
+            let _g = exec.install();
+
+            let survivor_ran = Rc::new(Cell::new(false));
+            let sr = Rc::clone(&survivor_ran);
+
+            // Root spawns a detached task that needs a tokio tick (a 0ms sleep)
+            // to complete, then returns immediately WITHOUT awaiting it.
+            let root = async {
+                exec.spawn(async move {
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                    sr.set(true);
+                });
+            };
+            exec_run_until(&exec, root).await;
+
+            // The survivor has NOT necessarily completed yet (root returned first).
+            // drain() drives it to completion.
+            exec.drain().await;
+            assert!(
+                survivor_ran.get(),
+                "detached survivor completed during drain()"
+            );
+        })
+        .await;
+    }
+
+    /// A spawned task that awaits a tokio timer completes — proving the leaf
+    /// future registered OUR waker with tokio's timer wheel and the park
+    /// delivered the wake.
+    #[tokio::test]
+    #[cfg_attr(miri, ignore)]
+    async fn sleep_inside_bespoke_task_fires() {
+        on_local(async {
+            let exec = Executor::new();
+            let _g = exec.install();
+
+            let fired = Rc::new(Cell::new(false));
+            let f = Rc::clone(&fired);
+            let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+            exec.spawn(async move {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+                f.set(true);
+                let _ = tx.send(());
+            });
+
+            let root = async move {
+                let _ = rx.await;
+            };
+            exec_run_until(&exec, root).await;
+            assert!(fired.get(), "timer fired inside a bespoke task");
+        })
+        .await;
+    }
+
+    /// §2.3 driver liveness: two tasks ping-pong via `Notify` in a bounded loop
+    /// (keeping `ready` non-empty across ticks), PLUS a sleep task whose flag is
+    /// the deterministic exit. If the tick budget did NOT yield to the driver the
+    /// timer wheel would starve and this would hang.
+    #[tokio::test]
+    #[cfg_attr(miri, ignore)]
+    async fn driver_liveness_under_ping_pong() {
+        on_local(async {
+            let exec = Executor::new();
+            let _g = exec.install();
+
+            let ping = Rc::new(tokio::sync::Notify::new());
+            let pong = Rc::new(tokio::sync::Notify::new());
+
+            // ~1000 ping-pong rounds: enough ready-poll volume to exceed the
+            // budget many times over, so the timer ONLY fires if the budget
+            // self-yield gives the driver turns.
+            const ROUNDS: usize = 1000;
+            {
+                let ping = Rc::clone(&ping);
+                let pong = Rc::clone(&pong);
+                exec.spawn(async move {
+                    for _ in 0..ROUNDS {
+                        ping.notify_one();
+                        pong.notified().await;
+                    }
+                });
+            }
+            {
+                let ping = Rc::clone(&ping);
+                let pong = Rc::clone(&pong);
+                exec.spawn(async move {
+                    for _ in 0..ROUNDS {
+                        ping.notified().await;
+                        pong.notify_one();
+                    }
+                });
+            }
+
+            // The deterministic exit: a timer that MUST fire despite the churn.
+            let timer_fired = Rc::new(Cell::new(false));
+            let tf = Rc::clone(&timer_fired);
+            let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+            exec.spawn(async move {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                tf.set(true);
+                let _ = tx.send(());
+            });
+
+            let root = async move {
+                let _ = rx.await;
+            };
+            exec_run_until(&exec, root).await;
+            assert!(
+                timer_fired.get(),
+                "timer fired under ping-pong churn → budget yielded to the driver"
+            );
+        })
+        .await;
+    }
+
+    /// Cross-thread wake end-to-end: a spawned task awaiting `spawn_blocking`
+    /// completes (the blocking-pool completion wakes OUR task from another thread
+    /// → injection + `wake_parked` → re-poll).
+    #[tokio::test]
+    #[cfg_attr(miri, ignore)]
+    async fn spawn_blocking_wakes_bespoke_task() {
+        let got = on_local(async {
+            let exec = Executor::new();
+            let _g = exec.install();
+
+            let (tx, rx) = tokio::sync::oneshot::channel::<i32>();
+            exec.spawn(async move {
+                let v = tokio::task::spawn_blocking(|| 7).await.expect("blocking");
+                let _ = tx.send(v);
+            });
+
+            let root = async move { rx.await.expect("got value") };
+            exec_run_until(&exec, root).await
+        })
+        .await;
+        assert_eq!(got, 7, "cross-thread wake delivered the blocking result");
+    }
+
+    /// The targeted lost-wakeup guard: a stress loop of spawn → cross-thread wake
+    /// → await. A wake landing right as the executor decides to park would be
+    /// lost (and the run would hang) WITHOUT the park re-check. 100 iterations,
+    /// each gated on a real cross-thread `spawn_blocking` completion.
+    #[tokio::test]
+    #[cfg_attr(miri, ignore)]
+    async fn lost_wakeup_window_closes() {
+        on_local(async {
+            let exec = Executor::new();
+            let _g = exec.install();
+
+            for i in 0..100i32 {
+                let (tx, rx) = tokio::sync::oneshot::channel::<i32>();
+                exec.spawn(async move {
+                    // The completion fires from the blocking pool (another
+                    // thread) — the wake may land in the park window.
+                    let v = tokio::task::spawn_blocking(move || i).await.unwrap_or(-1);
+                    let _ = tx.send(v);
+                });
+                let root = async move { rx.await.expect("no hang") };
+                let v = exec_run_until(&exec, root).await;
+                assert_eq!(v, i, "iteration {i} completed without hanging");
+            }
+        })
+        .await;
     }
 }
