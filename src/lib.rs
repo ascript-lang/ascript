@@ -1779,14 +1779,38 @@ pub async fn wasm_run_source(
         .await;
     interp.abort_signal_listeners();
     local.await;
-    crate::gc::collect();
-    match result {
-        Ok(RunOutcome::Done(_)) => Ok((interp.output(), None)),
+
+    // Snapshot the captured output and the return value, then drop the isolate's GC roots
+    // (`fiber`/`vm`/`interp`) so refcounting reclaims all acyclic garbage immediately.
+    let output = interp.output();
+    let ret = match result {
+        Ok(RunOutcome::Done(_)) => Ok((output, None)),
         Ok(RunOutcome::Yielded(_)) => unreachable!("top-level program cannot yield"),
         Err(crate::interp::Control::Panic(e)) => Err(e.with_source(src_info)),
-        Err(crate::interp::Control::Propagate(_)) => Ok((interp.output(), None)),
-        Err(crate::interp::Control::Exit(code)) => Ok((interp.output(), Some(code))),
-    }
+        Err(crate::interp::Control::Propagate(_)) => Ok((output, None)),
+        Err(crate::interp::Control::Exit(code)) => Ok((output, Some(code))),
+    };
+    drop(fiber);
+    drop(vm);
+    drop(interp);
+
+    // WASM §5.3: the explicit cycle collection runs on NATIVE only. The playground runs
+    // MANY programs on ONE wasm thread sharing gcmodule's `THREAD_OBJECT_SPACE`, and
+    // gcmodule 0.3's `collect_thread_cycles()` is NOT safe to call repeatedly across
+    // distinct isolates on a long-lived wasm thread: a second invocation traverses a
+    // dead-but-still-linked leaked cycle whose acyclic neighbors were already freed by
+    // refcounting and reads a dangling box → a hard `RuntimeError: memory access out of
+    // bounds` (reproduced by `tests/solo.rs` — gc-cycle program then any second program).
+    // Native runs one program per process, so the single end-of-run collect there is safe
+    // and unchanged. On wasm we rely on REFCOUNTING (which reclaims all acyclic garbage
+    // immediately and is the common case); a genuinely-dead *cycle* leaks within a single
+    // short playground run and is reclaimed wholesale when the Web Worker is terminated /
+    // re-instantiated between runs (the §5.5 `worker.terminate()` kill path). Collection
+    // never changes observable output (the GC invariant), so skipping it on wasm is
+    // behavior-identical — only the (bounded, per-run) cycle reclamation differs.
+    #[cfg(not(target_family = "wasm"))]
+    crate::gc::collect();
+    ret
 }
 
 #[cfg(not(ascript_rt))]

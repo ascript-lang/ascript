@@ -2366,8 +2366,6 @@ dependencies = [
 [[package]]
 name = "gcmodule"
 version = "0.3.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "aea43e9f1a437124f44a401fc74936a20a8d3fe4f95ba3e8f84fcc6193b0ed25"
 dependencies = [
  "gcmodule_derive",
  "parking_lot 0.10.2",

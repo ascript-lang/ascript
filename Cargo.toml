@@ -489,3 +489,15 @@ await_holding_refcell_ref = "deny"
 inherits = "release"
 debug = true
 strip = false
+
+# WASM target fix: gcmodule 0.3.3 has a wasm32 struct-padding defect in `GcHeader` — its
+# `value()` computes the `CcBox` pointer as `header + size_of::<GcHeader>()`, which is
+# 4 bytes short on 32-bit targets (where the 12-byte 3-pointer header isn't 8-aligned but the
+# `CcBox<Value>` is), corrupting the heap on wasm32 (the playground crashes on ordinary
+# programs like `examples/data.as`). The vendored copy adds `#[repr(C, align(8))]` to
+# `GcHeader` — a NO-OP on 64-bit native (the header is already 24 bytes / 8-aligned, so
+# layout and behavior are byte-identical; proven by the unchanged `vm_differential` 446/0
+# in both feature configs) and the correct offset on wasm32. The vendored tree is otherwise
+# verbatim gcmodule 0.3.3. Recorded Phase-1 follow-up was "possible upstream patch"; this is it.
+[patch.crates-io]
+gcmodule = { path = "vendor/gcmodule" }

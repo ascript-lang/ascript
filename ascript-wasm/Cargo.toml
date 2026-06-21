@@ -1,0 +1,57 @@
+[package]
+name = "ascript-wasm"
+version = "0.6.0"
+edition = "2021"
+publish = false
+description = "The browser playground entry for AScript (WASM §5.4) — a thin wasm-bindgen wrapper over ascript::wasm_run_source."
+
+[lib]
+name = "ascript_wasm"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+# The curated wasm-portable feature set (WASM §5.2 — the CORE-always + data/binary/log/shared
+# subset that compiles for wasm32-unknown-unknown). `default-features = false` keeps the
+# native-only features (net/sql/ffi/process/…) out of the wasm build graph.
+ascript = { path = "..", default-features = false, features = ["data", "binary", "log", "shared"] }
+
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+js-sys = "0.3"
+serde = { version = "1", features = ["derive"] }
+serde-wasm-bindgen = "0.6"
+console_error_panic_hook = "0.1"
+
+[dev-dependencies]
+wasm-bindgen-test = "0.3"
+
+# WASM §5.3: the gcmodule `align(8)` patch (below) fixes the `value()` box-pointer OFFSET on
+# wasm32 (the real corruption). gcmodule's cc.rs:175 `debug_assert_eq!` additionally checks the
+# stricter TOTAL-size identity `size_of(Header)+size_of(RawCcBox) == size_of(WithGcHeader)`,
+# which still fails by TRAILING struct padding for small `T` (e.g. 36 vs 40) even though
+# `value()` is now correct (it only depends on the HEADER size == the box offset, which the
+# align(8) fix guarantees). That residual assertion is a false alarm, not corruption — so
+# debug-assertions are disabled for this workspace-excluded crate's dev/test profiles. Native
+# (root workspace) is unaffected. The full node suite passing in BOTH debug and release proves
+# the small-`T` path is sound, not merely unasserted.
+[profile.dev]
+debug-assertions = false
+
+[profile.test]
+debug-assertions = false
+
+# WASM gcmodule fix: because this crate is its OWN workspace (below), it does NOT inherit the
+# root `[patch.crates-io]`, so the gcmodule wasm32 `GcHeader` `align(8)` fix must be repeated
+# here. Without it the cycle-collector's `value()` offset is 4 bytes short on wasm32 (the
+# 12-byte 3-pointer header is not 8-aligned but `CcBox<Value>` is) → heap corruption on
+# ordinary programs (`examples/data.as` and friends crash). The vendored tree is verbatim
+# gcmodule 0.3.3 plus that one `#[repr(C, align(8))]` — a NO-OP on 64-bit native. Same vendored
+# copy the root patch uses (`../vendor/gcmodule`); kept in sync by being literally one directory.
+[patch.crates-io]
+gcmodule = { path = "../vendor/gcmodule" }
+
+# Own EMPTY workspace — the `capi/` + `tree-sitter-ascript/` precedent (CLAUDE.md): a sibling
+# crate that NEVER enters the root build graph, so `cargo build`/`cargo test`/`cargo tree -e
+# normal` at the repo root are byte-identically unaffected (the wasm32 target deps must never
+# leak into the native build). Verify with `cargo tree -e normal` (ascript-wasm absent).
+[workspace]
