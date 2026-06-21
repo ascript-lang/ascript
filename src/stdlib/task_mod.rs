@@ -1595,8 +1595,9 @@ async fn par_inline_run(
 fn retry_rand_f64() -> f64 {
     use std::cell::Cell;
     thread_local! {
-        // WASM §5.3.3: seed via the platform entropy source (native = SystemTime-nanos,
-        // identical magnitude to the previous `.as_nanos()` body; wasm = getrandom(js))
+        // WASM §5.3.3: seed via the platform entropy source (native = `entropy_seed()` —
+        // SystemTime-nanos XOR a stack address, the verbatim `math.rs seed()` body; wasm
+        // = getrandom(js))
         // so the retry-jitter RNG doesn't panic on the missing OS clock on wasm. The
         // seed is timing-only (never an observable script value — see the doc above).
         static RNG: Cell<u64> = Cell::new(crate::platform::entropy_seed());

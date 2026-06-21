@@ -134,14 +134,17 @@ mod tests {
     }
 
     #[test]
-    fn entropy_seed_nonzero_and_varies() {
-        // Mirrors today's `math.rs seed()` contract: non-zero, and two in-process
-        // calls differ (the XOR'd nanos advance, and the stack address may differ).
-        let a = entropy_seed();
-        assert_ne!(a, 0, "seed must be non-zero (the PRNG state must never be 0)");
-        let b = entropy_seed();
-        assert_ne!(b, 0);
-        assert_ne!(a, b, "two seeds should differ (nanos advance between calls)");
+    fn entropy_seed_nonzero() {
+        // The ONLY contract `math.rs seed()` guarantees (and all the PRNG needs): a
+        // NON-ZERO seed. Variance is per-RUN (wall-clock nanos differ across process
+        // launches), NOT per-CALL: two adjacent calls within the same nanosecond share
+        // the same `nanos` AND the same stack address, so `a != b` is NOT guaranteed
+        // (it collides the large majority of the time) and must never be asserted — that
+        // was a flaky assertion. The seed is timing-only and never an observable script
+        // value (deterministic mode seeds the PRNG from `det.rs SeededRng`, never this),
+        // so per-call variance is irrelevant to correctness.
+        assert_ne!(entropy_seed(), 0, "seed must be non-zero (PRNG state must never be 0)");
+        assert_ne!(entropy_seed(), 0);
     }
 
     #[tokio::test]
