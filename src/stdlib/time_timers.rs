@@ -78,8 +78,11 @@ pub struct ThrottleState {
     pub func: Value,
     /// Throttle window in milliseconds.
     pub ms: u64,
-    /// Monotonic instant of the last successful fire, or `None` if never fired.
-    pub last_fire: Option<std::time::Instant>,
+    /// Monotonic ms (`platform::monotonic_ms`) of the last successful fire, or `None`
+    /// if never fired. WASM §5.3.3: stored as `f64` ms (not a raw `Instant`) so the
+    /// platform monotonic clock backs it — native is byte-equivalent (the same
+    /// elapsed-ms comparison), wasm uses `performance.now`.
+    pub last_fire: Option<f64>,
 }
 
 // ── factory functions (called from mod.rs call_time) ─────────────────────────
@@ -87,22 +90,39 @@ pub struct ThrottleState {
 /// `time.interval(ms)` — create and register a tokio `Interval` resource.
 /// Returns a `Value::native(Interval)` handle; script accesses `.tick()` on it.
 pub fn create_interval(interp: &Interp, args: &[Value], span: Span) -> Result<Value, Control> {
-    let ms = want_number(&arg(args, 0), span, "time.interval")?;
-    // Reject anything that would truncate to a zero Duration: tokio's
-    // `interval` panics ("period must be non-zero") on a 0 period, and that
-    // would surface as a raw Rust panic rather than a catchable Tier-2 AsError.
-    // A fractional `ms >= 1` truncates toward zero (e.g. 1.7 → 1ms), which is fine.
-    if ms <= 0.0 || (ms as u64) == 0 {
-        return Err(AsError::at("time.interval: ms must be >= 1", span).into());
+    // WASM §5.3.4: interval/timer RESOURCES are a clean Tier-2 platform error on wasm
+    // (v1 non-goal). The tokio time DRIVER never runs on wasm (no parking), so a real
+    // `tokio::time::interval` would HANG, not error — refuse it loudly here instead.
+    // (`time.sleep`/`task.timeout`/`task.retry` — the common cases — DO work via the
+    // platform `setTimeout` sleep shim.) Never silent, never a hang.
+    #[cfg(target_family = "wasm")]
+    {
+        let _ = (interp, args);
+        Err(AsError::at(
+            "time.interval is not available on this platform (wasm)",
+            span,
+        )
+        .into())
     }
-    let period = std::time::Duration::from_millis(ms as u64);
-    let iv = tokio::time::interval(period);
-    let handle = interp.register_resource(
-        NativeKind::Interval,
-        indexmap::IndexMap::new(),
-        ResourceState::Interval(Box::new(iv)),
-    );
-    Ok(handle)
+    #[cfg(not(target_family = "wasm"))]
+    {
+        let ms = want_number(&arg(args, 0), span, "time.interval")?;
+        // Reject anything that would truncate to a zero Duration: tokio's
+        // `interval` panics ("period must be non-zero") on a 0 period, and that
+        // would surface as a raw Rust panic rather than a catchable Tier-2 AsError.
+        // A fractional `ms >= 1` truncates toward zero (e.g. 1.7 → 1ms), which is fine.
+        if ms <= 0.0 || (ms as u64) == 0 {
+            return Err(AsError::at("time.interval: ms must be >= 1", span).into());
+        }
+        let period = std::time::Duration::from_millis(ms as u64);
+        let iv = tokio::time::interval(period);
+        let handle = interp.register_resource(
+            NativeKind::Interval,
+            indexmap::IndexMap::new(),
+            ResourceState::Interval(Box::new(iv)),
+        );
+        Ok(handle)
+    }
 }
 
 /// `time.debounce(fn, ms)` — create a debounce wrapper.
@@ -246,7 +266,8 @@ impl Interp {
         // `DebounceState::Drop` aborts it if the wrapper itself is dropped before
         // the window expires (an AbortHandle's own Drop does NOT abort).
         let jh = tokio::task::spawn_local(async move {
-            tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
+            // WASM §5.3.3: route the debounce delay through the platform sleep.
+            crate::platform::sleep_ms(ms).await;
             // Calling an `async fn` returns Ok(Value::future(..)) WITHOUT running
             // the body — so we must drive that inner future to completion here,
             // otherwise an async callback would silently never run. (Mirror of
@@ -299,10 +320,12 @@ impl Interp {
             }
         };
 
-        let now = std::time::Instant::now();
+        let now = crate::platform::monotonic_ms();
         let should_fire = match state.last_fire {
             None => true,
-            Some(last) => now.duration_since(last).as_millis() as u64 >= state.ms,
+            // `(now - last)` is elapsed ms; truncate to whole ms (`as u64`) to match the
+            // previous `duration_since(..).as_millis() as u64` comparison byte-for-byte.
+            Some(last) => (now - last) as u64 >= state.ms,
         };
 
         if should_fire {

@@ -3,8 +3,39 @@ use crate::error::AsError;
 
 /// Render an error to stderr — a source-pointing report if span+source are
 /// present, otherwise a plain `error: <message>` line.
+///
+/// A one-line wrapper over [`render_to_string`] with color ON (the byte-identical
+/// reuse refactor WASM §5.4 asked for — stderr output is unchanged; the only new
+/// surface is the `color` toggle the wasm playground passes as `false`). ariadne's
+/// `eprint`/`write` share the same renderer, so `eprint!`-ing the captured string
+/// is byte-identical to the prior direct `.eprint(...)`. The no-span fallback adds
+/// the trailing newline the legacy `eprintln!` emitted (`render_to_string` itself
+/// does NOT — its embed/wasm callers want the bare report).
 pub fn report(err: &AsError) {
-    use ariadne::{Color, Label, Report, ReportKind, Source};
+    let s = render_to_string(err, true);
+    let has_caret = (err.span_source.as_ref().or(err.source.as_ref())).is_some() && err.span.is_some();
+    if has_caret {
+        eprint!("{s}");
+    } else {
+        // The plain `error: <message>` fallback — match the legacy `eprintln!`.
+        eprintln!("{s}");
+    }
+}
+
+/// Render an error to a `String` — the same ariadne report [`report`] writes to
+/// stderr, captured into an owned string instead. Used by the EMBED facade
+/// (`EmbedError`'s `rendered` field) so a host gets the source-pointing caret
+/// report as data, not only on stderr, AND by the WASM playground wrapper
+/// (`color = false` → no ANSI escapes in the JS-facing error string, WASM §5.4).
+/// Mirrors the caret-source selection (span-bound source preferred over the
+/// context source) exactly; falls back to the plain `error: <message>` line when
+/// no span+source is available.
+///
+/// `color` toggles ariadne's `Config` color: `true` reproduces the legacy colored
+/// stderr/embed output byte-identically; `false` emits a plain ANSI-free report.
+/// The plain (`error: <message>`) fallback is ANSI-free in both cases.
+pub fn render_to_string(err: &AsError, color: bool) -> String {
+    use ariadne::{Color, Config, Label, Report, ReportKind, Source};
     // Prefer the span's OWN source (bound at raise time) for the caret, so a span
     // is never rendered against a different module's text (SP4 §3 cross-module
     // provenance). Fall back to the outer/context `source` when no span-source is
@@ -21,37 +52,9 @@ pub fn report(err: &AsError) {
             let start = span.start;
             let end = span.end;
             let path = src.path.as_str();
-            let _ = Report::build(ReportKind::Error, (path, start..end))
-                .with_message(&err.message)
-                .with_label(
-                    Label::new((path, start..end))
-                        .with_message(&err.message)
-                        .with_color(Color::Red),
-                )
-                .finish()
-                .eprint((path, Source::from(text.as_str())));
-        }
-        _ => eprintln!("error: {}", err),
-    }
-}
-
-/// Render an error to a `String` — the same ariadne report [`report`] writes to
-/// stderr, captured into an owned string instead. Used by the EMBED facade
-/// (`EmbedError`'s `rendered` field) so a host gets the source-pointing caret
-/// report as data, not only on stderr. Mirrors [`report`]'s caret-source selection
-/// (span-bound source preferred over the context source) exactly; falls back to the
-/// plain `error: <message>` line when no span+source is available.
-pub fn render_to_string(err: &AsError) -> String {
-    use ariadne::{Color, Label, Report, ReportKind, Source};
-    let caret_source = err.span_source.as_ref().or(err.source.as_ref());
-    match (caret_source, err.span) {
-        (Some(src), Some(span)) => {
-            let text = &src.text;
-            let start = span.start;
-            let end = span.end;
-            let path = src.path.as_str();
             let mut buf: Vec<u8> = Vec::new();
             let render = Report::build(ReportKind::Error, (path, start..end))
+                .with_config(Config::default().with_color(color))
                 .with_message(&err.message)
                 .with_label(
                     Label::new((path, start..end))
@@ -63,8 +66,9 @@ pub fn render_to_string(err: &AsError) -> String {
             // ariadne writes UTF-8; on the off chance of a write error, fall back to
             // the plain line rather than panicking (this is a diagnostics path).
             match render {
-                Ok(()) => String::from_utf8(buf)
-                    .unwrap_or_else(|_| format!("error: {}", err)),
+                Ok(()) => {
+                    String::from_utf8(buf).unwrap_or_else(|_| format!("error: {}", err))
+                }
                 Err(_) => format!("error: {}", err),
             }
         }

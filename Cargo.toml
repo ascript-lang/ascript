@@ -48,7 +48,11 @@ rust_decimal = { version = "1", features = ["maths"] }
 # of NEITHER a plain `cargo build` NOR `--no-default-features` (verified `cargo tree`).
 # `cargo test` pulls it in via the crate's self-dev-dependency with `features=["fuzzgen"]`.
 arbitrary = { version = "1", features = ["derive"], optional = true }
-tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "time", "sync"] }
+# WASM §5.3.2: `tokio` is target-split below ([target.'cfg(...)'.dependencies]). The
+# non-wasm row keeps TODAY'S EXACT feature set (Gate W-1: native resolution unchanged);
+# the wasm row drops `rt-multi-thread` (vestigial — zero `multi_thread` uses in `src/`,
+# §2.2). It is NOT declared here (a bare `[dependencies]` row would re-add it to every
+# target and defeat the split).
 async-recursion = "1"
 # Probe-and-grow native stack (SP9 §1): `stacker::maybe_grow` allocates a fresh
 # heap-backed stack segment at the native re-entry points (VM/generator/compiler/
@@ -75,7 +79,9 @@ rustc-hash = "2"
 cstree = { version = "0.14", features = ["derive"] }
 clap = { version = "4", features = ["derive"] }
 ariadne = "0.6"
-rustyline = "14"
+# WASM §5.3.2: `rustyline` is target-split below (it pulls `fd-lock`, a native file-lock
+# crate using `std::os::unix` that does not build on `wasm32-unknown-unknown`). The REPL
+# module is the only consumer and is cfg'd out of wasm builds (`src/lib.rs`).
 serde = { version = "1.0.228", features = ["derive"], optional = true }
 serde_json = { version = "1.0.150", features = ["preserve_order"], optional = true }
 # SRV Part A — direct dep (transitive today via tokio/hyper/reqwest) so the
@@ -190,6 +196,37 @@ rand_core = { version = "0.6", features = ["getrandom"], optional = true }
 # the build. The macro expands to a zero-size `const` check — no runtime cost, no
 # codegen.
 static_assertions = "1"
+
+# WASM §5.3.2 — target-dep tables. The NON-wasm row is TODAY'S EXACT dependency set
+# (Gate W-1: native `cargo tree` byte-identical, both feature configs). The wasm row is
+# the wasm-buildable subset.
+#
+# - `tokio`: non-wasm keeps the full feature list incl. `rt-multi-thread`; the wasm row
+#   drops `rt-multi-thread` (vestigial — zero `multi_thread` uses in `src/`, §2.2) and
+#   keeps `time` (core types reference `tokio::time`; the time DRIVER is shimmed via the
+#   `platform.rs` `setTimeout` future, §5.3.4 — Phase-0 spike confirmed `time` compiles
+#   on wasm).
+# - `rustyline`: native-only (pulls `fd-lock` → `std::os::unix`); the REPL module is
+#   cfg'd out of wasm (`src/lib.rs`).
+# - `stacker`: STAYS in `[dependencies]` (Phase-0 spike §10.4: it compiles for wasm with
+#   NO patch — `maybe_grow` degrades to run-on-current-stack); only the recursion ceiling
+#   is lowered on wasm (`src/interp.rs` `MAX_CALL_DEPTH`), no dep split needed.
+[target.'cfg(not(target_family = "wasm"))'.dependencies]
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "time", "sync"] }
+rustyline = "14"
+
+# WASM §5.3.2 — the wasm row. `wasm-bindgen`/`js-sys`/`wasm-bindgen-futures` back the
+# `platform.rs` clock/entropy/sleep shims; `getrandom(js)` is the wasm entropy backend.
+# `uuid` is optional-under-`data` and must be declared here too (it is also in
+# `[dependencies]` for native) so the wasm build ADDS the `js` randomness backend; the
+# `dep:uuid` gate in `[features]` still controls inclusion on every target.
+[target.'cfg(target_family = "wasm")'.dependencies]
+tokio = { version = "1", features = ["rt", "macros", "sync", "time"] }
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+js-sys = "0.3"
+getrandom = { version = "0.2", features = ["js"] }
+uuid = { version = "1", features = ["v4", "v7", "js"], optional = true }
 
 # BIN — macOS ad-hoc code-signing for `build --native` (the `codesign -s -` equivalent, no
 # Xcode). macOS-only: appending the payload invalidates the stub's signature, so an arm64
@@ -452,3 +489,15 @@ await_holding_refcell_ref = "deny"
 inherits = "release"
 debug = true
 strip = false
+
+# WASM target fix: gcmodule 0.3.3 has a wasm32 struct-padding defect in `GcHeader` — its
+# `value()` computes the `CcBox` pointer as `header + size_of::<GcHeader>()`, which is
+# 4 bytes short on 32-bit targets (where the 12-byte 3-pointer header isn't 8-aligned but the
+# `CcBox<Value>` is), corrupting the heap on wasm32 (the playground crashes on ordinary
+# programs like `examples/data.as`). The vendored copy adds `#[repr(C, align(8))]` to
+# `GcHeader` — a NO-OP on 64-bit native (the header is already 24 bytes / 8-aligned, so
+# layout and behavior are byte-identical; proven by the unchanged `vm_differential` 446/0
+# in both feature configs) and the correct offset on wasm32. The vendored tree is otherwise
+# verbatim gcmodule 0.3.3. Recorded Phase-1 follow-up was "possible upstream patch"; this is it.
+[patch.crates-io]
+gcmodule = { path = "vendor/gcmodule" }

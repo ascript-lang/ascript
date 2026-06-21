@@ -1,0 +1,10 @@
+# WASM §5.1: pin the wasm target so a bare `cargo build`/`wasm-pack build` in this crate
+# targets wasm32 without a `--target` flag, and raise the wasm shadow-stack size so deep
+# (but bounded, ≤ MAX_CALL_DEPTH) recursion reaches the engine's recursion-depth guard with
+# a clean Tier-2 panic instead of trapping the much-smaller default 1 MiB shadow stack
+# (recursion calibration, §5.3.5). 8 MiB matches the native worker-thread headroom class.
+[build]
+target = "wasm32-unknown-unknown"
+
+[target.wasm32-unknown-unknown]
+rustflags = ["-C", "link-arg=-zstack-size=8388608"]

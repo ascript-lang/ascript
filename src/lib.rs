@@ -90,9 +90,17 @@ pub mod parser;
 // itself lives on the VM (`Vm::publish_profile_frames`) behind the single
 // `Vm.instrument` gate. `--no-default-features` builds none of this and `--profile`
 // reports a clean rebuild hint.
+// WASM §5.3.3: the platform clock/entropy/sleep seam. CORE (builds under
+// `--no-default-features` and on every target); sits BELOW the `det.rs` seams.
+pub mod platform;
 #[cfg(feature = "profile")]
 pub mod profile;
-#[cfg(not(ascript_rt))]
+// WASM §5.3.2 / §2.2: `repl` pulls `rustyline` (→ `fd-lock`, a native file-lock crate
+// using `std::os::unix` that fails to build on `wasm32-unknown-unknown`). The wasm
+// entry is the wrapper crate (`ascript-wasm/`), never `main.rs`/the REPL, so gate the
+// module out of wasm builds. Native builds are unchanged (`not(target_family = "wasm")`
+// is always true off-wasm).
+#[cfg(all(not(ascript_rt), not(target_family = "wasm")))]
 pub mod repl;
 pub mod span;
 pub mod stdlib;
@@ -1707,6 +1715,102 @@ pub async fn vm_eval_source(src: &str) -> Result<crate::value::Value, AsError> {
 #[doc(hidden)]
 pub async fn vm_run_source(src: &str) -> Result<(String, Option<i32>), AsError> {
     vm_run_source_with(src, true).await
+}
+
+#[cfg(not(ascript_rt))]
+/// WASM §5.4: the wasm playground wrapper's entry point. Compile + run `src` on the
+/// SPECIALIZED bytecode VM (the production engine) with the Capture output sink, an
+/// explicit [`CapSet`](crate::stdlib::caps::CapSet) applied at `Interp` construction
+/// (the playground passes all-five-denied). Returns the captured output plus the exit
+/// code requested by `exit(n)` (if any). It is `cfg`-FREE on purpose: native tests
+/// exercise the EXACT path the wasm wrapper ships, so the deny-all + capture behavior
+/// is on the tested path. `#[doc(hidden)]` — not a stable public API.
+///
+/// This mirrors [`vm_run_source`] (the VM mirror of [`run_source_exit`]) and threads
+/// `caps` through `Interp::set_caps` the same way the CLI `--deny`/`--sandbox` flags
+/// reach the runtime — there is no second caps path.
+#[doc(hidden)]
+pub async fn wasm_run_source(
+    src: &str,
+    caps: crate::stdlib::caps::CapSet,
+) -> Result<(String, Option<i32>), AsError> {
+    use crate::vm::chunk::FnProto;
+    use crate::vm::value_ext::{Closure, RunOutcome};
+    use crate::vm::Vm;
+
+    let src_info = Rc::new(SourceInfo {
+        path: "<input>".to_string(),
+        text: src.to_string(),
+    });
+    let chunk = crate::compile::compile_source(src)
+        .map_err(|e| AsError::at(e.message, e.span).with_source(src_info.clone()))?;
+    let proto = Rc::new(FnProto {
+        chunk,
+        arity: 0,
+        has_rest: false,
+        is_async: false,
+        is_generator: false,
+        is_worker: false,
+        owning_class: None,
+        params: Vec::new(),
+        ret: None,
+        local_names: Vec::new(),
+        debug_name: None,
+        name_span: None,
+    });
+    let closure = Closure::new(proto);
+
+    let interp = Rc::new(Interp::new());
+    interp.install_self();
+    // WASM §5.4: apply the caller's CapSet BEFORE running any program code — the same
+    // `set_caps` setter the CLI `--deny`/`--sandbox` path uses. The playground passes
+    // all-five-denied; a native test can pass `all_granted` to prove the entry adds
+    // nothing over `vm_run_source` on a pure-compute program.
+    interp.set_caps(caps);
+    // Workers Spec A: retain the source so a `worker fn` call can build its slice (on
+    // wasm the worker dispatch then refuses with the §5.3.7 platform error).
+    interp.set_worker_source(src);
+    let vm = Vm::new(interp.clone());
+    let mut fiber = crate::vm::fiber::Fiber::new(closure);
+
+    let local = tokio::task::LocalSet::new();
+    let result = local
+        .run_until(crate::interp::ambient_root_scope(vm.run(&mut fiber)))
+        .await;
+    interp.abort_signal_listeners();
+    local.await;
+
+    // Snapshot the captured output and the return value, then drop the isolate's GC roots
+    // (`fiber`/`vm`/`interp`) so refcounting reclaims all acyclic garbage immediately.
+    let output = interp.output();
+    let ret = match result {
+        Ok(RunOutcome::Done(_)) => Ok((output, None)),
+        Ok(RunOutcome::Yielded(_)) => unreachable!("top-level program cannot yield"),
+        Err(crate::interp::Control::Panic(e)) => Err(e.with_source(src_info)),
+        Err(crate::interp::Control::Propagate(_)) => Ok((output, None)),
+        Err(crate::interp::Control::Exit(code)) => Ok((output, Some(code))),
+    };
+    drop(fiber);
+    drop(vm);
+    drop(interp);
+
+    // WASM §5.3: the explicit cycle collection runs on NATIVE only. The playground runs
+    // MANY programs on ONE wasm thread sharing gcmodule's `THREAD_OBJECT_SPACE`, and
+    // gcmodule 0.3's `collect_thread_cycles()` is NOT safe to call repeatedly across
+    // distinct isolates on a long-lived wasm thread: a second invocation traverses a
+    // dead-but-still-linked leaked cycle whose acyclic neighbors were already freed by
+    // refcounting and reads a dangling box → a hard `RuntimeError: memory access out of
+    // bounds` (reproduced by `tests/solo.rs` — gc-cycle program then any second program).
+    // Native runs one program per process, so the single end-of-run collect there is safe
+    // and unchanged. On wasm we rely on REFCOUNTING (which reclaims all acyclic garbage
+    // immediately and is the common case); a genuinely-dead *cycle* leaks within a single
+    // short playground run and is reclaimed wholesale when the Web Worker is terminated /
+    // re-instantiated between runs (the §5.5 `worker.terminate()` kill path). Collection
+    // never changes observable output (the GC invariant), so skipping it on wasm is
+    // behavior-identical — only the (bounded, per-run) cycle reclamation differs.
+    #[cfg(not(target_family = "wasm"))]
+    crate::gc::collect();
+    ret
 }
 
 #[cfg(not(ascript_rt))]

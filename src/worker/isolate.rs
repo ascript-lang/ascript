@@ -309,10 +309,28 @@ where
     F: FnOnce(Rc<Vm>) -> Fut + Send + 'static,
     Fut: std::future::Future<Output = ()>,
 {
-    std::thread::Builder::new()
-        .name("ascript-isolate".to_string())
-        .stack_size(ISOLATE_STACK_SIZE)
-        .spawn(move || run_isolate_thread(make_loop))
+    // WASM §5.3.7: ONE chokepoint. Every worker form (`worker fn` pools via
+    // `Isolate::spawn`, `worker class` actors / `worker fn*` streams / `run_in_worker`
+    // via `spawn_isolate`) reaches a thread spawn here. `wasm32-unknown-unknown` has no
+    // threads, so refuse with `Unsupported` — the dispatch funnels turn it into the
+    // Tier-2 `workers are not available on this platform (wasm)` (never a hang, never a
+    // silent inline-degradation: the pooled funnel suppresses its inline fallback on
+    // wasm so this error propagates). `make_loop` is intentionally dropped unused.
+    #[cfg(target_family = "wasm")]
+    {
+        let _ = make_loop;
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "workers are not available on this platform (wasm)",
+        ))
+    }
+    #[cfg(not(target_family = "wasm"))]
+    {
+        std::thread::Builder::new()
+            .name("ascript-isolate".to_string())
+            .stack_size(ISOLATE_STACK_SIZE)
+            .spawn(move || run_isolate_thread(make_loop))
+    }
 }
 
 /// The isolate thread entry: build the runtime + `LocalSet` + a fresh `Interp`/`Vm`,
@@ -323,6 +341,9 @@ where
 /// WITHOUT panicking — the inbound channel's senders see no receiver, so every send /
 /// reply fails and surfaces as a recoverable "isolate terminated" panic at the caller's
 /// `await`, rather than aborting the process.
+// WASM §5.3.7: never called on wasm (the `bootstrap` chokepoint refuses the thread
+// spawn before it would run this), so it is dead there.
+#[cfg_attr(target_family = "wasm", allow(dead_code))]
 fn run_isolate_thread<F, Fut>(make_loop: F)
 where
     F: FnOnce(Rc<Vm>) -> Fut,

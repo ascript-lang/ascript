@@ -598,7 +598,9 @@ impl Interp {
                 Ok(value) => Ok(ok_pair(value)),
                 Err(c) => Err(c),
             },
-            _ = tokio::time::sleep(std::time::Duration::from_millis(ms as u64)) => {
+            // WASM §5.3.3: route through the platform sleep so `task.timeout` works on
+            // wasm (native = `tokio::time::sleep`; wasm = a `setTimeout` future).
+            _ = crate::platform::sleep_ms(ms as u64) => {
                 Ok(err_pair(format!("operation timed out after {}ms", ms as u64)))
             }
         }
@@ -820,7 +822,9 @@ impl Interp {
             retry_rand_f64,
         );
         if delay > 0 {
-            tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+            // WASM §5.3.3: route the retry backoff through the platform sleep so
+            // `task.retry` works on wasm.
+            crate::platform::sleep_ms(delay).await;
         }
     }
 
@@ -1591,14 +1595,12 @@ async fn par_inline_run(
 fn retry_rand_f64() -> f64 {
     use std::cell::Cell;
     thread_local! {
-        static RNG: Cell<u64> = Cell::new({
-            use std::time::{SystemTime, UNIX_EPOCH};
-            let n = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map(|d| d.as_nanos() as u64)
-                .unwrap_or(0x9E3779B97F4A7C15);
-            n.max(1)
-        });
+        // WASM §5.3.3: seed via the platform entropy source (native = `entropy_seed()` —
+        // SystemTime-nanos XOR a stack address, the verbatim `math.rs seed()` body; wasm
+        // = getrandom(js))
+        // so the retry-jitter RNG doesn't panic on the missing OS clock on wasm. The
+        // seed is timing-only (never an observable script value — see the doc above).
+        static RNG: Cell<u64> = Cell::new(crate::platform::entropy_seed());
     }
     RNG.with(|c| {
         let mut x = c.get();

@@ -71,7 +71,7 @@ impl EmbedError {
             message: err.message.clone(),
             start,
             end,
-            rendered: crate::diagnostics::render_to_string(err),
+            rendered: crate::diagnostics::render_to_string(err, true),
         }])
     }
 
@@ -80,7 +80,7 @@ impl EmbedError {
         EmbedError::Panic(EmbedPanic {
             message: err.message.clone(),
             span: err.span.map(|s| (s.start, s.end)),
-            rendered: crate::diagnostics::render_to_string(err),
+            rendered: crate::diagnostics::render_to_string(err, true),
         })
     }
 }

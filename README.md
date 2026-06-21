@@ -271,6 +271,7 @@ python3 -m http.server 8000
 
 - **`docs/index.html`** — landing page.
 - **`docs/reader.html`** — the documentation reader (language guide + stdlib reference, with search).
+- **`docs/playground.html`** — the **Playground**: compiles and runs AScript entirely in your browser (the bytecode VM compiled to WebAssembly — no server, no install). See [the playground guide](docs/content/tooling/playground.md).
 - **`docs/content/`** — every page as plain Markdown, readable straight from the repo if you prefer.
 - **Specification** — `docs/content/spec/` (normative; stability policy + 1.0 criteria in `spec/stability`).
 

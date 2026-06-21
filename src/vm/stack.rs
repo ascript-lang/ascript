@@ -22,6 +22,16 @@
 //! the safety backstop (it also bounds heap-`frames` growth, which `stacker` does
 //! NOT bound). `grow` only ensures the native re-entry paths *reach* that cap
 //! instead of overflowing the native stack first.
+//!
+//! **WASM §5.3.5 — platform note (no code change here).** On `wasm32-unknown-unknown`
+//! `stacker`/`psm` compile but cannot switch stacks (spike §10.4), so `maybe_grow`
+//! degrades to "run the closure on the current stack" — i.e. [`grow`]/[`grow_future`]
+//! become the identity pass-throughs they already are when the stack is healthy. wasm
+//! has no growable native stack: recursion is bounded by the linker-set shadow stack
+//! (raised to 8 MiB by the wrapper) and the LOWERED wasm `MAX_CALL_DEPTH` (1000,
+//! `src/interp.rs`) trips the SAME `maximum recursion depth exceeded` panic before the
+//! shadow stack overflows. No `cfg` is needed here — `maybe_grow`'s own wasm arm is
+//! the pass-through. Native behavior is unchanged (Gate W-1).
 
 /// The minimum remaining native stack (bytes) below which [`grow`] / [`grow_future`]
 /// allocate a fresh segment. It must comfortably exceed the **largest native-stack
