@@ -1,6 +1,6 @@
 # Record/Replay as a User-Facing Flagship — Design (REPLAY)
 
-- **Status:** Implemented (Tasks 0–11 done on `feat/record-replay`; merge SHA recorded at Task 12).
+- **Status:** Implemented — MERGED to `main` (`--no-ff`, `e6229e68`).
   Deltas from this draft, all owner-noted: (1) the trace file extension shipped as `.astrc`
   for `run` traces (matching the `ASTRC` magic) and `.trace` for the per-test auto-saved files
   under `.ascript-traces/`; (2) `test --replay` against a CHANGED test file proceeds with a
@@ -8,7 +8,10 @@
   Task 7 — editing the test/code between replays is the normal loop, so a digest change is a
   warning, while a seam-order divergence is still a loud error); (3) the §8 coverage table was
   FINALIZED in Task 9 with two reclassifications (`time.interval`/`debounce`/`throttle` →
-  Refused; `archive.tarExtractTo`/`zipExtractTo`/`tarCreateFromDir` → Recorded(Plain)). All
+  Refused; `archive.tarExtractTo`/`zipExtractTo`/`tarCreateFromDir` → Recorded(Plain)); (4)
+  `run --replay <trace> <prog>` REQUIRES the program-file arg in v1 (§4.1's draft called it
+  optional) — consistently documented in `docs/content/cli.md` + `--help`, and the source
+  digest still governs identity. All
   in-spec invariants (zero-cost-when-off `Cell` gate, completeness test, strict CliTrace vs
   lenient Workflow origins, HttpResponse-only virtualization, worker refusal, hostile-safe
   `ASTRC` reader + fuzz target, DAP stepBack-by-re-execution, the §0.5 bare-sleep fix) shipped

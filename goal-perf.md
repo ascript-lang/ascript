@@ -336,17 +336,8 @@ stated, results are measured.
 
 ### Flagship & ecosystem track
 
-- 🔒 **REPLAY — record/replay as a user-facing flagship.** The plumbing is shipped and INERT
-  (`src/det.rs` Record/Replay, virtual clock, seeded RNG, FFI replay, workflow replay); REPLAY
-  makes it a headline feature: `ascript run --record/--replay`, `ascript test --record` (failed
-  tests auto-save a trace; any failure replays deterministically), and replay-debugging through
-  the shipped DAP server (time-travel via deterministic re-execution, the rr model). The core
-  design question it must answer honestly: extending `DetEvent` recording to effectful stdlib
-  I/O at the `call_stdlib` chokepoint (http/fs/process results) vs documenting the seamed
-  subset (clock/RNG/FFI) as v1. Zero-cost-when-off inherited from det's INERT default.
-  - Spec: `superpowers/specs/2026-06-12-record-replay-design.md` · Plan: `superpowers/plans/2026-06-12-record-replay.md`
-  - **[Task 11 DRAFT — flip 🔒 → ✅ at Task 12 merge, fill `<sha>`]** ✅ **REPLAY — record/replay as a
-    user-facing flagship. MERGED to `main` (`--no-ff`, `<sha>`).** SP9's INERT determinism plumbing made a
+- ✅ **REPLAY — record/replay as a
+    user-facing flagship. MERGED to `main` (`--no-ff`, `e6229e68`).** SP9's INERT determinism plumbing made a
     headline: `run --record/--replay/--seed`, `test --record/--replay` (failed tests auto-save a trace under
     `.ascript-traces/`), and DAP time-travel (`stepBack`/`reverseContinue` by deterministic re-execution, the
     rr model). Extended `DetEvent` recording to effectful stdlib at the `call_stdlib` chokepoint behind a
@@ -356,7 +347,14 @@ stated, results are measured.
     the hostile-safe `ASTRC` trace format + fuzz target. No grammar/`Value`/opcode change, `ASO_FORMAT_VERSION`
     29 unchanged, `vm_differential` flag-gated-untouched. Headline: plain→record `sleep_heavy` **56.0×** (real
     sleeps become virtual), replay skips all real OS effects; spec/tw geomean 3.78× ≥ 2×; `dbg_zero_cost_gate`
-    0.969×.
+    0.969×. Spec: `superpowers/specs/2026-06-12-record-replay-design.md` · Plan:
+    `superpowers/plans/2026-06-12-record-replay.md`. **Deltas from spec (recorded):** (a) `run --replay <trace>
+    <prog>` REQUIRES the program-file arg in v1 (the spec §4.1 draft called it optional) — documented in
+    `docs/content/cli.md` + `--help`, the source digest still governs; (b) `test --replay` of a CHANGED test
+    file proceeds with a printed WARNING (not the hard `run` error — §4.3 sharpening). v2 follow-ups (streaming/
+    SSE/WS + general handle virtualization, per-isolate worker traces, replay checkpointing for O(1) backsteps,
+    task-identity event tags, `--deterministic` alias, `--profile`/`--inspect`×record matrix) recorded in
+    `superpowers/roadmap.md`.
 
 - ✅ **BATT — backend batteries (T1+T2). MERGED to `main` in 4 phases (`--no-ff`): A auth `fc21c1f`,
   B data `bf13fb3`, C testing `a1c92cf`, D toolbelt `72d5977`. See EXECUTION LOG.** One multi-unit stdlib spec, phased like the
@@ -411,6 +409,38 @@ stated, results are measured.
   revisit inline short strings ONLY behind its measured-win gate.
 
 ## EXECUTION LOG (live)
+
+- **REPLAY** — ✅ MERGED to `main` (`--no-ff`, `e6229e68`). Record/replay as a user-facing flagship: 13 commits
+  (Tasks 0-11), each subagent-implemented + independently opus-reviewed + controller-verified (vm_differential
+  446/0 BOTH configs after every task; the final holistic ran the FULL suite both configs **5230/0** + a 10-min
+  fuzz campaign **5.3M runs / 0 crashes**). **The mechanism:** SP9's shipped-but-INERT determinism plumbing
+  surfaced behind a `trace_active()` `Cell` at the `call_stdlib` chokepoint (the answer to the spec's core design
+  question — record effectful stdlib I/O at the result boundary, NOT just the seamed clock/RNG subset). A complete
+  `replay_class` table (Seamed/Recorded/Refused/Harmless) with a **sabotage-proven completeness test** (a new
+  unclassified module trips it loudly — no silently-Harmless effect); **airlock outcome encoding, NOT JSON** (NUM
+  Int/Float fidelity — a JSON-coded replay would branch wrong on a recorded number); HttpResponse-only handle
+  virtualization (vid birth + `NativeCall` record/replay); the hostile-safe `ASTRC` trace format + fuzz target.
+  **Surfaces:** `run --record/--replay/--seed` (cross-engine: a trace records on any engine and replays
+  byte-identically on tw↔VM↔generic↔.aso — the Gate-1 extension); `test --record/--replay` (per-test failure
+  traces under `.ascript-traces/`, sliced as O(1) index-ranges, failure-only save); DAP **time-travel**
+  (`stepBack`/`reverseContinue` by deterministic re-execution, the rr model — `supportsStepBack` replay-only).
+  **Bugs fixed in-branch (failing-test-first):** the §0.5 bare-`time.sleep` replay desync (a pre-existing
+  workflow cursor bug); a DAP `teardown_session` deadlock (ClearBreakpoints before the final Continue — surfaced
+  by multi-breakpoint re-execution); the Task-7 module-load-failure trace replaying just-the-load (was rejected as
+  "corrupt"). **Determinism audit (§8):** every std module classified vs SOURCE; `time.interval/debounce/throttle`
+  reclassified Seamed→Refused (real tokio timers bypass the clock seam) + `archive` disk funcs Harmless→Recorded.
+  **Invariants held:** NO grammar/`Value`/opcode change; `ASO_FORMAT_VERSION` **29 unchanged** (0 diff vs main
+  `src/vm/aso.rs`); `vm_differential` flag-gated-untouched (REPLAY adds no engine mode); `Origin::Workflow`
+  det/workflow semantics additions-only; no `unwrap`/`panic!` reachable from hostile trace bytes. **Process note:**
+  Task 6 was implemented INLINE by the controller through a sustained API 529-overload that blocked subagent
+  dispatch, then fully independently reviewed once the API recovered. **Headline:** plain→record `sleep_heavy`
+  **56.0×** (real sleeps become virtual under the SP9 clock); replay skips all real OS effects (effect_heavy
+  12×, proc_heavy ∞); spec/tw geomean **3.78×** ≥ 2× (the `call_stdlib` neighbor untaxed); `dbg_zero_cost_gate`
+  **0.969×**; zero-cost-off cross-binary A/B **0.982×** (branch faster — the `Cell` is free). **Deltas from spec
+  (recorded):** `run --replay` requires the program-file arg in v1 (spec §4.1 draft called it optional —
+  consistently documented in `cli.md`/`--help`); `test --replay` of a changed test file warns (not the hard `run`
+  error). v2 follow-ups recorded in `superpowers/roadmap.md`. Now **19/21** (WASM spike-gated + EXEC evidence-gated
+  remain; JIT a recorded deferral).
 
 - **LSPEC** — ✅ MERGED to `main` (`--no-ff`, `0064be93`). The AScript normative language specification + its
   stability/governance policy, plus the owner-approved grammar feature that resolved the recover-contract triage.
