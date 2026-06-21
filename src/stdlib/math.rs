@@ -509,14 +509,11 @@ thread_local! {
 }
 
 fn seed() -> u64 {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos() as u64)
-        .unwrap_or(0x9E3779B97F4A7C15);
-    let local = 0u8;
-    let addr = &local as *const u8 as u64;
-    (nanos ^ addr).max(1)
+    // WASM §5.3.3: the raw ambient seed source moved to `platform::entropy_seed`
+    // (native arm = this exact SystemTime-nanos XOR stack-address body; wasm =
+    // `getrandom(js)`). The deterministic-mode PRNG seeding is unchanged (it goes
+    // through `interp.next_seeded_f64` in `next_random`, ABOVE this).
+    crate::platform::entropy_seed()
 }
 
 /// The next `[0,1)` random value. SP9 §3: in deterministic mode (an `interp` with a

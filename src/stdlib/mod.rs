@@ -1308,8 +1308,10 @@ impl Interp {
                 return Ok(Value::nil());
             }
             // `ms as u64` truncates toward zero: a fractional `sleep(20.7)`
-            // sleeps for 20 whole milliseconds.
-            tokio::time::sleep(std::time::Duration::from_millis(ms as u64)).await;
+            // sleeps for 20 whole milliseconds. WASM §5.3.3: route through the platform
+            // sleep (native = `tokio::time::sleep`; wasm = a `setTimeout` future) — this
+            // is the non-det path (the det branch returned above).
+            crate::platform::sleep_ms(ms as u64).await;
             return Ok(Value::nil());
         }
         if func == "interval" {

@@ -90,6 +90,9 @@ pub mod parser;
 // itself lives on the VM (`Vm::publish_profile_frames`) behind the single
 // `Vm.instrument` gate. `--no-default-features` builds none of this and `--profile`
 // reports a clean rebuild hint.
+// WASM §5.3.3: the platform clock/entropy/sleep seam. CORE (builds under
+// `--no-default-features` and on every target); sits BELOW the `det.rs` seams.
+pub mod platform;
 #[cfg(feature = "profile")]
 pub mod profile;
 // WASM §5.3.2 / §2.2: `repl` pulls `rustyline` (→ `fd-lock`, a native file-lock crate

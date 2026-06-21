@@ -7,7 +7,6 @@ use crate::span::Span;
 use crate::value::Value;
 #[cfg(test)]
 use crate::value::ValueKind;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 pub fn exports() -> Vec<(&'static str, Value)> {
     vec![
@@ -24,17 +23,14 @@ pub fn exports() -> Vec<(&'static str, Value)> {
     ]
 }
 
-// A process-global start instant for monotonic(), lazily initialized. Global
-// (not thread_local) so readings are comparable across threads under a
-// multi-thread runtime.
-use std::sync::LazyLock;
-static START: LazyLock<std::time::Instant> = LazyLock::new(std::time::Instant::now);
-
 /// The real monotonic clock in ms since process start. Shared with the SP9 §3
 /// determinism seam in `call_time`, which passes this as the `None`-mode fallback
 /// for `time.monotonic` so the default path stays byte-identical to the arm below.
+/// WASM §5.3.3: the raw monotonic source (the process-global `Instant` baseline)
+/// moved to `platform::monotonic_ms` (native arm unchanged; wasm uses
+/// `performance.now`).
 pub(crate) fn real_monotonic_ms() -> f64 {
-    START.elapsed().as_secs_f64() * 1000.0
+    crate::platform::monotonic_ms()
 }
 
 /// Synchronous time functions. `sleep` is handled async in `call_time` (mod.rs)
@@ -43,14 +39,14 @@ pub fn call(func: &str, args: &[Value], span: Span) -> Result<Value, Control> {
     let ctx = |f: &str| format!("time.{}", f);
     match func {
         "now" => {
-            let ms = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map(|d| d.as_millis() as f64)
-                .unwrap_or(0.0);
+            // WASM §5.3.3: route through the platform clock (native = same `SystemTime`
+            // body; wasm = `Date.now`). NOTE: this synchronous arm is the NON-det path
+            // reached only when `call_time` did NOT pre-empt with the det seam.
+            let ms = crate::platform::now_unix_ms();
             Ok(Value::float(ms))
         }
         "monotonic" => {
-            let ms = START.elapsed().as_secs_f64() * 1000.0;
+            let ms = real_monotonic_ms();
             Ok(Value::float(ms))
         }
         "millis" => Ok(Value::float(want_number(
