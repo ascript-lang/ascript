@@ -39,12 +39,17 @@
 //! [`install_current`] asserts an install never stomps a different executor.
 //! Task 4/5 install it via [`CurrentExecGuard`] (RAII) at the entry points.
 //!
-//! ## Task-1 carry-forward shortcuts (flagged for later tasks)
+//! ## Carry-forward shortcuts (flagged for later tasks)
 //!
-//! * **Abort (Task 1 partial → Task 3).** `Inject::Abort(id)` marks the task's
-//!   `aborted` cell (gen-checked). A marked task is dropped + freed at its next
-//!   dequeue in [`Core::poll_one`]. Task 3 wires immediate abort drop + the
-//!   abort handle plumbing.
+//! * **Abort (DONE — Task 3).** [`AbortHandle::abort`] is deferred-drop, matching
+//!   tokio: it NEVER drops the future synchronously (mid-`poll` drop is UB). The
+//!   three cases — idle (mark + enqueue → dropped at the next dequeue), self-abort
+//!   of the running task (mark only → dropped by [`Core::poll_one`]'s post-poll
+//!   re-check), and cross-thread (`Inject::Abort` → [`Core::drain_injected`] marks
+//!   then enqueues) — all converge on the future actually dropping, at which point
+//!   its wrapper drop guard resolves the [`JoinHandle`]'s [`JoinState`] to
+//!   `Err(Aborted)` (first-writer-wins). The SAME guard makes whole-future
+//!   cancel-on-drop resolve the join identically, with zero special-casing.
 //! * **tokio integration (Task 4).** [`Shared::parked`] (the executor's parked
 //!   tokio waker) is wired by [`TaskWaker::signal`] now but only ever holds `None`
 //!   until Task 4's `run_until`/drain loop parks a real tokio waker there.
@@ -353,9 +358,48 @@ impl Core {
         self.ready.borrow_mut().push_back(id);
     }
 
+    /// Same-thread abort request (S3). NEVER drops the future synchronously
+    /// (dropping a future mid-`poll` is instant UB); marks + arranges a dequeue,
+    /// and the executor drops it at `poll_one`. Cases:
+    ///
+    /// 1. Task NOT currently running → mark `aborted` (gen-checked) AND enqueue,
+    ///    so `poll_one` dequeues it, sees the mark, and `retire`s (drops it).
+    /// 2. Task IS the currently-running one (self-abort, `running == Some(id)`) →
+    ///    mark ONLY (it is mid-poll); `poll_one`'s post-poll re-check drops it.
+    /// 3. Stale/forged/already-freed id → gen-check fails → silent no-op
+    ///    (double-abort / abort-after-complete idempotency).
+    fn request_abort(&self, id: TaskId) {
+        // Mark `aborted` iff the slot is gen-matching and live.
+        let marked = {
+            let tasks = self.tasks.borrow();
+            match tasks.get(id.index as usize) {
+                Some(slot) if slot.gen == id.gen => match &slot.cell {
+                    Some(cell) => {
+                        cell.aborted.set(true);
+                        true
+                    }
+                    None => false,
+                },
+                _ => false,
+            }
+        };
+        if !marked {
+            return; // stale / freed → no-op
+        }
+        // Case 2: self-abort of the running task → mark only (mid-poll).
+        if self.running.get() == Some(id) {
+            return;
+        }
+        // Case 1: not running → enqueue so `poll_one` dequeues + drops it. A
+        // double-enqueue is harmless (the second dequeue gen-fails after the
+        // first retire frees the slot).
+        self.enqueue_local(id);
+    }
+
     /// Drain the injection channel (non-blocking). `Wake(id)` → enqueue iff the
-    /// slot's gen matches and its cell is live; `Abort(id)` → mark `aborted` iff
-    /// the gen matches (the drop/free happens at next dequeue in Task 1).
+    /// slot's gen matches and its cell is live; `Abort(id)` → mark `aborted` AND
+    /// enqueue (gen-checked) so `poll_one` dequeues + `retire`s (drops) it — its
+    /// drop guard then resolves the join to `Err(Aborted)` (Task 3).
     pub(crate) fn drain_injected(&self) {
         while let Ok(msg) = self.injected_rx.try_recv() {
             match msg {
@@ -366,13 +410,26 @@ impl Core {
                     // else: stale gen / completed cell → wake-after-complete no-op.
                 }
                 Inject::Abort(id) => {
-                    let tasks = self.tasks.borrow();
-                    if let Some(slot) = tasks.get(id.index as usize) {
-                        if slot.gen == id.gen {
-                            if let Some(cell) = &slot.cell {
-                                cell.aborted.set(true);
+                    // Mark `aborted` (gen-checked) AND enqueue so `poll_one`
+                    // dequeues it and `retire`s (drops the future → its drop
+                    // guard resolves the join to `Err(Aborted)`). Without the
+                    // enqueue a parked task would never be dequeued/dropped.
+                    let mark = {
+                        let tasks = self.tasks.borrow();
+                        match tasks.get(id.index as usize) {
+                            Some(slot) if slot.gen == id.gen => {
+                                if let Some(cell) = &slot.cell {
+                                    cell.aborted.set(true);
+                                    true
+                                } else {
+                                    false
+                                }
                             }
+                            _ => false,
                         }
+                    };
+                    if mark {
+                        self.ready.borrow_mut().push_back(id);
                     }
                 }
             }
@@ -466,15 +523,36 @@ impl Core {
                 self.retire(id.index);
             }
             Poll::Pending => {
-                // Put the (still-live) future back; a wake re-queues it.
-                let mut tasks = self.tasks.borrow_mut();
-                if let Some(cell) = tasks
-                    .get_mut(id.index as usize)
-                    .and_then(|s| s.cell.as_mut())
-                {
-                    cell.future = future;
+                // Post-poll abort re-check (S3 self-abort case). A task that
+                // aborted ITS OWN handle mid-poll cannot be dropped during the
+                // poll (dropping a future mid-`poll` is instant UB), so
+                // `request_abort` only marked the cell. Now that the poll has
+                // returned, if the abort flag is newly set we `retire` (drop the
+                // future here) instead of re-parking a marked-but-live task that
+                // would only drop on a later wake (a latent leak). The future's
+                // drop guard resolves the join to `Err(Aborted)`.
+                let aborted_now = {
+                    let tasks = self.tasks.borrow();
+                    tasks
+                        .get(id.index as usize)
+                        .and_then(|s| s.cell.as_ref())
+                        .map(|c| c.aborted.get())
+                        .unwrap_or(false)
+                };
+                if aborted_now {
+                    drop(future); // drop the pending future before freeing the slot
+                    self.retire(id.index);
+                } else {
+                    // Put the (still-live) future back; a wake re-queues it.
+                    let mut tasks = self.tasks.borrow_mut();
+                    if let Some(cell) = tasks
+                        .get_mut(id.index as usize)
+                        .and_then(|s| s.cell.as_mut())
+                    {
+                        cell.future = future;
+                    }
+                    // else: the cell was freed under us → drop future.
                 }
-                // else: the cell was freed under us (abort during poll) → drop future.
             }
         }
 
@@ -536,6 +614,262 @@ impl Core {
         let before = self.ready.borrow().len();
         self.drain_injected();
         self.ready.borrow().len() == before
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Task 3: the handle surface — JoinHandle<T> / AbortHandle / spawn_local_on,
+// and deferred-drop abort (S3).
+// ---------------------------------------------------------------------------
+
+/// The error a [`JoinHandle`] yields when its task was aborted (explicit abort
+/// or cancel-on-drop). Unit type — the bespoke analogue of tokio's cancelled
+/// `JoinError`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Aborted;
+
+/// Per-task join channel: the output slot + the parked joiner's waker + a
+/// finished flag (for `is_finished()`). `Rc` — every join site is same-thread
+/// (spec §5.2 inventory).
+struct JoinState<T> {
+    slot: RefCell<Option<Result<T, Aborted>>>,
+    waiter: RefCell<Option<Waker>>,
+    finished: Cell<bool>,
+}
+
+impl<T> JoinState<T> {
+    fn new() -> Rc<Self> {
+        Rc::new(JoinState {
+            slot: RefCell::new(None),
+            waiter: RefCell::new(None),
+            finished: Cell::new(false),
+        })
+    }
+
+    /// First-writer-wins resolution of the join slot, then wake the parked
+    /// joiner. Used both by the wrapper on `Ready(output)` (with `Ok`) and by
+    /// the drop guard on an un-finished drop (with `Err(Aborted)`).
+    fn resolve(&self, result: Result<T, Aborted>) {
+        {
+            let mut slot = self.slot.borrow_mut();
+            if slot.is_some() {
+                return; // first-writer-wins
+            }
+            *slot = Some(result);
+        }
+        // Wake the parked joiner (if any) outside the slot borrow.
+        if let Some(waker) = self.waiter.borrow_mut().take() {
+            waker.wake();
+        }
+    }
+}
+
+/// The await/abort surface for a spawned task. `!Send` (every call site is
+/// same-thread; spec §5.2). Dropping a `JoinHandle` does NOT abort the task
+/// (tokio parity — cancel-on-drop lives at the higher SharedFuture layer).
+pub(crate) struct JoinHandle<T> {
+    inner: JoinInner<T>,
+}
+
+enum JoinInner<T> {
+    Bespoke {
+        state: Rc<JoinState<T>>,
+        id: TaskId,
+        shared: Arc<Shared>,
+    },
+    /// Seam fallback (Task 5 wires it; the variant exists now).
+    Tokio(tokio::task::JoinHandle<T>),
+}
+
+impl<T> JoinHandle<T> {
+    /// A cheap, `Send + Sync` handle that can abort this task from any thread.
+    pub(crate) fn abort_handle(&self) -> AbortHandle {
+        match &self.inner {
+            JoinInner::Bespoke { id, shared, .. } => AbortHandle {
+                inner: AbortInner::Bespoke {
+                    id: *id,
+                    shared: Arc::clone(shared),
+                },
+            },
+            JoinInner::Tokio(h) => AbortHandle {
+                inner: AbortInner::Tokio(h.abort_handle()),
+            },
+        }
+    }
+
+    /// Abort the task (deferred-drop; never drops the future synchronously).
+    pub(crate) fn abort(&self) {
+        self.abort_handle().abort();
+    }
+
+    /// True once the task has finished (completed OR resolved as aborted).
+    pub(crate) fn is_finished(&self) -> bool {
+        match &self.inner {
+            JoinInner::Bespoke { state, .. } => state.finished.get(),
+            JoinInner::Tokio(h) => h.is_finished(),
+        }
+    }
+}
+
+impl<T> Future for JoinHandle<T> {
+    type Output = Result<T, Aborted>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        // `JoinHandle` is `Unpin` for the bespoke arm (the fields are `Rc`/`Arc`/
+        // `TaskId`); the tokio arm's `JoinHandle` is itself `Unpin`.
+        match &mut self.get_mut().inner {
+            JoinInner::Bespoke { state, .. } => {
+                if let Some(result) = state.slot.borrow_mut().take() {
+                    return Poll::Ready(result);
+                }
+                *state.waiter.borrow_mut() = Some(cx.waker().clone());
+                Poll::Pending
+            }
+            JoinInner::Tokio(h) => match Pin::new(h).poll(cx) {
+                Poll::Ready(Ok(v)) => Poll::Ready(Ok(v)),
+                // A cancelled/panicked tokio task maps to `Aborted` (the bespoke
+                // surface has no panic-carrying variant).
+                Poll::Ready(Err(_)) => Poll::Ready(Err(Aborted)),
+                Poll::Pending => Poll::Pending,
+            },
+        }
+    }
+}
+
+/// A cheap, clonable abort handle. MUST stay `Send + Sync` (tokio's is) — a
+/// cross-thread abort lands via the injection channel.
+#[derive(Clone)]
+pub(crate) struct AbortHandle {
+    inner: AbortInner,
+}
+
+#[derive(Clone)]
+enum AbortInner {
+    Bespoke { id: TaskId, shared: Arc<Shared> },
+    Tokio(tokio::task::AbortHandle),
+}
+
+impl AbortHandle {
+    /// Request abort. Deferred-drop: NEVER drops the future synchronously.
+    ///
+    /// * Same-thread, task not running → mark + enqueue (drops at next dequeue).
+    /// * Same-thread, task IS running (self-abort) → mark only (poll_one's
+    ///   post-poll re-check drops it).
+    /// * Cross-thread → inject `Abort(id)`; `drain_injected` marks + enqueues.
+    /// * Stale/forged/completed id → gen-checked silent no-op (double-abort /
+    ///   abort-after-complete idempotency).
+    pub(crate) fn abort(&self) {
+        match &self.inner {
+            AbortInner::Bespoke { id, shared } => {
+                // Same-thread fast path: route through the installed `Core` so we
+                // can distinguish the self-abort (running) case and avoid the
+                // channel round-trip. Confirm identity via `Arc::ptr_eq`.
+                if std::thread::current().id() == shared.thread {
+                    let core = CURRENT_EXEC.with(|slot| slot.borrow().clone());
+                    if let Some(core) = core {
+                        if Arc::ptr_eq(&core.shared, shared) {
+                            core.request_abort(*id);
+                            return;
+                        }
+                    }
+                    // Registry empty / different executor → fall through to inject.
+                }
+                // Cross-thread (or no-registry) path: inject. `drain_injected`
+                // marks + enqueues (gen-checked). A send-after-shutdown is a
+                // silent no-op (the executor + its receiver are gone).
+                let _ = shared.injected_tx.send(Inject::Abort(*id));
+            }
+            AbortInner::Tokio(h) => h.abort(),
+        }
+    }
+}
+
+/// `AbortHandle` is fired from foreign threads (worker channels, blocking-pool
+/// completions). Pin `Send + Sync` so a future non-`Send`/`!Sync` field fails
+/// the BUILD here rather than silently regressing the design.
+const _: fn() = || {
+    fn assert_send_sync<T: Send + Sync>() {}
+    assert_send_sync::<AbortHandle>();
+};
+
+/// Spawn `fut` onto `core`. The user future (`Output = T`) is wrapped into a
+/// `Future<Output = ()>` for [`Core::insert`] that (a) on `Ready(output)` stores
+/// `Ok(output)` into the join state, sets `finished`, wakes the joiner, and
+/// DISARMS the drop guard; and (b) carries a drop guard that, if the wrapper
+/// drops UN-finished (abort-at-dequeue OR whole-future cancel-on-drop), resolves
+/// the join to `Err(Aborted)` (first-writer-wins) and wakes the joiner — so both
+/// abort paths resolve the join with zero special-casing, exactly at the drop
+/// point (spec §3.1).
+pub(crate) fn spawn_local_on<T, F>(core: &Rc<Core>, fut: F) -> JoinHandle<T>
+where
+    F: Future<Output = T> + 'static,
+    T: 'static,
+{
+    let state = JoinState::<T>::new();
+
+    let wrapper = JoinWrapper {
+        fut: Box::pin(fut),
+        guard: AbortDropGuard {
+            state: Rc::clone(&state),
+            armed: true,
+        },
+    };
+
+    let id = core.insert(Box::pin(wrapper));
+
+    JoinHandle {
+        inner: JoinInner::Bespoke {
+            state,
+            id,
+            shared: Arc::clone(&core.shared),
+        },
+    }
+}
+
+/// The wrapper future stored in the slab. Drives the user future; on completion
+/// resolves the join `Ok` and disarms the guard; on ANY drop while still armed
+/// the guard resolves the join `Err(Aborted)`.
+struct JoinWrapper<T> {
+    fut: Pin<Box<dyn Future<Output = T>>>,
+    guard: AbortDropGuard<T>,
+}
+
+/// Resolves the join to `Err(Aborted)` on drop unless disarmed (the wrapper
+/// disarms it on normal completion). This is the single mechanism that makes
+/// BOTH abort-at-dequeue and whole-future cancel-on-drop resolve the join.
+struct AbortDropGuard<T> {
+    state: Rc<JoinState<T>>,
+    armed: bool,
+}
+
+impl<T> Drop for AbortDropGuard<T> {
+    fn drop(&mut self) {
+        if self.armed {
+            // Un-finished-normally drop → aborted. Set `finished` (an aborted
+            // task IS finished — tokio's `is_finished()` is true post-cancel)
+            // then resolve `Err(Aborted)` (first-writer-wins inside `resolve`).
+            self.state.finished.set(true);
+            self.state.resolve(Err(Aborted));
+        }
+    }
+}
+
+impl<T> Future for JoinWrapper<T> {
+    type Output = ();
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+        // `JoinWrapper` is `Unpin` (the boxed future is `Unpin`, the guard holds
+        // only `Rc`/`bool`), so `get_mut` is safe.
+        let this = self.get_mut();
+        match this.fut.as_mut().poll(cx) {
+            Poll::Ready(output) => {
+                this.guard.state.finished.set(true);
+                this.guard.state.resolve(Ok(output));
+                this.guard.armed = false; // disarm: normal completion, not abort
+                Poll::Ready(())
+            }
+            Poll::Pending => Poll::Pending,
+        }
     }
 }
 
@@ -1062,5 +1396,303 @@ mod tests {
         let _ = core.poll_tick(EXEC_TICK_BUDGET);
         // The Parkers never complete; live count is still the original 4.
         assert_eq!(core.live.get(), THREADS, "all parker tasks still live");
+    }
+
+    // ------------------------------------------------------------------------
+    // Task 3: JoinHandle / AbortHandle parity + deferred-drop abort (S2/S3).
+    // ------------------------------------------------------------------------
+
+    /// Drive `core` to `AllDone` (or `MoreWork` exhaustion-safe), then poll the
+    /// `JoinHandle` once with a throwaway no-op waker and return its verdict.
+    /// The join state is resolved synchronously inside the wrapper before the
+    /// executor reports `AllDone`, so one poll after draining always observes it.
+    fn drain_then_poll_join<T>(core: &Rc<Core>, handle: &mut JoinHandle<T>) -> Poll<Result<T, Aborted>>
+    where
+        T: Unpin,
+    {
+        while let TickOutcome::MoreWork = core.poll_tick(EXEC_TICK_BUDGET) {}
+        let waker = Waker::noop().clone();
+        let mut cx = Context::from_waker(&waker);
+        Pin::new(handle).poll(&mut cx)
+    }
+
+    /// A future whose `Drop` flips a shared flag — proves WHEN the future drops.
+    struct DropTracked {
+        dropped: Rc<Cell<bool>>,
+        polls: u32,
+        ready_after: u32,
+    }
+    impl Future for DropTracked {
+        type Output = i32;
+        fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<i32> {
+            let this = self.get_mut();
+            this.polls += 1;
+            if this.polls >= this.ready_after {
+                Poll::Ready(42)
+            } else {
+                // Park: never self-wakes (driven only by an external abort).
+                let _ = cx;
+                Poll::Pending
+            }
+        }
+    }
+    impl Drop for DropTracked {
+        fn drop(&mut self) {
+            self.dropped.set(true);
+        }
+    }
+
+    /// S2: spawn_local_on returns a JoinHandle that yields the output; is_finished
+    /// flips true after completion.
+    #[test]
+    fn join_handle_awaits_output() {
+        let core = Core::new();
+        let _g = CurrentExecGuard::install(&core);
+
+        let dropped = Rc::new(Cell::new(false));
+        let mut handle = spawn_local_on(
+            &core,
+            DropTracked {
+                dropped: Rc::clone(&dropped),
+                polls: 0,
+                ready_after: 1, // Ready on first poll
+            },
+        );
+        assert!(!handle.is_finished(), "not finished before any tick");
+
+        let verdict = drain_then_poll_join(&core, &mut handle);
+        assert_eq!(verdict, Poll::Ready(Ok(42)));
+        assert!(handle.is_finished(), "finished after completion");
+    }
+
+    /// S3: aborting a queued-but-not-running task drops the future at the NEXT
+    /// tick (NOT synchronously inside abort()); the join resolves Err(Aborted).
+    #[test]
+    fn abort_idle_task_drops_at_dequeue() {
+        let core = Core::new();
+        let _g = CurrentExecGuard::install(&core);
+
+        let dropped = Rc::new(Cell::new(false));
+        let mut handle = spawn_local_on(
+            &core,
+            DropTracked {
+                dropped: Rc::clone(&dropped),
+                polls: 0,
+                ready_after: 9999, // never completes on its own
+            },
+        );
+
+        // The task is queued (spawned) but NOT yet polled/running.
+        let abort = handle.abort_handle();
+        abort.abort();
+        // Deferred-drop: the future has NOT dropped synchronously inside abort().
+        assert!(
+            !dropped.get(),
+            "abort() must NOT drop the future synchronously"
+        );
+
+        // Next tick dequeues the marked task and retires it (drops the future).
+        let verdict = drain_then_poll_join(&core, &mut handle);
+        assert!(dropped.get(), "future dropped at the next tick");
+        assert_eq!(verdict, Poll::Ready(Err(Aborted)));
+        assert!(handle.is_finished(), "aborted task counts as finished");
+    }
+
+    /// S3 UB guard: a task that aborts its OWN handle mid-poll. The mark is set,
+    /// the poll returns (future NOT dropped during the poll), the future drops
+    /// AFTER the poll via poll_one's post-poll re-check; join resolves Aborted.
+    #[test]
+    fn abort_during_own_poll_defers_drop() {
+        let core = Core::new();
+        let _g = CurrentExecGuard::install(&core);
+
+        // Smuggle the abort handle into the future via a shared slot.
+        let handle_slot: Rc<StdRefCell<Option<AbortHandle>>> = Rc::new(StdRefCell::new(None));
+
+        struct SelfAbort {
+            abort: Rc<StdRefCell<Option<AbortHandle>>>,
+            dropped: Rc<Cell<bool>>,
+            dropped_during_poll: Rc<Cell<bool>>,
+        }
+        impl Future for SelfAbort {
+            type Output = i32;
+            fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<i32> {
+                let this = self.get_mut();
+                // Abort ourselves mid-poll.
+                if let Some(a) = this.abort.borrow().as_ref() {
+                    a.abort();
+                }
+                // If a synchronous drop happened, it would have flipped `dropped`
+                // BEFORE this poll returns — record that observation.
+                this.dropped_during_poll.set(this.dropped.get());
+                Poll::Pending
+            }
+        }
+        impl Drop for SelfAbort {
+            fn drop(&mut self) {
+                self.dropped.set(true);
+            }
+        }
+
+        let dropped = Rc::new(Cell::new(false));
+        let dropped_during_poll = Rc::new(Cell::new(false));
+        let mut handle = spawn_local_on(
+            &core,
+            SelfAbort {
+                abort: Rc::clone(&handle_slot),
+                dropped: Rc::clone(&dropped),
+                dropped_during_poll: Rc::clone(&dropped_during_poll),
+            },
+        );
+        // Now wire the abort handle in (after spawn so the id is known).
+        *handle_slot.borrow_mut() = Some(handle.abort_handle());
+
+        let verdict = drain_then_poll_join(&core, &mut handle);
+        assert!(
+            !dropped_during_poll.get(),
+            "future must NOT be dropped during its own poll (UB guard)"
+        );
+        assert!(dropped.get(), "future dropped after the poll (post-poll re-check)");
+        assert_eq!(verdict, Poll::Ready(Err(Aborted)));
+    }
+
+    /// AbortHandle is Send + Sync (compile-time), and a cross-thread abort lands
+    /// via injection and cancels the task. The thread is joined (no leak).
+    #[test]
+    fn cross_thread_abort() {
+        // Compile-time Send+Sync assertion (the const _ block also asserts it).
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<AbortHandle>();
+
+        let core = Core::new();
+        let _g = CurrentExecGuard::install(&core);
+
+        let dropped = Rc::new(Cell::new(false));
+        let mut handle = spawn_local_on(
+            &core,
+            DropTracked {
+                dropped: Rc::clone(&dropped),
+                polls: 0,
+                ready_after: 9999, // never completes on its own
+            },
+        );
+        // Poll it once so it parks Pending (running == None afterwards).
+        assert_eq!(core.poll_tick(EXEC_TICK_BUDGET), TickOutcome::Idle);
+
+        // Abort from ANOTHER thread → lands on the injection channel.
+        let abort = handle.abort_handle();
+        let th = std::thread::spawn(move || {
+            abort.abort();
+        });
+        th.join().expect("foreign abort thread joined");
+
+        // A tick drains the injected Abort: marks + enqueues + retires (drops).
+        let verdict = drain_then_poll_join(&core, &mut handle);
+        assert!(dropped.get(), "cross-thread abort dropped the future");
+        assert_eq!(verdict, Poll::Ready(Err(Aborted)));
+    }
+
+    /// Double-abort and abort-after-complete are silent no-ops (no panic, the
+    /// resolved verdict is unchanged — first-writer-wins).
+    #[test]
+    fn double_abort_and_abort_after_complete_are_noops() {
+        let core = Core::new();
+        let _g = CurrentExecGuard::install(&core);
+
+        // --- double abort of an idle task ---
+        let mut h1 = spawn_local_on(
+            &core,
+            DropTracked {
+                dropped: Rc::new(Cell::new(false)),
+                polls: 0,
+                ready_after: 9999,
+            },
+        );
+        let a = h1.abort_handle();
+        a.abort();
+        a.abort(); // second abort: idempotent (flag already set; re-enqueue gen-fails)
+        let v1 = drain_then_poll_join(&core, &mut h1);
+        assert_eq!(v1, Poll::Ready(Err(Aborted)));
+
+        // --- abort AFTER completion ---
+        let mut h2 = spawn_local_on(
+            &core,
+            DropTracked {
+                dropped: Rc::new(Cell::new(false)),
+                polls: 0,
+                ready_after: 1, // completes immediately
+            },
+        );
+        let a2 = h2.abort_handle();
+        // Drive to completion first.
+        while let TickOutcome::MoreWork = core.poll_tick(EXEC_TICK_BUDGET) {}
+        assert!(h2.is_finished());
+        // Abort after complete: slot freed → gen-checked no-op, verdict unchanged.
+        a2.abort();
+        let waker = Waker::noop().clone();
+        let mut cx = Context::from_waker(&waker);
+        assert_eq!(Pin::new(&mut h2).poll(&mut cx), Poll::Ready(Ok(42)));
+    }
+
+    /// Dropping the WHOLE wrapper future (cancel-on-drop, simulated by dropping
+    /// the Core while a task is parked) resolves the join to Err(Aborted) via the
+    /// drop guard.
+    #[test]
+    fn join_resolves_aborted_on_cancel_drop() {
+        let core = Core::new();
+        let _g = CurrentExecGuard::install(&core);
+
+        let dropped = Rc::new(Cell::new(false));
+        let mut handle = spawn_local_on(
+            &core,
+            DropTracked {
+                dropped: Rc::clone(&dropped),
+                polls: 0,
+                ready_after: 9999, // never completes
+            },
+        );
+        // Park it.
+        assert_eq!(core.poll_tick(EXEC_TICK_BUDGET), TickOutcome::Idle);
+        assert!(!dropped.get());
+
+        // Drop the executor: its slab drops every parked future → each wrapper's
+        // drop guard fires (armed) → the join resolves Err(Aborted).
+        drop(_g);
+        drop(core);
+        assert!(dropped.get(), "dropping the Core dropped the parked future");
+
+        let waker = Waker::noop().clone();
+        let mut cx = Context::from_waker(&waker);
+        assert_eq!(
+            Pin::new(&mut handle).poll(&mut cx),
+            Poll::Ready(Err(Aborted)),
+            "cancel-on-drop resolved the join to Aborted"
+        );
+    }
+
+    /// Dropping a JoinHandle does NOT abort the task (tokio parity).
+    #[test]
+    fn join_handle_drop_does_not_abort() {
+        let core = Core::new();
+        let _g = CurrentExecGuard::install(&core);
+
+        let ran = Rc::new(Cell::new(false));
+        let r = Rc::clone(&ran);
+        struct Marker {
+            ran: Rc<Cell<bool>>,
+        }
+        impl Future for Marker {
+            type Output = i32;
+            fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<i32> {
+                self.ran.set(true);
+                Poll::Ready(7)
+            }
+        }
+        let handle = spawn_local_on(&core, Marker { ran: r });
+        // Drop the handle WITHOUT awaiting — the task must still run.
+        drop(handle);
+        assert!(!ran.get(), "not run before a tick");
+        assert_eq!(core.poll_tick(EXEC_TICK_BUDGET), TickOutcome::AllDone);
+        assert!(ran.get(), "task ran despite the JoinHandle being dropped");
     }
 }
