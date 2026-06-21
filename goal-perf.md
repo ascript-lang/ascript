@@ -196,15 +196,22 @@ stated, results are measured.
 
 ### Evidence-gated (designed now, executed only when their gate opens — the JIT discipline)
 
-- 🔒 **EXEC — Bespoke single-thread executor.** Replace tokio `current_thread`+`LocalSet` as the
+- 🟡 **EXEC — Bespoke single-thread executor. IN PROGRESS (gate met: 90.7% ≥ 15%,
+  `bench/EXEC_GATE.md`).** Replace tokio `current_thread`+`LocalSet` as the
   VM's task driver with a purpose-built `!Send` executor (intrusive run queue, no per-spawn
   `JoinHandle`/`AbortHandle` allocations, same-thread wakes that never touch the reactor, tokio
-  retained solely as the I/O/timer driver). **Gate: a post-LANE re-profile showing the residual
-  async tax still material (≥15% on the async corpus).** Cancel-on-drop and structured-concurrency
+  retained solely as the I/O/timer driver). **Build gate: a post-LANE re-profile showing the residual
+  async tax still material (≥15% on the async corpus) — OPEN.** The 2026-06-21 fresh same-day
+  re-profile on `main` (`ff27977c`) measured the `async_inline` async-runtime share at **90.7%**
+  (kevent/reactor-park alone 88%), confirming the recorded post-LANE 78%/71% (`async_inline`/
+  `async_concurrent`). A separate **ship gate** (spec §7) governs merge: a measured ≥10% async-corpus
+  A/B geomean win with zero non-async/RSS regression, else the branch is parked with evidence (an
+  honored outcome). Cancel-on-drop and structured-concurrency
   semantics must survive byte-identically — this is the riskiest spec in the campaign and runs
   last among engine specs.
   - Spec: `superpowers/specs/2026-06-12-vm-executor-design.md`
   - Plan: `superpowers/plans/2026-06-12-vm-executor.md`
+  - Gate record: `bench/EXEC_GATE.md` (VERDICT: GO)
 
 - ⚖️ **REGION — Task-scoped region allocation — EVIDENCE-REJECTED (NO-GO). See EXECUTION LOG.**
   The spike was executed honestly (probe → narrow prototype → A/B). The narrow refcount recycler
