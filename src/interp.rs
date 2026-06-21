@@ -1133,11 +1133,10 @@ pub(crate) fn split_package_key(source: &str) -> (String, String) {
 /// return when NOT in deterministic mode). Shared so the determinism seam and the
 /// stdlib seams agree on the format. Saturating to 0 on a pre-epoch clock.
 pub(crate) fn real_now_ms() -> f64 {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as f64)
-        .unwrap_or(0.0)
+    // WASM §5.3.3: the raw wall-clock source moved to `platform::now_unix_ms` (native
+    // arm is the identical `SystemTime` body; wasm uses `Date.now`). This is the
+    // `None`-mode fallback below the det seam — `clock_now_ms` still gates it.
+    crate::platform::now_unix_ms()
 }
 
 /// The maximum LOGICAL call/eval recursion depth (SP3 §B). Exceeding it raises a
@@ -1167,6 +1166,22 @@ pub(crate) fn real_now_ms() -> f64 {
 /// also bounds heap-`frames` growth, which `stacker` does not); SP9 chose the
 /// "always-on stacker, cap stays the ceiling" option (spec §1.6), so the value is
 /// unchanged and both engines still trip at the SAME `MAX_CALL_DEPTH`.
+///
+/// **WASM §5.3.5 — platform asymmetry (documented, the SP3/VM-capacity precedent).**
+/// `wasm32-unknown-unknown` cannot grow native stack segments: `psm`/`stacker`'s
+/// `maybe_grow` degrades to "run on the current stack" (spike §10.4 — it compiles, it
+/// just can't switch stacks), and the program is NOT on the 512 MB worker thread (the
+/// browser polls the program future on the microtask loop). The only stack is the
+/// linker-set shadow stack, which the wrapper raises to 8 MiB
+/// (`-C link-arg=-zstack-size=8388608` in `ascript-wasm/.cargo/config.toml`). So the
+/// logical cap must fit that 8 MiB with ≥2× margin: it is lowered to 1000 on wasm
+/// (calibrated by the Phase-2 Node deep-recursion probe; adjust the literal there with
+/// the measurement if the probe says so). The panic message stays exactly
+/// `maximum recursion depth exceeded` — same error, lower ceiling. The native constant
+/// is UNCHANGED at 3000 (Gate W-1).
+#[cfg(target_family = "wasm")]
+pub const MAX_CALL_DEPTH: u32 = 1000;
+#[cfg(not(target_family = "wasm"))]
 pub const MAX_CALL_DEPTH: u32 = 3000;
 
 /// The maximum EXPRESSION-NESTING depth (SP3 §B / O1) — a SEPARATE limit from
